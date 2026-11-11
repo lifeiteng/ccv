@@ -96,25 +96,45 @@ from the E1 decoder. A failure at `fallback=0` and 64 rows comes from the fused 
 
 ## Benchmarks
 
-`bin/nnc/segmented_swiglu_bench.c` and `bin/nnc/routed_segmented_gemm_bench.c` take an explicit
-format list, which has no TMCQ (or IQ1_S) entry yet. That directory was outside this work line's
-files, so the benches are unchanged. Adding TMCQ needs a new enum value, a name, a parse entry and
-`ccv_nnc_tensor_8i_rowwise_x(dense, CCV_NNC_QX_8I_ROWWISE_TMCQ_N16 + (n - 16) / 2)`. The weight
-fill (random payload bytes plus scales) is already valid for TMCQ, because every bit string decodes.
-
-Baseline commands with the current benches:
+`bin/nnc/segmented_swiglu_bench.c` and `bin/nnc/routed_segmented_gemm_bench.c` take `iq1_s`,
+`iq2_xxs`, `tmcq_n18`, `tmcq_n22` and `tmcq_n26` (n18 / n22 / n26 are 1.125 / 1.375 / 1.625 bits per
+weight). Every TMCQ and IQ bit string is a valid payload, so the benches time their random or
+uninitialized weights directly and need no quantization pass.
 
 ```sh
 cd bin/nnc && make -j 4 -o ../../lib/libccv.a segmented_swiglu_bench routed_segmented_gemm_bench
-./segmented_swiglu_bench iq2_xxs 5 30 8 6 6 6       # decode: format warmup iters batch experts rows segments
-./segmented_swiglu_bench q2_k 5 30 8 6 6 6
-./routed_segmented_gemm_bench sparse6 iq2_xxs 3 12 1    # decode-like, T = 1
-./routed_segmented_gemm_bench balanced iq2_xxs 3 12 2048 # prefill
+
+# Routed segmented GEMM (gate 2048x4096, up, down 4096x2048, 256 experts, FP16 unless "fp32").
+# "tmcq" runs iq1_s, iq2_xxs, tmcq_n18, tmcq_n22 and tmcq_n26 in turn.
+# Arguments: routing format warmup iterations tokens [fp16|fp32].
+./routed_segmented_gemm_bench sparse6 tmcq 3 12 1          # decode: 6 rows, one per bin -> segmented GEMV
+./routed_segmented_gemm_bench sparse6 tmcq 3 12 6          # 6-token verify
+./routed_segmented_gemm_bench balanced tmcq 3 12 64        # short prefill: fused TMCQ tile decode
+./routed_segmented_gemm_bench balanced tmcq 3 12 512       # fused while M <= 64 x bins
+./routed_segmented_gemm_bench balanced tmcq 3 12 2048      # long prefill: expands the selected experts
+./routed_segmented_gemm_bench balanced tmcq 3 12 512 fp32  # FP32 (Int8MatMul without neural accelerators)
+
+# Segmented SwiGLU decode (vector path), FP16, n = 2048, k = 4096.
+# Arguments: format warmup iterations batch experts rows segments.
+for f in iq1_s iq2_xxs tmcq_n18 tmcq_n22 tmcq_n26; do ./segmented_swiglu_bench $f 5 30 8 6 6 6; done
+for f in iq1_s iq2_xxs tmcq_n18 tmcq_n22 tmcq_n26; do ./segmented_swiglu_bench $f 5 30 8 64 1 1; done   # one row
+
+# Segmented SwiGLU FP32 prefill (256 experts), now with a format: warmup iterations tokens format.
+for f in rowwise iq1_s iq2_xxs tmcq_n18 tmcq_n22 tmcq_n26; do ./segmented_swiglu_bench prefill_fp32 2 7 2048 $f; done
+for f in iq1_s iq2_xxs tmcq_n18 tmcq_n22 tmcq_n26; do ./segmented_swiglu_bench prefill_fp32 2 7 64 $f; done
 ```
 
-With TMCQ added, compare `tmcq_n16` / `tmcq_n18` / `tmcq_n32` against `iq2_xxs` (and IQ1_S once it is
-added) at T = 1, 6, 64, 512 and 2048. At T = 512 and 2048, also try forcing `fusesPackedFormat` to
-true and to false, to set TMCQ's own fused / expanded cutoff.
+Each SwiGLU decode run also prints a `validation,...` line comparing the fused kernel with the
+composed segmented GEMM path. For TMCQ, that line also cross-checks the new SwiGLU kernel against
+the new GEMV kernel.
+
+What to look for:
+
+- **Decode (T = 1 / 6):** TMCQ against IQ2_XXS and IQ1_S. TMCQ moves fewer bytes but decodes with
+  more ALU work (two loads, a multiply and a byte sum per weight).
+- **Prefill (T = 64, 512, 2048):** whether TMCQ's fused / expanded cutoff (`M <= 64 x bins` in
+  `SegmentedScaledGEMMKernel::fusesPackedFormat`) sits in the right place. To measure both sides at
+  one size, temporarily make the TMCQ branch return `true` or `false`.
 
 ## Where compile or numeric failures are most likely
 
