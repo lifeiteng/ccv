@@ -261,8 +261,8 @@ TEST_CASE("mps tmcq int8 decode matches the reference bit for bit")
 			tmcq_fill_weights(hq, datatype, rows, cols, n, 0, 0x1234u + f * 31 + d, scales);
 			const size_t out_scale_offset = ((size_t)rows * cols + 127) & ~(size_t)127;
 			const size_t out_bytes = out_scale_offset + rows * scale_size;
-			ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 8U, (int)out_bytes), 0);
-			ccv_nnc_tensor_t* const hout = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(8U, (int)out_bytes), 0);
+			ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32S, (int)((out_bytes + 3) / 4)), 0);
+			ccv_nnc_tensor_t* const hout = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, (int)((out_bytes + 3) / 4)), 0);
 			ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(hq), TENSOR_LIST(gq), 0);
 			ccv_nnc_mps_dequantize_8i_rowwise_x_to_8i_rowwise(gq->data.u8, datatype, ccv_nnc_tensor_data_size_without_padding(hq->info), cols, format, gout->data.u8, (size_t)rows * cols, 0);
 			ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gout), TENSOR_LIST(hout), 0);
@@ -335,7 +335,28 @@ TEST_CASE("mps tmcq fp decode matches the reference bit for bit")
 			if (check_cpu)
 			{
 				ccv_nnc_dequantize_8i_rowwise_x(hq->data.u8, datatype, CCV_TENSOR_CPU_MEMORY, qsize, cols, format, href->data.u8, (size_t)rows * cols);
-				REQUIRE_EQ(memcmp(href->data.u8, hout->data.u8, (size_t)rows * cols * element_size), 0, "TMCQ n=%d datatype=%x fp decode matches the CPU decode bit for bit", n, datatype);
+				if (datatype == CCV_32F)
+				{
+					REQUIRE_EQ(memcmp(href->data.u8, hout->data.u8, (size_t)rows * cols * element_size), 0, "TMCQ n=%d datatype=%x fp decode matches the CPU decode bit for bit", n, datatype);
+				} else {
+					// The shared CPU writer (_ccv_nnc_8i_rowwise_packed_write_value, used by every packed
+					// format) narrows through ccv_float_to_half_precision / ccv_float_to_bfloat, which round
+					// toward zero, while the GPU rounds to nearest like the spec reference above. So for 16F /
+					// 16BF the CPU decode may sit one unit in the last place below the GPU in magnitude.
+					size_t far = 0, below = 0, j;
+					for (j = 0; j < (size_t)rows * cols; j++)
+					{
+						const uint16_t c = ((const uint16_t*)href->data.u8)[j];
+						const uint16_t g = ((const uint16_t*)hout->data.u8)[j];
+						if (c == g)
+							continue;
+						if ((c & 0x8000) == (g & 0x8000) && (uint16_t)(g & 0x7fff) == (uint16_t)((c & 0x7fff) + 1))
+							below++;
+						else
+							far++;
+					}
+					REQUIRE_EQ(far, 0, "TMCQ n=%d datatype=%x fp decode is within the CPU decode's round-toward-zero ulp (%zu elements one ulp below)", n, datatype, below);
+				}
 			}
 			ccfree(q8);
 			ccfree(scales);
@@ -375,9 +396,9 @@ TEST_CASE("mps tmcq selected expert int8 decode matches the reference")
 	ccv_nnc_tensor_t* const gcounts = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32S, 3), 0);
 	const size_t out_scale_offset = ((size_t)rows * cols + 127) & ~(size_t)127;
 	const size_t out_bytes = out_scale_offset + rows * scale_size;
-	ccv_nnc_tensor_t* const hout = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(8U, (int)out_bytes), 0);
+	ccv_nnc_tensor_t* const hout = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, (int)((out_bytes + 3) / 4)), 0);
 	memset(hout->data.u8, 0x5a, out_bytes);
-	ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 8U, (int)out_bytes), 0);
+	ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32S, (int)((out_bytes + 3) / 4)), 0);
 	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(hq, hindices, hcounts, hout), TENSOR_LIST(gq, gindices, gcounts, gout), 0);
 	const ccv_nnc_mfa_dequantize_8i_rowwise_x_selected_params_t params = {
 		.data_type = 16, // MTL::DataTypeHalf
