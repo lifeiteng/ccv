@@ -283,6 +283,16 @@ cc_binary(
 )
 
 cc_binary(
+	name = "tmcq.tests",
+	srcs = ["tmcq.tests.c"],
+	copts = ccv_default_copts(),
+	deps = [
+		"//test:case",
+		"//lib:nnc"
+	]
+)
+
+cc_binary(
 	name = "pad.tests",
 	srcs = ["pad.tests.c"],
 	copts = ccv_default_copts(),
