@@ -269,12 +269,6 @@ using namespace metal;
 	shader += "constant uint tmcq_tile_words = " + std::to_string(n / 2) + ";\n";
 	shader += ccv_nnc_mfa_tmcq_decode_source;
 	shader += R"(
-inline char4 tmcq_char4(device const uint* tile, const uint t)
-{
-  return char4((char)tmcq_decode(tile, tmcq_n, t), (char)tmcq_decode(tile, tmcq_n, t + 1),
-    (char)tmcq_decode(tile, tmcq_n, t + 2), (char)tmcq_decode(tile, tmcq_n, t + 3));
-}
-
 // Writes the 16 int8 weights of `row` (local to the tile grid starting at `source`) in tile column
 // `tc` to destination[row * row_length + 16 * tc ...].
 inline void tmcq_store_segment(device const uchar* source, device uchar* destination, const uint row, const uint tc)

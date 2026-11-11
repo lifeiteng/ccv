@@ -1230,14 +1230,6 @@ using namespace metal;
   shader += "constant constexpr uint TMCQ_N = " + std::to_string(rate) + ";\n";
   shader += "constant constexpr uint TMCQ_TILE_WORDS = TMCQ_N / 2;\n";
   shader += R"(
-// Codes of weights t ... t + 3 of a tile (four columns of one tile row).
-inline float4 tmcq_codes4(device const uint* tile, const uint t)
-{
-  return float4(int4(
-    tmcq_decode(tile, TMCQ_N, t), tmcq_decode(tile, TMCQ_N, t + 1u),
-    tmcq_decode(tile, TMCQ_N, t + 2u), tmcq_decode(tile, TMCQ_N, t + 3u)));
-}
-
 inline float stable_sigmoid(const float value)
 {
   const float tail = 1.0f / (1.0f + exp(abs(value)));
@@ -1298,7 +1290,6 @@ inline float stable_sigmoid(const float value)
   device const real4* activation4 = (device const real4*)activation;
 
   const uint r = lane & 15u;
-  const uint t = r * 16u;
   float gate_sum = 0;
   float up_sum = 0;
   // ncols % 256 == 0, so both halves run the same number of steps.

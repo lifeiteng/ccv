@@ -173,15 +173,6 @@ using namespace metal;
 	shader += "constant uint tmcq_tile_words = " + std::to_string(n / 2) + ";\n";
 	shader += ccv_nnc_mfa_tmcq_decode_source;
 	shader += R"(
-inline vec<real, 4> tmcq_real4(device const uint* tile, const uint t, const float scale)
-{
-  return vec<real, 4>(float4(
-    (float)tmcq_decode(tile, tmcq_n, t),
-    (float)tmcq_decode(tile, tmcq_n, t + 1),
-    (float)tmcq_decode(tile, tmcq_n, t + 2),
-    (float)tmcq_decode(tile, tmcq_n, t + 3)) * scale);
-}
-
 kernel void dequantize_8i_rowwise_x_fp(
   device const uchar* source [[buffer(0)]],
   device uchar* destination [[buffer(1)]],

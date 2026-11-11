@@ -1088,14 +1088,6 @@ using namespace metal;
   shader += "constant constexpr uint TMCQ_TILE_WORDS = TMCQ_N / 2;\n";
   shader += "constant constexpr uint S = " + std::to_string(segmentedInt8GemvSIMDGroupsPerThreadgroup(CCV_NNC_QX_8I_ROWWISE_TMCQ_N16)) + ";\n";
   shader += R"(
-// Codes of weights t ... t + 3 of a tile (four columns of one tile row).
-inline float4 tmcq_codes4(device const uint* tile, const uint t)
-{
-  return float4(int4(
-    tmcq_decode(tile, TMCQ_N, t), tmcq_decode(tile, TMCQ_N, t + 1u),
-    tmcq_decode(tile, TMCQ_N, t + 2u), tmcq_decode(tile, TMCQ_N, t + 3u)));
-}
-
 kernel void segmented_int8_gemv(
   device const uchar *src0 [[buffer(0)]],
   device const real *src1 [[buffer(1)]],

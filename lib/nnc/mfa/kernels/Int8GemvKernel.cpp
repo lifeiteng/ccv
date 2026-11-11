@@ -1020,15 +1020,6 @@ using namespace metal;
   shader += "constant uint tmcq_tile_words = " + std::to_string(n / 2) + ";\n";
   shader += ccv_nnc_mfa_tmcq_decode_source;
   shader += R"(
-inline float4 tmcq_float4(device const uint* tile, const uint t)
-{
-  return float4(
-    (float)tmcq_decode(tile, tmcq_n, t),
-    (float)tmcq_decode(tile, tmcq_n, t + 1),
-    (float)tmcq_decode(tile, tmcq_n, t + 2),
-    (float)tmcq_decode(tile, tmcq_n, t + 3));
-}
-
 kernel void int8_gemv(
   device const uchar *src0 [[buffer(0)]],
   device const real *src1 [[buffer(1)]],
