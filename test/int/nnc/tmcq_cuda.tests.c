@@ -292,8 +292,9 @@ static void _tmcq_from_float(const int datatype, const float* const values, cons
 // largest difference to a double precision CPU reference, relative to max(1, |reference|, |actual|). Like the row-wise
 // int8 GEMM tests, the reference follows the GPU path: the row-wise int8 path multiplies the exact codes times the
 // row scales, and above 4 rows quantizes the activations row-wise to int8 (scale = max |a| / 127); the dequantizing
-// fallback multiplies the weights decoded into the datatype.
-static double _tmcq_gemm_max_rel_diff(const int datatype, const int format, const int use_bias, const int misaligned_bias, const int m, const int n, const int k, dsfmt_t* const dsfmt, int* const fast_path_out)
+// fallback multiplies the weights decoded into the datatype. If fp_rel_out is set, it also returns the largest
+// difference to the plain FP GEMM of the activations and the decoded weights, without the activation quantization.
+static double _tmcq_gemm_max_rel_diff(const int datatype, const int format, const int use_bias, const int misaligned_bias, const int m, const int n, const int k, dsfmt_t* const dsfmt, int* const fast_path_out, double* const fp_rel_out)
 {
 	ccv_nnc_tensor_param_t a_params = CPU_TENSOR_NHWC(32F, m, k);
 	a_params.datatype = datatype;
@@ -369,6 +370,9 @@ static double _tmcq_gemm_max_rel_diff(const int datatype, const int format, cons
 			}
 		}
 	}
+	float* const a_fp = fp_rel_out ? (float*)ccmalloc(sizeof(float) * m * k) : 0;
+	if (a_fp)
+		memcpy(a_fp, a_f, sizeof(float) * m * k);
 	if (fast_path && m > 4)
 		for (i = 0; i < m; i++)
 		{
@@ -391,17 +395,31 @@ static double _tmcq_gemm_max_rel_diff(const int datatype, const int format, cons
 	}
 	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gb), TENSOR_LIST(hb), 0);
 	double max_rel = status == CCV_NNC_EXEC_SUCCESS ? 0 : HUGE_VAL;
+	double fp_rel = max_rel;
 	for (i = 0; i < m; i++)
 		for (j = 0; j < n; j++)
 		{
 			double expected = use_bias ? bias_f[j] : 0;
+			double expected_fp = expected;
 			for (l = 0; l < k; l++)
-				expected += (double)a_f[i * k + l] * w_f[j * k + l];
+				expected += (double)a_f[(size_t)i * k + l] * w_f[(size_t)j * k + l];
 			const double actual = _tmcq_load(datatype, hb->data.u8, (size_t)i * n + j);
 			const double rel = fabs(actual - expected) / ccv_max(1.0, ccv_max(fabs(actual), fabs(expected)));
 			if (!(rel <= max_rel)) // Also catches NaN.
 				max_rel = isnan(rel) ? HUGE_VAL : rel;
+			if (a_fp)
+			{
+				for (l = 0; l < k; l++)
+					expected_fp += (double)a_fp[(size_t)i * k + l] * w_f[(size_t)j * k + l];
+				const double rel_fp = fabs(actual - expected_fp) / ccv_max(1.0, ccv_max(fabs(actual), fabs(expected_fp)));
+				if (!(rel_fp <= fp_rel))
+					fp_rel = isnan(rel_fp) ? HUGE_VAL : rel_fp;
+			}
 		}
+	if (fp_rel_out)
+		*fp_rel_out = fp_rel;
+	if (a_fp)
+		ccfree(a_fp);
 	ccfree(codes);
 	ccfree(a_f);
 	ccfree(w_f);
@@ -443,7 +461,7 @@ TEST_CASE("cublas forward gemm with TMCQ weights matches CPU across rates, row c
 			const int f = (d * 4 + s) % (sizeof(tmcq_formats) / sizeof(tmcq_formats[0]));
 			const int use_bias = (d + s) % 2;
 			int fast_path;
-			const double max_rel = _tmcq_gemm_max_rel_diff(datatypes[d], tmcq_formats[f], use_bias, 0, shapes[s][0], shapes[s][1], shapes[s][2], &dsfmt, &fast_path);
+			const double max_rel = _tmcq_gemm_max_rel_diff(datatypes[d], tmcq_formats[f], use_bias, 0, shapes[s][0], shapes[s][1], shapes[s][2], &dsfmt, &fast_path, 0);
 			const double tolerance = fast_path ? tolerances[d] : fallback_tolerances[d];
 			if (max_rel > tolerance)
 				printf("format %d, datatype %x, bias %d, m %d, n %d, k %d, fast path %d: max relative difference %g\n", tmcq_formats[f], datatypes[d], use_bias, shapes[s][0], shapes[s][1], shapes[s][2], fast_path, max_rel);
@@ -462,10 +480,56 @@ TEST_CASE("cublas forward gemm with TMCQ weights falls back to the dequantized w
 	for (d = 0; d < sizeof(datatypes) / sizeof(datatypes[0]); d++)
 	{
 		int fast_path;
-		const double max_rel = _tmcq_gemm_max_rel_diff(datatypes[d], tmcq_formats[d * 3 + 1], 1, 1, 64, 256, 512, &dsfmt, &fast_path);
+		const double max_rel = _tmcq_gemm_max_rel_diff(datatypes[d], tmcq_formats[d * 3 + 1], 1, 1, 64, 256, 512, &dsfmt, &fast_path, 0);
 		REQUIRE(!fast_path, "a misaligned bias takes the dequantizing fallback");
 		REQUIRE(max_rel <= fallback_tolerances[d], "TMCQ fallback GEMM should match the CPU reference: datatype=%x max_rel=%g", datatypes[d], max_rel);
 	}
+}
+
+TEST_CASE("cublas forward gemm with TMCQ weights runs the CUTLASS int8 GEMM from M = 5 to 2048")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_GPU_CUBLAS));
+#ifndef HAVE_CUDA_SM80
+	printf("SKIP: TMCQ CUTLASS int8 GEMM test: built without HAVE_CUDA_SM80 (configure --enable-sm80), thus more than 4 rows take the dequantizing cuBLAS fallback\n");
+#else
+	const int datatypes[] = {CCV_32F, CCV_16F, CCV_16BF};
+	const double tolerances[] = {1e-4, 1e-3, 5e-3};
+	// Each M picks a different CUTLASS tile in _ccv_nnc_8i_rowwise_cutlass_gemm_dispatch: 16 x 128 (n >= 8192), 64 x 64,
+	// 128 x 128 and 256 x 128.
+	const int shapes[][3] = {
+		{5, 8192, 512},
+		{64, 384, 768},
+		{512, 512, 1024},
+		{2048, 256, 1024},
+	};
+	size_t workspace_size;
+	// 16-byte aligned dummies: only the device and the shapes decide.
+	if (!ccv_nnc_compat_8i_rowwise_gemm_supported(CCV_32F, 0, 0, 0, 0, shapes[0][0], shapes[0][1], shapes[0][2], &workspace_size))
+	{
+		printf("SKIP: TMCQ CUTLASS int8 GEMM test: the int8 GEMM is not supported on this device (needs sm_80 or newer)\n");
+		return;
+	}
+	dsfmt_t dsfmt;
+	dsfmt_init_gen_rand(&dsfmt, 43);
+	int d, s;
+	for (d = 0; d < sizeof(datatypes) / sizeof(datatypes[0]); d++)
+		for (s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++)
+		{
+			const int f = (d * 3 + s * 2) % (sizeof(tmcq_formats) / sizeof(tmcq_formats[0]));
+			const int use_bias = (d + s) % 2;
+			int fast_path;
+			double fp_rel;
+			const double max_rel = _tmcq_gemm_max_rel_diff(datatypes[d], tmcq_formats[f], use_bias, 0, shapes[s][0], shapes[s][1], shapes[s][2], &dsfmt, &fast_path, &fp_rel);
+			printf("TMCQ CUTLASS GEMM: format %d, datatype %x, bias %d, m %d, n %d, k %d: max relative difference %g to the int8 activation reference, %g to the plain FP GEMM\n", tmcq_formats[f], datatypes[d], use_bias, shapes[s][0], shapes[s][1], shapes[s][2], max_rel, fp_rel);
+			REQUIRE(fast_path, "TMCQ weights take the int8 GEMM: m=%d", shapes[s][0]);
+			REQUIRE(max_rel <= tolerances[d], "TMCQ CUTLASS GEMM should match the CPU reference: datatype=%x m=%d max_rel=%g", datatypes[d], shapes[s][0], max_rel);
+			// Only the CUTLASS path quantizes the activations to int8: in FP32, its error to the plain FP GEMM (the
+			// cuBLAS fallback's result) is far above the error to the int8 activation reference, thus the fallback
+			// cannot have produced this output.
+			if (datatypes[d] == CCV_32F)
+				REQUIRE(fp_rel > 10 * ccv_max(max_rel, tolerances[d]), "the output carries the int8 activation quantization of the CUTLASS path: m=%d max_rel=%g fp_rel=%g", shapes[s][0], max_rel, fp_rel);
+		}
+#endif
 }
 
 TEST_CASE("TMCQ CUDA dequantization matches ccv_nnc_dequantize_8i_rowwise_x on CPU bit for bit")
