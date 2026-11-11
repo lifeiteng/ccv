@@ -647,6 +647,187 @@ TEST_CASE("TMCQ metadata and payload survive tensor persistence")
 	ccv_nnc_tensor_free(source);
 }
 
+// Straightforward Viterbi over one tile in processing order t' = 0..255, t = (t' + rotation) mod 256.
+// start < 0: free ends. bp is 256 x 2^14 indexed by t'. Returns the end state.
+static int _test_tmcq_pass(const double* const y, const double* const w, const int n, const int rotation, const int start, uint8_t* const bp, double* const cost_out)
+{
+	double* cost = ccmalloc(sizeof(double) * 32768);
+	double* next = ccmalloc(sizeof(double) * 32768);
+	int s, step;
+	for (s = 0; s < 32768; s++)
+		cost[s] = start < 0 || s == start ? 0 : INFINITY;
+	for (step = 0; step < 256; step++)
+	{
+		const int t = (step + rotation) % 256;
+		const int f = (t + 1) * n / 16 - t * n / 16;
+		for (s = 0; s < 32768; s++)
+		{
+			const int low = s & ((1 << (15 - f)) - 1);
+			int h, best_h = 0;
+			for (h = 1; h < (1 << f); h++)
+				if (cost[(low << f) | h] < cost[(low << f) | best_h])
+					best_h = h;
+			const double d = y[t] - _test_tmcq_q8(s);
+			next[s] = cost[(low << f) | best_h] + w[t] * (d * d);
+			bp[step * 16384 + low] = best_h;
+		}
+		double* const swap = cost;
+		cost = next;
+		next = swap;
+	}
+	int end = start;
+	if (start < 0)
+		for (s = 1, end = 0; s < 32768; s++)
+			if (cost[s] < cost[end])
+				end = s;
+	*cost_out = cost[end];
+	ccfree(next);
+	ccfree(cost);
+	return end;
+}
+
+static int _test_tmcq_trace(const uint8_t* const bp, const int n, const int rotation, const int last, const int first, int s, int* const states)
+{
+	int step;
+	for (step = last; step >= first; step--)
+	{
+		const int t = (step + rotation) % 256;
+		const int f = (t + 1) * n / 16 - t * n / 16;
+		if (states)
+			states[t] = s;
+		const int low = s & ((1 << (15 - f)) - 1);
+		s = (low << f) | bp[step * 16384 + low];
+	}
+	return s;
+}
+
+// Tail-biting tile fit: mid = 0 is the v1 two-pass (anchor s_255), mid = 1 the v1.1 mid anchor (s_127).
+static double _test_tmcq_fit_tile(const double* const y, const double* const w, const int n, const int mid, int* const states)
+{
+	uint8_t* const bp = ccmalloc(256 * 16384);
+	double cost;
+	int s_star = _test_tmcq_pass(y, w, n, 0, -1, bp, &cost);
+	if (mid)
+		s_star = _test_tmcq_trace(bp, n, 0, 255, 128, s_star, 0);
+	const int rotation = mid ? 128 : 0;
+	_test_tmcq_pass(y, w, n, rotation, s_star, bp, &cost);
+	const int s = _test_tmcq_trace(bp, n, rotation, 255, 0, s_star, states);
+	assert(s == s_star);
+	(void)s;
+	ccfree(bp);
+	return cost;
+}
+
+// imatrix-path TMCQ encoder written out from the spec, with either anchor. Writes the 32F output layout
+// and returns the summed Viterbi tile costs.
+static double _test_tmcq_encode(const float* const x, const int rows, const int cols, const int n, const float* const imatrix, const int mid, uint8_t* const output)
+{
+	const int T = 16 * n;
+	const size_t scale_offset = _test_tmcq_scale_offset(rows, cols, n);
+	memset(output, 0, scale_offset);
+	double cb = 0;
+	int s, i, j, k, tr, tc, t;
+	for (s = 0; s < 32768; s++)
+		cb += (double)_test_tmcq_q8(s) * _test_tmcq_q8(s);
+	cb = sqrt(cb / 32768);
+	double* const wc = ccmalloc(sizeof(double) * cols);
+	double sum_wc = 0;
+	for (k = 0; k < cols; k++)
+		sum_wc += (wc[k] = imatrix ? ccv_max((double)imatrix[k], 0) : 1);
+	int* const q = ccmalloc(sizeof(int) * rows * cols);
+	double total = 0;
+	for (tr = 0; tr < rows / 16; tr++)
+	{
+		double scale[16];
+		for (i = 0; i < 16; i++)
+		{
+			double sum = 0;
+			for (k = 0; k < cols; k++)
+				sum += wc[k] * ((double)x[(tr * 16 + i) * cols + k] * x[(tr * 16 + i) * cols + k]);
+			const double sr = sum_wc > 0 ? sqrt(sum / sum_wc) / cb : 0;
+			scale[i] = sr > 0 && isfinite(sr) ? sr : 0;
+		}
+		for (tc = 0; tc < cols / 16; tc++)
+		{
+			double y[256], w[256];
+			for (i = 0; i < 16; i++)
+				for (j = 0; j < 16; j++)
+				{
+					y[i * 16 + j] = scale[i] > 0 ? x[(tr * 16 + i) * cols + tc * 16 + j] / scale[i] : 0;
+					w[i * 16 + j] = wc[tc * 16 + j] * (scale[i] * scale[i]);
+				}
+			int states[256];
+			total += _test_tmcq_fit_tile(y, w, n, mid, states);
+			const size_t g = (size_t)tr * (cols / 16) + tc;
+			int prev_end = 0;
+			for (t = 0; t < 256; t++)
+			{
+				const int end = (t + 1) * n / 16;
+				int p;
+				for (p = prev_end; p < end; p++)
+					if ((states[t] >> (14 - (end - 1 - p))) & 1)
+						output[(g * T + p) / 8] |= 1 << ((g * T + p) % 8);
+				prev_end = end;
+				q[(tr * 16 + t / 16) * cols + tc * 16 + t % 16] = _test_tmcq_q8(states[t]);
+			}
+		}
+		for (i = 0; i < 16; i++)
+		{
+			double num = 0, den = 0;
+			const int r = tr * 16 + i;
+			for (k = 0; k < cols; k++)
+			{
+				num += (double)q[r * cols + k] * (wc[k] * x[r * cols + k]);
+				den += (double)q[r * cols + k] * (wc[k] * (double)q[r * cols + k]);
+			}
+			const double sr = num / den;
+			((float*)(output + scale_offset))[r] = (float)(den > 0 && isfinite(sr) ? sr : scale[i]);
+		}
+	}
+	ccfree(q);
+	ccfree(wc);
+	return total;
+}
+
+TEST_CASE("TMCQ mid anchor matches an independent encoder and costs no more than the v1 two-pass fit")
+{
+	enum { rows = 64, cols = 512, count = rows * cols };
+	const int formats[2] = {CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N24};
+	dsfmt_t dsfmt;
+	dsfmt_init_gen_rand(&dsfmt, 4242);
+	float* const values = ccmalloc(sizeof(float) * count);
+	float* const decoded = ccmalloc(sizeof(float) * count);
+	float imatrix[cols];
+	_test_tmcq_values(&dsfmt, values, rows, cols);
+	int i, f;
+	for (i = 0; i < cols; i++)
+		imatrix[i] = 0.2f + (float)dsfmt_genrand_open_close(&dsfmt) * 2;
+	for (f = 0; f < 2; f++)
+	{
+		const int n = ccv_nnc_8i_rowwise_x_tmcq_rate(formats[f]);
+		const size_t size = ccv_nnc_8i_rowwise_x_data_size(formats[f], CCV_32F, count, cols);
+		uint8_t* const packed = ccmalloc(size);
+		uint8_t* const mid = ccmalloc(size);
+		uint8_t* const v1 = ccmalloc(size);
+		REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, count, cols, formats[f], imatrix, cols, 0, 0, packed, size), size, "imatrix quantization succeeds");
+		const double mid_cost = _test_tmcq_encode(values, rows, cols, n, imatrix, 1, mid);
+		const double v1_cost = _test_tmcq_encode(values, rows, cols, n, imatrix, 0, v1);
+		REQUIRE_ARRAY_EQ(uint8_t, packed, mid, size, "library output matches the spec 4.2 encoder for n = %d", n);
+		ccv_nnc_dequantize_8i_rowwise_x(mid, CCV_32F, CCV_TENSOR_CPU_MEMORY, size, cols, formats[f], decoded, count);
+		const double mid_sse = _test_tmcq_weighted_sse(values, decoded, rows, cols, imatrix);
+		ccv_nnc_dequantize_8i_rowwise_x(v1, CCV_32F, CCV_TENSOR_CPU_MEMORY, size, cols, formats[f], decoded, count);
+		const double v1_sse = _test_tmcq_weighted_sse(values, decoded, rows, cols, imatrix);
+		printf("\n\tTMCQ n = %d trellis cost mid %.6g v1 %.6g (%+.3f%%), weighted SSE after refit mid %.6g v1 %.6g (%+.3f%%)", n, mid_cost, v1_cost, (mid_cost / v1_cost - 1) * 100, mid_sse, v1_sse, (mid_sse / v1_sse - 1) * 100);
+		REQUIRE(mid_cost <= v1_cost, "mid anchor trellis cost %g is no more than v1 %g for n = %d", mid_cost, v1_cost, n);
+		REQUIRE(mid_sse <= v1_sse, "mid anchor weighted error %g is no more than v1 %g for n = %d", mid_sse, v1_sse, n);
+		ccfree(v1);
+		ccfree(mid);
+		ccfree(packed);
+	}
+	ccfree(decoded);
+	ccfree(values);
+}
+
 // FIPS 180-4 SHA-256, for the golden payload digests below.
 static void _test_sha256(const uint8_t* const data, const size_t length, char hex[65])
 {
@@ -718,21 +899,21 @@ TEST_CASE("TMCQ golden vectors for the QuantStar reference")
 	//   W[16][256] = uniform();
 	//   imatrix[256] = ((x >> 9) + 2^21) / 2^21 for x = xorshift();
 	//   A[512][256] = uniform(), H[j][k] = (float)(sum_s A[s][j] A[s][k] / 512) with s ascending in double.
-	// Digests cover the whole 32F output: payload, zero padding to 128 bytes and the float row scales.
+	// Encoder v1.1 (spec 4.2, mid anchor). Digests cover the whole 32F output: payload, zero padding to 128 bytes and the float row scales.
 	// Input digests (little-endian float32): W 2457d29c78ab867fd09946a2ca8b1c18baf38290b88174728302da8bdb2354e7,
 	// imatrix c277f046520b74ffd8434a5ece854a98715bfba8bee87f654e377a7ed0568598,
 	// H 3686ed3dd6195ab6b88eab8fd4859f7d14072dfe8ea63c519cfbf792e62f1612.
 	enum { rows = 16, cols = 256, count = rows * cols, samples = 512 };
 	static const char* const expected_digest[2][3] = {
 		{ // imatrix: n = 16, 22, 32.
-			"084cba4d91a12b0c5388b121a418c9cc1f7704610fa334ceae30fd608a66b0b9",
-			"585570f116a754a464241125ff555e6eed50576b6bc7a3aea199b9a8e393de32",
-			"206e173260238e1f53663c191726dc17195f78ab5dd42253a20a45390f2ddbd8",
+			"c954f755f0fddb77c4bdf849617e6dddb8345a784cad85e0f02dba04bc241755",
+			"478f34b56dd77db82a30447abcf664462484983d1b98a67919032f0355e44aca",
+			"479e4648f1b25ba149953a292113dba0b65e6ea9a31dc4d19bf9ef80839e237b",
 		},
 		{ // Hessian: n = 16, 22, 32.
-			"2e7fe7d1a79a4e5be136da3af896c83ee0dcd3237cb390cbc92445fb9a9d8c09",
-			"0ec2a99a0c4a57d8d764369e9097d9dec81943d31895c4d8955d8393211ff27c",
-			"5dace272992771aed5e19e8badfbd43005e947cf45c7466b4b9182afc8db5a5b",
+			"7cc5958fe6c0ef66e42ad39fb8439d83b203828ee14bae0bd87e150b846c072e",
+			"1fa49211009d64d79a9ed471a582708fa7941e2f01d53e45f9fe61bd3fb435e4",
+			"cc38aad17ddf1c2ac75dd85284fd1edb0ba4f6f497107beaf45d02faa3ecc285",
 		},
 	};
 	const int formats[3] = {CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N22, CCV_NNC_QX_8I_ROWWISE_TMCQ_N32};

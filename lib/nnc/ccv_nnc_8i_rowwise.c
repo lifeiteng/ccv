@@ -2081,9 +2081,17 @@ typedef struct {
 	uint8_t* bp; // Back pointers h, 256 x CCV_NNC_8I_ROWWISE_TMCQ_LOWS.
 } ccv_nnc_8i_rowwise_tmcq_viterbi_t;
 
-// One Viterbi pass over the 256 weights of a tile. With start < 0 both ends are free and the cheapest end
-// state is returned; otherwise both ends are fixed to start. Back pointers are recorded only when bp is set.
-static int _ccv_nnc_8i_rowwise_tmcq_viterbi_pass(const ccv_nnc_8i_rowwise_tmcq_viterbi_t* const ws, const double* const y, const double* const w, const int n, const int start, uint8_t* const bp)
+// f_t = E_t - E_{t-1} with E_{-1} = 0. For even n, E_{t+8} = E_t + n / 2, so f has period 8 (it divides 128).
+static inline int _ccv_nnc_8i_rowwise_tmcq_fresh(const int t, const int n)
+{
+	return _ccv_nnc_8i_rowwise_tmcq_end(t, n) - (t > 0 ? _ccv_nnc_8i_rowwise_tmcq_end(t - 1, n) : 0);
+}
+
+// One Viterbi pass over the 256 weights of a tile, processed in the order t' = 0..255 with original index
+// t = (t' + rotation) mod 256 (targets, weights and f all taken at t). With start < 0 both ends are free and
+// the cheapest end state is returned; otherwise both ends are fixed to start. Back pointers are recorded
+// at bp[t' * CCV_NNC_8I_ROWWISE_TMCQ_LOWS] for t' >= bp_from only, when bp is set.
+static int _ccv_nnc_8i_rowwise_tmcq_viterbi_pass(const ccv_nnc_8i_rowwise_tmcq_viterbi_t* const ws, const double* const y, const double* const w, const int n, const int rotation, const int start, uint8_t* const bp, const int bp_from)
 {
 	double* cost = ws->cost;
 	double* next = ws->next;
@@ -2092,14 +2100,13 @@ static int _ccv_nnc_8i_rowwise_tmcq_viterbi_pass(const ccv_nnc_8i_rowwise_tmcq_v
 	int s;
 	for (s = 0; s < CCV_NNC_8I_ROWWISE_TMCQ_STATES; s++)
 		cost[s] = start < 0 ? 0 : (s == start ? 0 : INFINITY);
-	int prev_end = 0;
-	int t;
-	for (t = 0; t < 256; t++)
+	int step;
+	for (step = 0; step < 256; step++)
 	{
-		const int end = _ccv_nnc_8i_rowwise_tmcq_end(t, n);
-		const int f = end - prev_end;
-		prev_end = end;
+		const int t = (step + rotation) & 255;
+		const int f = _ccv_nnc_8i_rowwise_tmcq_fresh(t, n);
 		assert(f == 1 || f == 2);
+		assert(f == _ccv_nnc_8i_rowwise_tmcq_fresh(step, n)); // Rotating by 128 keeps the f sequence.
 		const int lows = 1 << (15 - f);
 		const int hs = 1 << f;
 		// c_t(s) = w_t (y_t - V[s])^2 only depends on V[s], so tabulate it per code.
@@ -2110,7 +2117,7 @@ static int _ccv_nnc_8i_rowwise_tmcq_viterbi_pass(const ccv_nnc_8i_rowwise_tmcq_v
 			const double d = y[t] - (double)(v - 127);
 			code_cost[v] = w[t] * (d * d);
 		}
-		uint8_t* const bpt = bp ? bp + (size_t)t * CCV_NNC_8I_ROWWISE_TMCQ_LOWS : 0;
+		uint8_t* const bpt = (bp && step >= bp_from) ? bp + (size_t)step * CCV_NNC_8I_ROWWISE_TMCQ_LOWS : 0;
 		int low;
 		for (low = 0; low < lows; low++)
 		{
@@ -2148,21 +2155,34 @@ static int _ccv_nnc_8i_rowwise_tmcq_viterbi_pass(const ccv_nnc_8i_rowwise_tmcq_v
 	return best_s;
 }
 
-// Tail-biting fit: a free pass picks the end state s*, a second pass pins both ends to s* and backtracks.
+// Walk the back pointers of processing steps last .. first (inclusive, descending) from state s, storing
+// the state of each step at states[(step + rotation) mod 256] when states is set. Returns the state before
+// step first.
+static int _ccv_nnc_8i_rowwise_tmcq_backtrack(const ccv_nnc_8i_rowwise_tmcq_viterbi_t* const ws, const int n, const int rotation, const int last, const int first, int s, uint16_t* const states)
+{
+	int step;
+	for (step = last; step >= first; step--)
+	{
+		const int t = (step + rotation) & 255;
+		if (states)
+			states[t] = (uint16_t)s;
+		const int f = _ccv_nnc_8i_rowwise_tmcq_fresh(t, n);
+		const int low = s & ((1 << (15 - f)) - 1);
+		s = (low << f) | ws->bp[(size_t)step * CCV_NNC_8I_ROWWISE_TMCQ_LOWS + low];
+	}
+	return s;
+}
+
+// Tail-biting fit with a mid anchor (spec 4.2): a free pass is traced back from t = 255 to t = 128 to read
+// s* = s_127 on its best path; a second pass rotated by 128 steps (t = 128 .. 255, 0 .. 127) pins both ends
+// to s*, so the anchor sits in the middle of the tile instead of at its wrap-around.
 static void _ccv_nnc_8i_rowwise_tmcq_viterbi(const ccv_nnc_8i_rowwise_tmcq_viterbi_t* const ws, const double* const y, const double* const w, const int n, uint16_t* const states)
 {
-	const int s_star = _ccv_nnc_8i_rowwise_tmcq_viterbi_pass(ws, y, w, n, -1, 0);
-	_ccv_nnc_8i_rowwise_tmcq_viterbi_pass(ws, y, w, n, s_star, ws->bp);
-	int s = s_star;
-	int t;
-	for (t = 255; t >= 0; t--)
-	{
-		states[t] = (uint16_t)s;
-		const int f = _ccv_nnc_8i_rowwise_tmcq_end(t, n) - (t > 0 ? _ccv_nnc_8i_rowwise_tmcq_end(t - 1, n) : 0);
-		const int low = s & ((1 << (15 - f)) - 1);
-		s = (low << f) | ws->bp[(size_t)t * CCV_NNC_8I_ROWWISE_TMCQ_LOWS + low];
-	}
-	assert(s == s_star); // s_{-1} wraps around to s_255.
+	const int s_end = _ccv_nnc_8i_rowwise_tmcq_viterbi_pass(ws, y, w, n, 0, -1, ws->bp, 128);
+	const int s_star = _ccv_nnc_8i_rowwise_tmcq_backtrack(ws, n, 0, 255, 128, s_end, 0);
+	_ccv_nnc_8i_rowwise_tmcq_viterbi_pass(ws, y, w, n, 128, s_star, ws->bp, 0);
+	const int s = _ccv_nnc_8i_rowwise_tmcq_backtrack(ws, n, 128, 255, 0, s_star, states);
+	assert(s == s_star); // The state before t = 128 is s_127 = s*.
 	(void)s;
 }
 
