@@ -1131,6 +1131,22 @@ enum {
 	CCV_NNC_QX_8I_ROWWISE_Q6_K,
 	CCV_NNC_QX_8I_ROWWISE_IQ1_S,
 	CCV_NNC_QX_8I_ROWWISE_IQ1_M,
+	/* TMCQ (trellis multiply-codebook quantization). Each 16 x 16 tile of the weight (16 rows x 16
+	 * columns, tiles row-major over the tile grid, weights row-major inside a tile) is one tail-biting
+	 * bitshift trellis of 16 * n bits, n / 16 bits per weight. Weight t (0..255) of a tile reads the
+	 * 15-bit LSB-first window that ends at bit E_t = floor((t + 1) * n / 16), wrapping inside the tile.
+	 * Its int8 code is q8 = min((bytesum((uint32_t)cw * 0x83DCD12D) >> 2) - 127, 127), so the weight is
+	 * row_scale * q8 like every other row-wise-x codec. One value per even rate n = 16..32; requires
+	 * row_count % 16 == 0 and row_length % 256 == 0. */
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N16,
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N18,
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N20,
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N22,
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N24,
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N26,
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N28,
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N30,
+	CCV_NNC_QX_8I_ROWWISE_TMCQ_N32,
 };
 
 /* Modifiers for the format argument / tensor reserved field of ROWWISE_X. */
