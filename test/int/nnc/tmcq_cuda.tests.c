@@ -489,8 +489,13 @@ TEST_CASE("cublas forward gemm with TMCQ weights falls back to the dequantized w
 TEST_CASE("cublas forward gemm with TMCQ weights runs the CUTLASS int8 GEMM from M = 5 to 2048")
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_GPU_CUBLAS));
+	// CCV_REQUIRE_CUTLASS_TESTS=1 turns every skip of this case into a failure, so a build that is meant to cover the
+	// CUTLASS path cannot pass silently.
+	const char* const require_env = getenv("CCV_REQUIRE_CUTLASS_TESTS");
+	const int require = require_env && require_env[0] == '1';
 #ifndef HAVE_CUDA_SM80
 	printf("SKIP: TMCQ CUTLASS int8 GEMM test: built without HAVE_CUDA_SM80 (configure --enable-sm80), thus more than 4 rows take the dequantizing cuBLAS fallback\n");
+	REQUIRE(!require, "CCV_REQUIRE_CUTLASS_TESTS=1 but the build has no HAVE_CUDA_SM80");
 #else
 	const int datatypes[] = {CCV_32F, CCV_16F, CCV_16BF};
 	const double tolerances[] = {1e-4, 1e-3, 5e-3};
@@ -507,6 +512,7 @@ TEST_CASE("cublas forward gemm with TMCQ weights runs the CUTLASS int8 GEMM from
 	if (!ccv_nnc_compat_8i_rowwise_gemm_supported(CCV_32F, 0, 0, 0, 0, shapes[0][0], shapes[0][1], shapes[0][2], &workspace_size))
 	{
 		printf("SKIP: TMCQ CUTLASS int8 GEMM test: the int8 GEMM is not supported on this device (needs sm_80 or newer)\n");
+		REQUIRE(!require, "CCV_REQUIRE_CUTLASS_TESTS=1 but the device does not support the int8 GEMM");
 		return;
 	}
 	dsfmt_t dsfmt;
