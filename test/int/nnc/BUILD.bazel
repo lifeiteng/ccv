@@ -293,6 +293,16 @@ cc_binary(
 )
 
 cc_binary(
+	name = "tmcq_cuda.tests",
+	srcs = ["tmcq_cuda.tests.c"],
+	copts = ccv_default_copts(),
+	deps = [
+		"//test:case",
+		"//lib:nnc"
+	]
+)
+
+cc_binary(
 	name = "pad.tests",
 	srcs = ["pad.tests.c"],
 	copts = ccv_default_copts(),
