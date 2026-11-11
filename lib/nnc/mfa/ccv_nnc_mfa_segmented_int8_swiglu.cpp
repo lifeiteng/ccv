@@ -72,8 +72,9 @@ void ccv_nnc_mfa_encode_segmented_int8_swiglu(
   descriptor.broadcastInput = params.broadcast_input;
   descriptor.clamp = params.clamp;
   descriptor.memoryPrecision = ioPrecision(params.data_type);
-  // Four rows per threadgroup (one per SIMD group), or for TMCQ four 16-row tile rows.
-  const NS::UInteger rowsPerThreadgroup = segmentedTMCQRate(params.format) ? 16 * kSegmentedInt8SwiGLUTMCQSIMDGroups : 4;
+  // Four rows per threadgroup (one per SIMD group), or for TMCQ one 16-row tile row whose SIMD groups
+  // split K.
+  const NS::UInteger rowsPerThreadgroup = segmentedTMCQRate(params.format) ? 16 : 4;
   const NS::UInteger threadgroupsPerRoute = (params.N + rowsPerThreadgroup - 1) / rowsPerThreadgroup;
   const NS::UInteger routedThreadgroups = threadgroupsPerRoute * params.M;
   descriptor.sharedRows = params.shared_rows;

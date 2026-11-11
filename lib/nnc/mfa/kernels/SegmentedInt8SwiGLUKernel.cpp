@@ -494,6 +494,7 @@ inline void segmented_int8_swiglu_routes(
   device const int* counts,
   device const real* route_weights,
   threadgroup int& route_expert,
+  threadgroup float* route_scratch,
   uint threadgroup_position,
   uint simdgroup_index,
   uint lane)
@@ -519,9 +520,11 @@ kernel void segmented_int8_swiglu(
   uint lane [[thread_index_in_simdgroup]])
 {
   threadgroup int route_expert;
+  // Cross-SIMD-group partial sums for the formats that split K (TMCQ); the others leave it unused.
+  threadgroup float route_scratch[2 * 4 * 16];
   segmented_int8_swiglu_routes(
     gate_weights, up_weights, activation, destination, gate_scales, up_scales,
-    indices, counts, route_weights, route_expert, threadgroup_position,
+    indices, counts, route_weights, route_expert, route_scratch, threadgroup_position,
     simdgroup_index, lane);
 }
 )";
@@ -656,6 +659,8 @@ kernel void segmented_int8_swiglu_shared(
   uint lane [[thread_index_in_simdgroup]])
 {
   threadgroup int route_expert;
+  // Cross-SIMD-group partial sums for the formats that split K (TMCQ); the others leave it unused.
+  threadgroup float route_scratch[2 * 4 * 16];
   // Spread the shared threadgroups evenly through the grid, as the Q8_0 shared rows do.
   const uint shared_threadgroups = (shared_nrows + shared_rows_per_threadgroup - 1u) / shared_rows_per_threadgroup;
   const uint total = routed_threadgroups + shared_threadgroups;
@@ -667,7 +672,7 @@ kernel void segmented_int8_swiglu_shared(
   else
     segmented_int8_swiglu_routes(
       gate_weights, up_weights, activation, destination, gate_scales, up_scales,
-      indices, counts, route_weights, route_expert, threadgroup_position - shared_before,
+      indices, counts, route_weights, route_expert, route_scratch, threadgroup_position - shared_before,
       simdgroup_index, lane);
 }
 )";
@@ -806,6 +811,8 @@ kernel void segmented_int8_swiglu_shared(
   uint lane [[thread_index_in_simdgroup]])
 {
   threadgroup int route_expert;
+  // Cross-SIMD-group partial sums for the formats that split K (TMCQ); the others leave it unused.
+  threadgroup float route_scratch[2 * 4 * 16];
   threadgroup float partials[4][32];
   // Spread the shared threadgroups evenly through the grid: grouping them at either end leaves
   // most of the routed work without bandwidth-bound neighbors.
@@ -819,7 +826,7 @@ kernel void segmented_int8_swiglu_shared(
   else
     segmented_int8_swiglu_routes(
       gate_weights, up_weights, activation, destination, gate_scales, up_scales,
-      indices, counts, route_weights, route_expert, threadgroup_position - shared_before,
+      indices, counts, route_weights, route_expert, route_scratch, threadgroup_position - shared_before,
       simdgroup_index, lane);
 }
 )";
@@ -1239,10 +1246,10 @@ inline float stable_sigmoid(const float value)
 )";
   appendRoutesSignature(shader);
   shader += R"(
-  constexpr uint row_simdgroups = )" + std::to_string(kSegmentedInt8SwiGLUTMCQSIMDGroups) + R"(;
+  // One threadgroup per 16-row tile row; its SIMD groups split K and add up in route_scratch.
+  constexpr uint k_simdgroups = )" + std::to_string(kSegmentedInt8SwiGLUTMCQSIMDGroups) + R"(;
   const uint tile_rows = nrows / 16u;
-  const uint threadgroups_per_route =
-    (tile_rows + row_simdgroups - 1u) / row_simdgroups;
+  const uint threadgroups_per_route = tile_rows;
   const uint route = threadgroup_position / threadgroups_per_route;
   if (simdgroup_index == 0 && lane == 0) {
     route_expert = -1;
@@ -1271,10 +1278,7 @@ inline float stable_sigmoid(const float value)
   // test/int/nnc/segmented_swiglu.tests.c.
   const float route_weight = (float)route_weights[route];
 
-  const uint tile_row =
-    (threadgroup_position - route * threadgroups_per_route) * row_simdgroups + simdgroup_index;
-  if (tile_row >= tile_rows)
-    return;
+  const uint tile_row = threadgroup_position - route * threadgroups_per_route;
   // An expert is nrows / 16 whole tile rows, so weight_expert_stride (bytes) is a multiple of the
   // 2n-byte tile and every tile starts on a word.
   const uint tiles_per_row = ncols / 16u;
@@ -1292,8 +1296,8 @@ inline float stable_sigmoid(const float value)
   const uint r = lane & 15u;
   float gate_sum = 0;
   float up_sum = 0;
-  // ncols % 256 == 0, so both halves run the same number of steps.
-  for (uint tc = lane >> 4; tc < tiles_per_row; tc += 2u) {
+  // ncols % 256 == 0, so every one of the 2 * k_simdgroups streams runs the same number of steps.
+  for (uint tc = simdgroup_index * 2u + (lane >> 4); tc < tiles_per_row; tc += 2u * k_simdgroups) {
     const ulong tile_word = (ulong)tc * TMCQ_TILE_WORDS;
     device const uint* gate_tile = gate_tiles + tile_word;
     device const uint* up_tile = up_tiles + tile_word;
@@ -1311,6 +1315,17 @@ inline float stable_sigmoid(const float value)
   gate_sum += simd_shuffle_xor(gate_sum, 16);
   up_sum += simd_shuffle_xor(up_sum, 16);
   if (lane < 16) {
+    route_scratch[simdgroup_index * 16u + r] = gate_sum;
+    route_scratch[(k_simdgroups + simdgroup_index) * 16u + r] = up_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simdgroup_index == 0 && lane < 16) {
+    gate_sum = 0;
+    up_sum = 0;
+    for (uint s = 0; s < k_simdgroups; ++s) {
+      gate_sum += route_scratch[s * 16u + r];
+      up_sum += route_scratch[(k_simdgroups + s) * 16u + r];
+    }
     const uint row = tile_row * 16u + r;
     float gate0 = gate_sum * (float)gate_scales[row];
     float up0 = up_sum * (float)up_scales[row];

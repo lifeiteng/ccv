@@ -8,12 +8,13 @@
 static const char* const ccv_nnc_mfa_tmcq_decode_source = R"(
 // int8 code of a 15-bit TMCQ codeword: bytesum(cw * 0x83DCD12D) / 4 - 127, clamped to 127.
 // s holds two 16-bit lanes, each the sum of one byte pair. s * 0x10001 puts lo + hi lanes (the byte
-// sum, at most 1020, so no carry leaves the lane) in bits 16 .. 31, and >> 18 is that sum / 4.
+// sum) in bits 16 .. 31, and >> 18 is that sum / 4. Over all 32768 codewords the byte sum is at most
+// 1005 (checked exhaustively), so the code is at most 124 and the clamp never applies.
 inline int tmcq_q8(uint cw)
 {
   const uint x = cw * 0x83DCD12Du;
   const uint s = (x & 0x00ff00ffu) + ((x >> 8) & 0x00ff00ffu);
-  return min(int((s * 0x10001u) >> 18) - 127, 127);
+  return int((s * 0x10001u) >> 18) - 127;
 }
 
 // The 32 bits of the little-endian pair (lo, hi) starting at bit o (0 <= o < 32).

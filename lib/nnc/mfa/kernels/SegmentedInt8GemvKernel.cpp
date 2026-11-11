@@ -1106,10 +1106,12 @@ kernel void segmented_int8_gemv(
   uint sgitg [[simdgroup_index_in_threadgroup]],
   uint tiisg [[thread_index_in_simdgroup]]
 ) {
+  // One threadgroup per 16-row tile row; its S SIMD groups split K and add up in partials.
   const uint tile_rows = nrows / 16u;
-  const uint threadgroups_per_route = (tile_rows + S - 1u) / S;
+  const uint threadgroups_per_route = tile_rows;
   const uint route = tgpig_position / threadgroups_per_route;
   threadgroup int route_expert;
+  threadgroup float partials[S * 16];
   if (sgitg == 0 && tiisg == 0) {
     route_expert = -1;
     uint row_offset = 0;
@@ -1129,9 +1131,7 @@ kernel void segmented_int8_gemv(
   const int expert = route_expert;
   if (expert < 0 || expert >= (int)expert_count)
     return;
-  const uint tile_row = (tgpig_position - route * threadgroups_per_route) * S + sgitg;
-  if (tile_row >= tile_rows)
-    return;
+  const uint tile_row = tgpig_position - route * threadgroups_per_route;
 
   // An expert is nrows / 16 whole tile rows, so weight_expert_stride (bytes) is a multiple of the
   // 2n-byte tile and every tile starts on a word.
@@ -1142,8 +1142,8 @@ kernel void segmented_int8_gemv(
   device const real4* y4 = (device const real4*)src1;
   const uint r = tiisg & 15u;
   float sum = 0;
-  // ncols % 256 == 0, so both halves run the same number of steps.
-  for (uint tc = tiisg >> 4; tc < tiles_per_row; tc += 2u) {
+  // ncols % 256 == 0, so every one of the 2 S streams runs the same number of steps.
+  for (uint tc = sgitg * 2u + (tiisg >> 4); tc < tiles_per_row; tc += 2u * S) {
     device const uint* tile = tiles + (ulong)tc * TMCQ_TILE_WORDS;
     const float4 y0 = float4(y4[tc * 4u + 0u]);
     const float4 y1 = float4(y4[tc * 4u + 1u]);
@@ -1154,7 +1154,13 @@ kernel void segmented_int8_gemv(
     sum += dot(float4(q[0]), y0) + dot(float4(q[1]), y1) + dot(float4(q[2]), y2) + dot(float4(q[3]), y3);
   }
   sum += simd_shuffle_xor(sum, 16);
-  if (tiisg < 16) {
+  if (tiisg < 16)
+    partials[sgitg * 16u + r] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgitg == 0 && tiisg < 16) {
+    sum = 0;
+    for (uint s = 0; s < S; s++)
+      sum += partials[s * 16u + r];
     const uint row = tile_row * 16u + r;
     float value = sum * (float)scales[(ulong)expert * nrows + row];
 )";

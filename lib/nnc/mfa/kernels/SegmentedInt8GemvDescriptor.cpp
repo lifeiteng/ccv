@@ -227,7 +227,8 @@ uint32_t segmentedTMCQRate(const uint32_t format)
 
 uint32_t segmentedInt8GemvRowsPerThreadgroup(const uint32_t format)
 {
+  // TMCQ: one 16-row tile row per threadgroup, its SIMD groups splitting K.
   if (segmentedTMCQRate(format))
-    return 16 * segmentedInt8GemvSIMDGroupsPerThreadgroup(format);
+    return 16;
   return kSegmentedInt8GemvRowsPerSIMDGroup * segmentedInt8GemvSIMDGroupsPerThreadgroup(format);
 }

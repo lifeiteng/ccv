@@ -69,7 +69,7 @@ void ccv_nnc_mfa_encode_segmented_int8_gemv(
   descriptor.useBias = params.fused_bias;
   descriptor.broadcastInput = params.broadcast_input;
   const uint32_t simdgroups = segmentedInt8GemvSIMDGroupsPerThreadgroup(params.format);
-  // Two rows per SIMD group, or for TMCQ one 16-row tile row per SIMD group.
+  // Two rows per SIMD group, or for TMCQ one 16-row tile row per threadgroup.
   const uint32_t rowsPerThreadgroup = segmentedInt8GemvRowsPerThreadgroup(params.format);
   const NS::UInteger threadgroupsPerRoute =
     (params.N + rowsPerThreadgroup - 1) / rowsPerThreadgroup;
