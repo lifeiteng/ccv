@@ -199,13 +199,14 @@ kernel void dequantize_8i_rowwise_x_fp(
   const uint tc = x - row * tiles_per_row;
   const ulong tile_index = (ulong)(row >> 4) * tiles_per_row + tc;
   device const uint* tile = reinterpret_cast<device const uint*>(source) + tile_index * tmcq_tile_words;
-  const uint t = (row & 15u) << 4;
+  int4 q[4];
+  tmcq_decode_row16(tile, tmcq_n, row & 15u, q);
   const float scale = (float)scales[row];
   device vec<real, 4>* destination4 = reinterpret_cast<device vec<real, 4>*>(reinterpret_cast<device real*>(destination) + (ulong)row * row_length + (tc << 4));
-  destination4[0] = tmcq_real4(tile, t, scale);
-  destination4[1] = tmcq_real4(tile, t + 4, scale);
-  destination4[2] = tmcq_real4(tile, t + 8, scale);
-  destination4[3] = tmcq_real4(tile, t + 12, scale);
+  destination4[0] = vec<real, 4>(float4(q[0]) * scale);
+  destination4[1] = vec<real, 4>(float4(q[1]) * scale);
+  destination4[2] = vec<real, 4>(float4(q[2]) * scale);
+  destination4[3] = vec<real, 4>(float4(q[3]) * scale);
 }
 )";
 	return shader;

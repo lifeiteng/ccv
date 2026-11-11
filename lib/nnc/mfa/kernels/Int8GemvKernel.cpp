@@ -1068,10 +1068,12 @@ kernel void int8_gemv(
     sum[m] = 0;
   for (uint tc = stream; tc < tiles_per_row; tc += S * 2) {
     device const uint* tile = tiles + (ulong)tc * tmcq_tile_words;
-    const float4 w0 = tmcq_float4(tile, t);
-    const float4 w1 = tmcq_float4(tile, t + 4);
-    const float4 w2 = tmcq_float4(tile, t + 8);
-    const float4 w3 = tmcq_float4(tile, t + 12);
+    int4 q[4];
+    tmcq_decode_row16(tile, tmcq_n, r, q);
+    const float4 w0 = float4(q[0]);
+    const float4 w1 = float4(q[1]);
+    const float4 w2 = float4(q[2]);
+    const float4 w3 = float4(q[3]);
     for (uint m = 0; m < M; m++) {
       device const real4* y = (device const real4*)(src1 + (ulong)vector_row_stride * m) + tc * 4;
       sum[m] += dot(w0, float4(y[0])) + dot(w1, float4(y[1])) + dot(w2, float4(y[2])) + dot(w3, float4(y[3]));

@@ -282,12 +282,13 @@ inline void tmcq_store_segment(device const uchar* source, device uchar* destina
   const uint tiles_per_row = row_length >> 4;
   const ulong tile_index = (ulong)(row >> 4) * tiles_per_row + tc;
   device const uint* tile = reinterpret_cast<device const uint*>(source) + tile_index * tmcq_tile_words;
-  const uint t = (row & 15u) << 4;
+  int4 q[4];
+  tmcq_decode_row16(tile, tmcq_n, row & 15u, q);
   device char4* destination4 = reinterpret_cast<device char4*>(destination + (ulong)row * row_length + (tc << 4));
-  destination4[0] = tmcq_char4(tile, t);
-  destination4[1] = tmcq_char4(tile, t + 4);
-  destination4[2] = tmcq_char4(tile, t + 8);
-  destination4[3] = tmcq_char4(tile, t + 12);
+  destination4[0] = char4(q[0]);
+  destination4[1] = char4(q[1]);
+  destination4[2] = char4(q[2]);
+  destination4[3] = char4(q[3]);
 }
 
 kernel void dequantize_8i_rowwise_x(

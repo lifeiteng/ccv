@@ -1310,10 +1310,12 @@ inline float stable_sigmoid(const float value)
     const float4 y1 = float4(activation4[tc * 4u + 1u]);
     const float4 y2 = float4(activation4[tc * 4u + 2u]);
     const float4 y3 = float4(activation4[tc * 4u + 3u]);
-    gate_sum += dot(tmcq_codes4(gate_tile, t), y0) + dot(tmcq_codes4(gate_tile, t + 4u), y1) +
-      dot(tmcq_codes4(gate_tile, t + 8u), y2) + dot(tmcq_codes4(gate_tile, t + 12u), y3);
-    up_sum += dot(tmcq_codes4(up_tile, t), y0) + dot(tmcq_codes4(up_tile, t + 4u), y1) +
-      dot(tmcq_codes4(up_tile, t + 8u), y2) + dot(tmcq_codes4(up_tile, t + 12u), y3);
+    int4 g[4];
+    int4 u[4];
+    tmcq_decode_row16(gate_tile, TMCQ_N, r, g);
+    tmcq_decode_row16(up_tile, TMCQ_N, r, u);
+    gate_sum += dot(float4(g[0]), y0) + dot(float4(g[1]), y1) + dot(float4(g[2]), y2) + dot(float4(g[3]), y3);
+    up_sum += dot(float4(u[0]), y0) + dot(float4(u[1]), y1) + dot(float4(u[2]), y2) + dot(float4(u[3]), y3);
   }
   gate_sum += simd_shuffle_xor(gate_sum, 16);
   up_sum += simd_shuffle_xor(up_sum, 16);

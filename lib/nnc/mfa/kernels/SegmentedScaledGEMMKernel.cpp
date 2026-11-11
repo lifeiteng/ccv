@@ -723,13 +723,11 @@ kernel void segmented_scaled_gemm(
         ((ulong)tn * (K / 16u) + k / 16u + tk) * ({{TMCQ_RATE}}u / 2u);
       threadgroup char4* destination =
         (threadgroup char4*)(weights + (tn * 16u + r) * {{BLOCK_K}}u + tk * 16u);
+      int4 q[4];
+      tmcq_decode_row16(p, {{TMCQ_RATE}}u, r, q);
       #pragma clang loop unroll(full)
-      for (uint c = 0; c < 4u; ++c) {
-        const uint t = r * 16u + c * 4u;
-        destination[c] = char4(int4(
-          tmcq_decode(p, {{TMCQ_RATE}}u, t), tmcq_decode(p, {{TMCQ_RATE}}u, t + 1u),
-          tmcq_decode(p, {{TMCQ_RATE}}u, t + 2u), tmcq_decode(p, {{TMCQ_RATE}}u, t + 3u)));
-      }
+      for (uint c = 0; c < 4u; ++c)
+        destination[c] = char4(q[c]);
     }
 )";
     } else if (format == CCV_NNC_QX_8I_ROWWISE_IQ1_S || format == CCV_NNC_QX_8I_ROWWISE_IQ1_M) {

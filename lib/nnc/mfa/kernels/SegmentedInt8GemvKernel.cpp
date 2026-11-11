@@ -1157,9 +1157,9 @@ kernel void segmented_int8_gemv(
     const float4 y1 = float4(y4[tc * 4u + 1u]);
     const float4 y2 = float4(y4[tc * 4u + 2u]);
     const float4 y3 = float4(y4[tc * 4u + 3u]);
-    const uint t = r * 16u;
-    sum += dot(tmcq_codes4(tile, t), y0) + dot(tmcq_codes4(tile, t + 4u), y1) +
-      dot(tmcq_codes4(tile, t + 8u), y2) + dot(tmcq_codes4(tile, t + 12u), y3);
+    int4 q[4];
+    tmcq_decode_row16(tile, TMCQ_N, r, q);
+    sum += dot(float4(q[0]), y0) + dot(float4(q[1]), y1) + dot(float4(q[2]), y2) + dot(float4(q[3]), y3);
   }
   sum += simd_shuffle_xor(sum, 16);
   if (tiisg < 16) {
