@@ -221,10 +221,10 @@ static const int tmcq_datatypes[] = { CCV_32F, CCV_16F, CCV_16BF };
 TEST_CASE("tmcq reference decode fixed vectors")
 {
 	// CPU-only checks of the reference itself (no GPU needed). All-zero codewords: cw = 0 selects pair
-	// 0 of the frozen table, (8, -46): even weights take 8, odd weights -46.
+	// 0 of the frozen table, (54, -52): even weights take 54, odd weights -52.
 	uint8_t zeros[128] = {0}; // tile 1 at n = 32 is bytes 64 .. 127
-	REQUIRE_EQ(tmcq_ref_decode(zeros, 0, 16, 0), 8, "zero payload decodes even weights to pair 0's first code");
-	REQUIRE_EQ(tmcq_ref_decode(zeros, 1, 32, 255), -46, "zero payload decodes odd weights to pair 0's second code");
+	REQUIRE_EQ(tmcq_ref_decode(zeros, 0, 16, 0), 54, "zero payload decodes even weights to pair 0's first code");
+	REQUIRE_EQ(tmcq_ref_decode(zeros, 1, 32, 255), -52, "zero payload decodes odd weights to pair 0's second code");
 	// All-ones windows give cw = 0x7fff, pair (0x7fff * 0x83DCD12D) >> 23, recomputed here.
 	const uint32_t k = (0x7fffu * 0x83DCD12Du) >> 23;
 	uint8_t ones[64];

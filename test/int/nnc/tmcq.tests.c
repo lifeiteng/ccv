@@ -111,17 +111,17 @@ static void _test_tmcq_from_float(const float* const values, const int datatype,
 TEST_CASE("TMCQ code values follow the P2 pair codebook definition")
 {
 	// k = (cw * 0x83DCD12D) >> 23, read by hand off ccv_nnc_tmcq_table.inc (16 entries per line, T[2k] and T[2k + 1]).
-	REQUIRE_EQ(_test_tmcq_q8(0, 0), 8, "zero state is pair 0, first weight");
-	REQUIRE_EQ(_test_tmcq_q8(0, 1), -46, "zero state is pair 0, second weight");
+	REQUIRE_EQ(_test_tmcq_q8(0, 0), 54, "zero state is pair 0, first weight");
+	REQUIRE_EQ(_test_tmcq_q8(0, 1), -52, "zero state is pair 0, second weight");
 	// 1 * 0x83DCD12D >> 23 = 0x107 = 263 -> T[526], T[527].
-	REQUIRE_EQ(_test_tmcq_q8(1, 0), -12, "unit state is pair 263");
-	REQUIRE_EQ(_test_tmcq_q8(1, 1), -26, "unit state is pair 263");
+	REQUIRE_EQ(_test_tmcq_q8(1, 0), -18, "unit state is pair 263");
+	REQUIRE_EQ(_test_tmcq_q8(1, 1), -96, "unit state is pair 263");
 	// 0x7fff * 0x83DCD12D = 0x41EDE4B9AED3 -> low 32 bits 0xE4B9AED3 >> 23 = 0x1C9 = 457 -> T[914], T[915].
-	REQUIRE_EQ(_test_tmcq_q8(0x7fff, 0), -35, "all-ones state is pair 457");
-	REQUIRE_EQ(_test_tmcq_q8(0x7fff, 1), 3, "all-ones state is pair 457");
+	REQUIRE_EQ(_test_tmcq_q8(0x7fff, 0), 44, "all-ones state is pair 457");
+	REQUIRE_EQ(_test_tmcq_q8(0x7fff, 1), -3, "all-ones state is pair 457");
 	// 0x4000 * 0x83DCD12D = 0x20F7344B4000 -> 0x344B4000 >> 23 = 0x68 = 104 -> T[208], T[209].
-	REQUIRE_EQ(_test_tmcq_q8(0x4000, 0), 3, "top-bit state is pair 104");
-	REQUIRE_EQ(_test_tmcq_q8(0x4000, 1), 34, "top-bit state is pair 104");
+	REQUIRE_EQ(_test_tmcq_q8(0x4000, 0), -22, "top-bit state is pair 104");
+	REQUIRE_EQ(_test_tmcq_q8(0x4000, 1), -9, "top-bit state is pair 104");
 	int s, min_q = 127, max_q = -127;
 	for (s = 0; s < 32768; s++)
 	{
@@ -129,7 +129,7 @@ TEST_CASE("TMCQ code values follow the P2 pair codebook definition")
 		min_q = ccv_min(min_q, ccv_min(q0, q1));
 		max_q = ccv_max(max_q, ccv_max(q0, q1));
 	}
-	REQUIRE_EQ(min_q, -123, "smallest reachable code");
+	REQUIRE_EQ(min_q, -118, "smallest reachable code");
 	REQUIRE_EQ(max_q, 127, "largest reachable code");
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_tmcq_rate(CCV_NNC_QX_8I_ROWWISE_TMCQ_N16), 16, "lowest rate");
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_tmcq_rate(CCV_NNC_QX_8I_ROWWISE_TMCQ_N32), 32, "highest rate");
@@ -164,11 +164,11 @@ TEST_CASE("TMCQ CPU decode of fixed payloads writes tiles back in row-major orde
 			expected[i] = (float)((double)((float*)(packed + scale_offset))[i / cols] * q8[i]);
 		ccv_nnc_dequantize_8i_rowwise_x(packed, CCV_32F, CCV_TENSOR_CPU_MEMORY, size, cols, tmcq_formats[f], actual, count);
 		REQUIRE_ARRAY_EQ(float, expected, actual, count, "tail-biting windows, codebook and tile order match for n = %d", n);
-		// All-zero tiles are pair 0 everywhere: 8 on even columns, -46 on odd ones.
+		// All-zero tiles are pair 0 everywhere: 54 on even columns, -52 on odd ones.
 		memset(packed, 0, scale_offset);
 		ccv_nnc_dequantize_8i_rowwise_x(packed, CCV_32F, CCV_TENSOR_CPU_MEMORY, size, cols, tmcq_formats[f], actual, count);
 		for (i = 0; i < count; i++)
-			expected[i] = (float)((double)((float*)(packed + scale_offset))[i / cols] * (i % 2 ? -46 : 8));
+			expected[i] = (float)((double)((float*)(packed + scale_offset))[i / cols] * (i % 2 ? -52 : 54));
 		REQUIRE_ARRAY_EQ(float, expected, actual, count, "zero payload is the pair-0 code");
 		ccfree(actual);
 		ccfree(expected);
@@ -919,7 +919,7 @@ TEST_CASE("TMCQ P2 table matches the frozen SHA-256")
 	REQUIRE_EQ(sizeof(ccv_nnc_tmcq_p2_table), 1024, "512 pairs of int8");
 	char digest[65];
 	_test_sha256((const uint8_t*)ccv_nnc_tmcq_p2_table, sizeof(ccv_nnc_tmcq_p2_table), digest);
-	REQUIRE(strcmp(digest, "a24c22821cd90b2fb42466b9ff4685805e86dc2974f9a71e1b12f94ecedd51c6") == 0, "table digest %s", digest);
+	REQUIRE(strcmp(digest, "d58cf36d15b31e5b121334f704b15ad99bc39837ac5c096f0a37b7632763f34c") == 0, "table digest %s", digest);
 }
 
 TEST_CASE("TMCQ golden vectors for the QuantStar reference")
@@ -935,14 +935,14 @@ TEST_CASE("TMCQ golden vectors for the QuantStar reference")
 	enum { rows = 16, cols = 256, count = rows * cols, samples = 512 };
 	static const char* const expected_digest[2][3] = {
 		{ // imatrix: n = 16, 22, 32.
-			"561546369de35f26ff9464422540877e272d6747f7c8ce19bbfe62a29c3405fa",
-			"b048be3d7434fdfc59791248795218be78218c00317f8ca20aaa7d18e445024e",
-			"b8c6d6a5b5d54ae7794da051777c733e98f93bb7d5d41c475717dcdb62f33caf",
+			"0de4e1b3a5d7f4c3b250c23ff76c3e7c31e75976f93aee22f2aaec3ea56b1163",
+			"e0e4b8eee76a6bf3a7c4bf5efe8f19d7f18ed4678cb71ba990ef4ed4076c4fda",
+			"e33101eaf3b1b91c9154843135e99eef99d2e39e4132bd5f4df4692b945b89c7",
 		},
 		{ // Hessian: n = 16, 22, 32.
-			"957ff0aba21604c518beb44bb63015b38dbaa78714cd47ab021ea6e07782bf70",
-			"e28cece33864086a1a0cba025c29f3bdcd261becb1fd08c8fb337f251f9883c1",
-			"1734859f65df7fa86bb306687bdf373ed3f7f770cbbc924f466e9356e9303dfd",
+			"71c8225e8373a748497c540dc2deff2e55ea530de0b5395cb4ab81408a28caee",
+			"6ab0a806b50f94fb13bae366d5666cd873e134c50d20eae0a3ee49aad65396b3",
+			"a2e1836cfee7ce7d8705b7a03a7360bb3d51a6e9a8ad682c33ef4ce5cf2fa0aa",
 		},
 	};
 	const int formats[3] = {CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N22, CCV_NNC_QX_8I_ROWWISE_TMCQ_N32};

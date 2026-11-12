@@ -1137,7 +1137,7 @@ enum {
 	 * the weight pair 2j, 2j + 1 (j = 0..127) reads the 15-bit LSB-first window cw that ends at bit E_{2j+1}
 	 * (bits E - 15 .. E - 1, wrapping inside the tile), takes k = ((uint32_t)cw * 0x83DCD12D) >> 23 and gets
 	 * the int8 codes q8[2j] = T[2k], q8[2j + 1] = T[2k + 1] from the frozen 1024-byte table T in
-	 * ccv_nnc_tmcq_table.inc (values in [-123, 127]). The weight is row_scale * q8 like every other
+	 * ccv_nnc_tmcq_table.inc (values in [-118, 127]). The weight is row_scale * q8 like every other
 	 * row-wise-x codec. One value per even rate n = 16..32; requires row_count % 16 == 0 and
 	 * row_length % 256 == 0. */
 	CCV_NNC_QX_8I_ROWWISE_TMCQ_N16,
