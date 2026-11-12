@@ -9,11 +9,13 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <nnc/ccv_nnc_tmcq_table.inc>
 
 // Metal TMCQ tests: the int8 and fp decode kernels, the selected (MoE expert) int8 decode, the TMCQ
 // GEMV (M = 1..3) and the decode-then-GEMM paths. Every expected value comes from tmcq_ref_q8 /
-// tmcq_ref_decode below, written from the TMCQ v1 spec (section 3) at the byte level, independent
-// of the Metal helpers in lib/nnc/mfa/kernels/TMCQDecodeSource.hpp. Any bit string is a valid
+// tmcq_ref_decode below, written from the TMCQ v1.2 spec at the byte level (only the frozen pair
+// table ccv_nnc_tmcq_p2_table is shared), independent of the Metal helpers in
+// lib/nnc/mfa/kernels/TMCQDecodeSource.hpp. Any bit string is a valid
 // TMCQ payload, so payloads are random bytes.
 //
 // Set TMCQ_CPU_REFERENCE=1 once the CPU TMCQ decode (ccv_nnc_dequantize_8i_rowwise_x on CPU memory)
@@ -39,21 +41,22 @@ static int tmcq_rate_of(const int format)
 	return 16 + 2 * (format - CCV_NNC_QX_8I_ROWWISE_TMCQ_N16);
 }
 
-static int tmcq_ref_q8(const uint32_t cw)
+// Code `half` (0 for an even weight, 1 for an odd one) of the pair that codeword cw selects:
+// entry (cw * 0x83DCD12D) >> 23 of the 512-pair table.
+static int tmcq_ref_q8(const uint32_t cw, const int half)
 {
-	const uint32_t x = cw * 0x83DCD12Du;
-	const int bs = (int)(x & 0xff) + (int)((x >> 8) & 0xff) + (int)((x >> 16) & 0xff) + (int)(x >> 24);
-	const int q = (bs >> 2) - 127;
-	return q < 127 ? q : 127;
+	const uint32_t k = (cw * 0x83DCD12Du) >> 23;
+	return ccv_nnc_tmcq_p2_table[2 * k + half];
 }
 
-// Weight t (row t / 16, column t % 16) of tile `tile`: the 15-bit LSB-first window ending at
-// E_t = ((t + 1) n) >> 4, wrapping inside the tile's T = 16 n bits.
+// Weight t (row t / 16, column t % 16) of tile `tile`: the 15-bit LSB-first window of weight t | 1,
+// ending at E_{t|1} = (((t | 1) + 1) n) >> 4 and wrapping inside the tile's T = 16 n bits, then half
+// t & 1 of its pair.
 static int tmcq_ref_decode(const uint8_t* const payload, const size_t tile, const int n, const int t)
 {
 	const size_t T = (size_t)16 * n;
 	const size_t base = tile * T;
-	const size_t end = ((size_t)(t + 1) * n) >> 4;
+	const size_t end = ((size_t)((t | 1) + 1) * n) >> 4;
 	uint32_t cw = 0;
 	int j;
 	for (j = 0; j < 15; j++)
@@ -61,7 +64,7 @@ static int tmcq_ref_decode(const uint8_t* const payload, const size_t tile, cons
 		const size_t p = base + (end + T - 15 + j) % T;
 		cw |= (uint32_t)((payload[p >> 3] >> (p & 7)) & 1) << j;
 	}
-	return tmcq_ref_q8(cw);
+	return tmcq_ref_q8(cw, t & 1);
 }
 
 // q8 of the whole [rows, cols] weight, row-major.
@@ -217,26 +220,32 @@ static const int tmcq_datatypes[] = { CCV_32F, CCV_16F, CCV_16BF };
 
 TEST_CASE("tmcq reference decode fixed vectors")
 {
-	// CPU-only checks of the reference itself (no GPU needed). All-zero codewords: x = 0, bytesum 0,
-	// q8 = -127. All-ones windows give cw = 0x7fff, recomputed here straight from the spec formula.
-	uint8_t zeros[64] = {0};
-	REQUIRE_EQ(tmcq_ref_decode(zeros, 0, 16, 0), -127, "zero payload decodes to -127");
-	REQUIRE_EQ(tmcq_ref_decode(zeros, 1, 32, 255), -127, "zero payload decodes to -127 at the last weight");
-	const uint32_t x = 0x7fffu * 0x83DCD12Du;
-	const int bs = (int)(x & 0xff) + (int)((x >> 8) & 0xff) + (int)((x >> 16) & 0xff) + (int)(x >> 24);
-	const int expected = ccv_min((bs >> 2) - 127, 127);
+	// CPU-only checks of the reference itself (no GPU needed). All-zero codewords: cw = 0 selects pair
+	// 0 of the frozen table, (8, -46): even weights take 8, odd weights -46.
+	uint8_t zeros[128] = {0}; // tile 1 at n = 32 is bytes 64 .. 127
+	REQUIRE_EQ(tmcq_ref_decode(zeros, 0, 16, 0), 8, "zero payload decodes even weights to pair 0's first code");
+	REQUIRE_EQ(tmcq_ref_decode(zeros, 1, 32, 255), -46, "zero payload decodes odd weights to pair 0's second code");
+	// All-ones windows give cw = 0x7fff, pair (0x7fff * 0x83DCD12D) >> 23, recomputed here.
+	const uint32_t k = (0x7fffu * 0x83DCD12Du) >> 23;
 	uint8_t ones[64];
 	memset(ones, 0xff, sizeof(ones));
-	REQUIRE_EQ(tmcq_ref_decode(ones, 0, 22, 17), expected, "all-ones payload decodes to q8(0x7fff)");
-	// Tail-biting: with n = 16, weight 0 ends at bit 1, so its window takes bits 2..15 of the tile's
-	// end and bit 0. Only bit 0 set gives cw = 1 << 14.
+	REQUIRE_EQ(tmcq_ref_decode(ones, 0, 22, 16), ccv_nnc_tmcq_p2_table[2 * k], "all-ones payload decodes an even weight to pair k's first code");
+	REQUIRE_EQ(tmcq_ref_decode(ones, 0, 22, 17), ccv_nnc_tmcq_p2_table[2 * k + 1], "all-ones payload decodes an odd weight to pair k's second code");
+	// Weights 0 and 1 share weight 1's window. With n = 16 it ends at E_1 = 2, so it takes bits 243..255
+	// of the tile's end, then bits 0 and 1: bit 1 is the codeword's top bit (1 << 14), bit 0 is 1 << 13.
+	uint8_t second[32] = {0};
+	second[0] = 2;
+	REQUIRE_EQ(tmcq_ref_decode(second, 0, 16, 0), tmcq_ref_q8(1u << 14, 0), "the newest bit is the codeword's top bit");
+	REQUIRE_EQ(tmcq_ref_decode(second, 0, 16, 1), tmcq_ref_q8(1u << 14, 1), "the odd weight reads the same window");
 	uint8_t first[32] = {0};
 	first[0] = 1;
-	REQUIRE_EQ(tmcq_ref_decode(first, 0, 16, 0), tmcq_ref_q8(1u << 14), "the newest bit is the codeword's top bit");
-	// Only the last bit of the tile (bit 255) set: weight 0's window holds it at position 13.
+	REQUIRE_EQ(tmcq_ref_decode(first, 0, 16, 0), tmcq_ref_q8(1u << 13, 0), "bit 0 is the window's second newest bit");
+	// Only the last bit of the tile (bit 255) set: the shared window of weights 0 and 1 holds it at
+	// position 12 (tail-biting wrap inside the tile).
 	uint8_t last[32] = {0};
 	last[31] = 0x80;
-	REQUIRE_EQ(tmcq_ref_decode(last, 0, 16, 0), tmcq_ref_q8(1u << 13), "the window wraps inside the tile");
+	REQUIRE_EQ(tmcq_ref_decode(last, 0, 16, 0), tmcq_ref_q8(1u << 12, 0), "the window wraps inside the tile");
+	REQUIRE_EQ(tmcq_ref_decode(last, 0, 16, 1), tmcq_ref_q8(1u << 12, 1), "the wrapped window is shared by the pair");
 }
 
 // The GPU tests call MPS-only entry points (the int8 decode wrapper and the selected decode).

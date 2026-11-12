@@ -8,6 +8,7 @@
 #include <3rdparty/dsfmt/dSFMT.h>
 #include <math.h>
 #include <string.h>
+#include <nnc/ccv_nnc_tmcq_table.inc>
 
 TEST_SETUP()
 {
@@ -466,14 +467,13 @@ TEST_CASE("MPS segmented SwiGLU executes grouped rowwise int8 prefill")
 	_segmented_swiglu_mps_rowwise_case(0, 0, 1, 10, "Q8_0 grouped prefill", __case_result__);
 }
 
-// TMCQ reference decode, written from the codec definition (CCV_NNC_QX_8I_ROWWISE_TMCQ_N16) rather
-// than the library's CPU codec: weight t of a 16 x 16 tile reads the 15-bit LSB-first window ending
-// at bit E_t = ((t + 1) * n) >> 4 of the tile's 16n bits, wrapping inside the tile.
-static int _segmented_swiglu_tmcq_q8(const uint32_t cw)
+// TMCQ v1.2 reference decode, written from the codec definition (CCV_NNC_QX_8I_ROWWISE_TMCQ_N16)
+// rather than the library's CPU codec: weight t of a 16 x 16 tile reads the 15-bit LSB-first window of
+// weight t | 1, ending at bit E_{t|1} = (((t | 1) + 1) * n) >> 4 of the tile's 16n bits and wrapping
+// inside the tile, and takes half t & 1 of pair (cw * 0x83DCD12D) >> 23 of the frozen table.
+static int _segmented_swiglu_tmcq_q8(const uint32_t cw, const int half)
 {
-	const uint32_t x = cw * 0x83DCD12Du;
-	const int bs = (int)(x & 255) + (int)((x >> 8) & 255) + (int)((x >> 16) & 255) + (int)(x >> 24);
-	return ccv_min((bs >> 2) - 127, 127);
+	return ccv_nnc_tmcq_p2_table[2 * ((cw * 0x83DCD12Du) >> 23) + half];
 }
 
 static void _segmented_swiglu_tmcq_decode(const uint8_t* const payload, const int rows, const int cols, const int n, int8_t* const codes)
@@ -487,14 +487,14 @@ static void _segmented_swiglu_tmcq_decode(const uint8_t* const payload, const in
 			const size_t base = ((size_t)tr * tiles_per_row + tc) * tile_bits;
 			for (t = 0; t < 256; t++)
 			{
-				const size_t end = ((size_t)(t + 1) * n) >> 4;
+				const size_t end = ((size_t)((t | 1) + 1) * n) >> 4;
 				uint32_t cw = 0;
 				for (j = 0; j < 15; j++)
 				{
 					const size_t bit = base + (end + tile_bits - 15 + j) % tile_bits;
 					cw |= (uint32_t)((payload[bit >> 3] >> (bit & 7)) & 1) << j;
 				}
-				codes[(size_t)(16 * tr + t / 16) * cols + 16 * tc + t % 16] = (int8_t)_segmented_swiglu_tmcq_q8(cw);
+				codes[(size_t)(16 * tr + t / 16) * cols + 16 * tc + t % 16] = (int8_t)_segmented_swiglu_tmcq_q8(cw, t & 1);
 			}
 		}
 }

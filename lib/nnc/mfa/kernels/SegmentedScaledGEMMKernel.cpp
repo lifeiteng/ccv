@@ -315,7 +315,7 @@ kernel void segmented_scaled_gemm_plan(
   } else if (format == CCV_NNC_QX_8I_ROWWISE_IQ1_S || format == CCV_NNC_QX_8I_ROWWISE_IQ1_M) {
     source += create_iq1_tile_source(format);
   } else if (tmcqRate) {
-    source += ccv_nnc_mfa_tmcq_decode_source;
+    source += ccv_nnc_mfa_tmcq_decode_source();
   } else if (format && format != CCV_NNC_QX_8I_ROWWISE_Q2_K)
     source += Dequantize8iRowwiseXKernel::createDecodeGroupSource(format);
   if (blockDimensions[2] == 64) {
@@ -676,6 +676,15 @@ kernel void segmented_scaled_gemm(
   B_scale_buf += (ulong)record.expert * N + n_start;
   threadgroup uint weight_words[{{BLOCK_N}} * {{BLOCK_K}} / 4];
   threadgroup int8_t* weights = (threadgroup int8_t*)weight_words;
+)";
+    if (tmcqRate) source += R"(
+  // A threadgroup copy of the pair table: about 1-2% faster than tmcq_table (constant) on routed
+  // prefill blocks on M5 Ultra.
+  threadgroup char2 tmcq_tg[512];
+  tmcq_load_table(tmcq_tg, tid, {{SIMDGROUPS}}u * 32u);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+)";
+    source += R"(
   auto A = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(A_buf, dextents<int32_t, 2>(K, m_count));
   auto B = tensor<threadgroup int8_t, extents<int32_t, {{BLOCK_K}}, {{BLOCK_N}}>, tensor_inline>(weights, extents<int32_t, {{BLOCK_K}}, {{BLOCK_N}}>());
   constexpr auto desc = matmul2d_descriptor({{BLOCK_M}}, {{BLOCK_N}}, {{BLOCK_K}}, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
@@ -724,7 +733,7 @@ kernel void segmented_scaled_gemm(
       threadgroup char4* destination =
         (threadgroup char4*)(weights + (tn * 16u + r) * {{BLOCK_K}}u + tk * 16u);
       int4 q[4];
-      tmcq_decode_row16(p, {{TMCQ_RATE}}u, r, q);
+      tmcq_decode_row16(p, {{TMCQ_RATE}}u, r, q, (threadgroup const char2*)tmcq_tg);
       #pragma clang loop unroll(full)
       for (uint c = 0; c < 4u; ++c)
         destination[c] = char4(q[c]);

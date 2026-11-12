@@ -1083,7 +1083,7 @@ static void append_tmcq_m1_kernel(std::string& shader, const uint32_t rate, cons
 #include <metal_stdlib>
 using namespace metal;
 )";
-  shader += ccv_nnc_mfa_tmcq_decode_source;
+  shader += ccv_nnc_mfa_tmcq_decode_source();
   shader += "constant constexpr uint TMCQ_N = " + std::to_string(rate) + ";\n";
   shader += "constant constexpr uint TMCQ_TILE_WORDS = TMCQ_N / 2;\n";
   shader += "constant constexpr uint S = " + std::to_string(segmentedInt8GemvSIMDGroupsPerThreadgroup(CCV_NNC_QX_8I_ROWWISE_TMCQ_N16)) + ";\n";
@@ -1112,6 +1112,10 @@ kernel void segmented_int8_gemv(
   const uint route = tgpig_position / threadgroups_per_route;
   threadgroup int route_expert;
   threadgroup float partials[S * 16];
+  // A threadgroup copy of the pair table, as in the dense TMCQ GEMV; the route lookup's barrier
+  // below also publishes it.
+  threadgroup char2 tmcq_tg[512];
+  tmcq_load_table(tmcq_tg, sgitg * 32u + tiisg, S * 32u);
   if (sgitg == 0 && tiisg == 0) {
     route_expert = -1;
     uint row_offset = 0;
@@ -1150,7 +1154,7 @@ kernel void segmented_int8_gemv(
     const float4 y2 = float4(y4[tc * 4u + 2u]);
     const float4 y3 = float4(y4[tc * 4u + 3u]);
     int4 q[4];
-    tmcq_decode_row16(tile, TMCQ_N, r, q);
+    tmcq_decode_row16(tile, TMCQ_N, r, q, (threadgroup const char2*)tmcq_tg);
     sum += dot(float4(q[0]), y0) + dot(float4(q[1]), y1) + dot(float4(q[2]), y2) + dot(float4(q[3]), y3);
   }
   sum += simd_shuffle_xor(sum, 16);

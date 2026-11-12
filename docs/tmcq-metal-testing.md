@@ -40,7 +40,7 @@ Mac none of them should be skipped. Expected: `all test case(s) passed, congratu
 
 | Case | What it checks |
 | --- | --- |
-| `tmcq reference decode fixed vectors` | The test's own C reference decode (spec section 3) on hand-derived vectors: zero payload -> -127, newest bit is codeword bit 14, tail-biting wrap. CPU only. |
+| `tmcq reference decode fixed vectors` | The test's own C reference decode (v1.2: weights 2j and 2j + 1 share the window of weight 2j + 1 and take pair (cw * 0x83DCD12D) >> 23 of `ccv_nnc_tmcq_p2_table`) on hand-derived vectors: zero payload -> pair 0 (8, -46), all-ones -> pair k, the shared window's newest bit is codeword bit 14, tail-biting wrap. CPU only. |
 | `mps tmcq int8 decode matches the reference bit for bit` | `Dequantize8iRowwiseX` (prefill decode, int8 rows + scale copy) for all 9 rates x 32F/16F/16BF, 48 x 768 random payload. Exact int8 match and exact scale bytes. |
 | `mps tmcq int8 decode of 7168-wide rows matches the reference bit for bit at every rate` | Same int8 decode for all 9 rates at 32 x 7168 (fp16 scales). |
 | `mps tmcq fp decode matches the reference bit for bit` | `Dequantize8iRowwiseXFP` for all 9 rates x 3 dtypes, random scales, compared bit for bit with `round_to_nearest_even(scale * q8)`. |
@@ -64,15 +64,14 @@ of 16 and each of the 2 x 4 streams over a tile row runs the same number of step
 4 SIMD groups do not divide cannot reach these kernels; K = 256 (2 steps per stream) is the shortest
 split and is covered above.
 
-Once the CPU TMCQ decode from the `wt/tmcq-cpu` branch is merged in, also run
+With the v1.2 CPU decode (`fd8a6e37`) in the build, also run
 
 ```sh
 TMCQ_CPU_REFERENCE=1 ./tmcq_mps.tests
 ```
 
 which additionally requires the GPU fp decode to equal `ccv_nnc_dequantize_8i_rowwise_x` on CPU
-memory byte for byte. Without that branch the CPU decode does not know TMCQ, so leave the variable
-unset.
+memory byte for byte (for 16F / 16BF, within the CPU writer's round-toward-zero ulp).
 
 Debug knob if something fails: `CCV_METAL_LOG_LEVEL=3 ./tmcq_mps.tests` logs which GEMM route ran.
 
@@ -163,3 +162,23 @@ make -j 4 -o libccv.a mpsblas.tests segmented_swiglu.tests palettize.tests moe_w
 | `tmcq_mps.tests` | 7 / 7 | 10 / 10 |
 
 The 29 skipped `palettize` cases are guarded on `CCV_NNC_BACKEND_GPU_REF` (CUDA only).
+
+TMCQ v1.2 (pair codebook) on top of `fd8a6e37`, same machine and commands, 2026-11-12: `mpsblas`
+326 / 326, `segmented_swiglu` 27 / 27, `palettize` 20 passed and 29 skipped, `moe_weights_streaming`
+3 / 3, `tmcq` 12 / 12, `tmcq_mps` 10 / 10, and `TMCQ_CPU_REFERENCE=1 ./tmcq_mps.tests` passes.
+
+## v1.2 table placement
+
+The decode helpers take the pair table as `tmcq_table` (constant) or a threadgroup copy filled by
+`tmcq_load_table`. Per kernel, from alternating constant / threadgroup runs on M5 Ultra:
+
+| Kernel | Table | Measured |
+| --- | --- | --- |
+| Dense GEMV (`Int8GemvKernel`) | threadgroup | 5120 x 17408 M = 1: 0.162-0.165 -> 0.143-0.147 ms; 17408 x 5120 unchanged |
+| Segmented GEMV | threadgroup | the fill shares the route lookup's barrier; sparse decode benches too sync-bound to resolve |
+| Segmented scaled GEMM (prefill) | threadgroup | balanced FFN T = 2048: 7.89 -> 7.76 ms, T = 512: 7.27 -> 7.19 ms (3-run means) |
+| Segmented SwiGLU decode | constant | threadgroup was within noise (DS 6 of 384: 89.6-92.0 vs 89.0-90.6 us) |
+| int8 / fp dequantize (incl. selected) | constant | one thread per row segment, not measured |
+
+The Metal table is generated from `lib/nnc/ccv_nnc_tmcq_table.inc`, so replacing that file is the only
+change a new table needs.

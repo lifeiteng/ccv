@@ -1018,7 +1018,7 @@ using namespace metal;
 )";
   shader += "constant uint tmcq_n = " + std::to_string(n) + ";\n";
   shader += "constant uint tmcq_tile_words = " + std::to_string(n / 2) + ";\n";
-  shader += ccv_nnc_mfa_tmcq_decode_source;
+  shader += ccv_nnc_mfa_tmcq_decode_source();
   shader += R"(
 kernel void int8_gemv(
   device const uchar *src0 [[buffer(0)]],
@@ -1053,6 +1053,11 @@ kernel void int8_gemv(
   device const uint* tiles = reinterpret_cast<device const uint*>(src0) + (ulong)(rb >> 4) * tiles_per_row * tmcq_tile_words;
   const uint t = r << 4;
   threadgroup float partials[S * M * 16];
+  // A threadgroup copy of the pair table: about 12% faster than reading tmcq_table (constant) at
+  // 5120 x 17408 on M5 Ultra, the same at 17408 x 5120.
+  threadgroup char2 tmcq_tg[512];
+  tmcq_load_table(tmcq_tg, sgitg * 32u + tiisg, S * 32u);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   float sum[M];
   for (uint m = 0; m < M; m++)
@@ -1060,7 +1065,7 @@ kernel void int8_gemv(
   for (uint tc = stream; tc < tiles_per_row; tc += S * 2) {
     device const uint* tile = tiles + (ulong)tc * tmcq_tile_words;
     int4 q[4];
-    tmcq_decode_row16(tile, tmcq_n, r, q);
+    tmcq_decode_row16(tile, tmcq_n, r, q, (threadgroup const char2*)tmcq_tg);
     const float4 w0 = float4(q[0]);
     const float4 w1 = float4(q[1]);
     const float4 w2 = float4(q[2]);

@@ -1233,7 +1233,7 @@ constant ulong weight_expert_stride [[function_constant(7)]];
 #include <metal_stdlib>
 using namespace metal;
 )";
-  shader += ccv_nnc_mfa_tmcq_decode_source;
+  shader += ccv_nnc_mfa_tmcq_decode_source();
   shader += "constant constexpr uint TMCQ_N = " + std::to_string(rate) + ";\n";
   shader += "constant constexpr uint TMCQ_TILE_WORDS = TMCQ_N / 2;\n";
   shader += R"(
@@ -1307,8 +1307,8 @@ inline float stable_sigmoid(const float value)
     const float4 y3 = float4(activation4[tc * 4u + 3u]);
     int4 g[4];
     int4 u[4];
-    tmcq_decode_row16(gate_tile, TMCQ_N, r, g);
-    tmcq_decode_row16(up_tile, TMCQ_N, r, u);
+    tmcq_decode_row16(gate_tile, TMCQ_N, r, g, tmcq_table);
+    tmcq_decode_row16(up_tile, TMCQ_N, r, u, tmcq_table);
     gate_sum += dot(float4(g[0]), y0) + dot(float4(g[1]), y1) + dot(float4(g[2]), y2) + dot(float4(g[3]), y3);
     up_sum += dot(float4(u[0]), y0) + dot(float4(u[1]), y1) + dot(float4(u[2]), y2) + dot(float4(u[3]), y3);
   }

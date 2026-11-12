@@ -7,6 +7,7 @@
 #include <nnc/ccv_nnc_internal.h>
 #include <nnc/mps/ccv_nnc_mps.h>
 #include <3rdparty/dsfmt/dSFMT.h>
+#include <nnc/ccv_nnc_tmcq_table.inc>
 #ifdef HAVE_MPS
 #include <dispatch/dispatch.h>
 #endif
@@ -1817,10 +1818,11 @@ static void _mps_segmented_packed_weights(dsfmt_t* const dsfmt, const int format
 	ccfree(scales);
 }
 
-// TMCQ reference decode, written from the codec definition (CCV_NNC_QX_8I_ROWWISE_TMCQ_N16) rather
-// than the library's CPU codec: weight t of a 16 x 16 tile (tiles row-major over the grid, weights
-// row-major in a tile) reads the 15-bit LSB-first window ending at bit ((t + 1) * n) >> 4 of the
-// tile's 16n bits, wrapping inside the tile; q8 = min(bytesum(cw * 0x83DCD12D) / 4 - 127, 127).
+// TMCQ v1.2 reference decode, written from the codec definition (CCV_NNC_QX_8I_ROWWISE_TMCQ_N16)
+// rather than the library's CPU codec: weight t of a 16 x 16 tile (tiles row-major over the grid,
+// weights row-major in a tile) reads the 15-bit LSB-first window of weight t | 1, ending at bit
+// (((t | 1) + 1) * n) >> 4 of the tile's 16n bits and wrapping inside the tile; q8 is half t & 1 of
+// pair (cw * 0x83DCD12D) >> 23 of the frozen table ccv_nnc_tmcq_p2_table.
 // The output is row scale x q8 in `datatype`, like the CPU dequantizer.
 static void _mps_tmcq_dequantize(const uint8_t* const packed, const int datatype, const size_t count, const int k, const int format, void* const output)
 {
@@ -1844,17 +1846,15 @@ static void _mps_tmcq_dequantize(const uint8_t* const packed, const int datatype
 			const size_t base = ((size_t)tr * tiles_per_row + tc) * tile_bits;
 			for (t = 0; t < 256; t++)
 			{
-				const size_t end = ((size_t)(t + 1) * n) >> 4;
+				const size_t end = ((size_t)((t | 1) + 1) * n) >> 4;
 				uint32_t cw = 0;
 				for (j = 0; j < 15; j++)
 				{
 					const size_t bit = base + (end + tile_bits - 15 + j) % tile_bits;
 					cw |= (uint32_t)((packed[bit >> 3] >> (bit & 7)) & 1) << j;
 				}
-				const uint32_t x = cw * 0x83DCD12Du;
-				const int bs = (int)(x & 255) + (int)((x >> 8) & 255) + (int)((x >> 16) & 255) + (int)(x >> 24);
 				const int row = 16 * tr + t / 16;
-				values[(size_t)row * k + 16 * tc + t % 16] = scales[row] * ccv_min((bs >> 2) - 127, 127);
+				values[(size_t)row * k + 16 * tc + t % 16] = scales[row] * ccv_nnc_tmcq_p2_table[2 * ((cw * 0x83DCD12Du) >> 23) + (t & 1)];
 			}
 		}
 	if (datatype == CCV_16F)

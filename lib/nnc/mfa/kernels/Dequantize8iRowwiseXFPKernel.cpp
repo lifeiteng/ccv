@@ -171,7 +171,7 @@ using namespace metal;
 )";
 	shader += "constant uint tmcq_n = " + std::to_string(n) + ";\n";
 	shader += "constant uint tmcq_tile_words = " + std::to_string(n / 2) + ";\n";
-	shader += ccv_nnc_mfa_tmcq_decode_source;
+	shader += ccv_nnc_mfa_tmcq_decode_source();
 	shader += R"(
 kernel void dequantize_8i_rowwise_x_fp(
   device const uchar* source [[buffer(0)]],
@@ -191,7 +191,7 @@ kernel void dequantize_8i_rowwise_x_fp(
   const ulong tile_index = (ulong)(row >> 4) * tiles_per_row + tc;
   device const uint* tile = reinterpret_cast<device const uint*>(source) + tile_index * tmcq_tile_words;
   int4 q[4];
-  tmcq_decode_row16(tile, tmcq_n, row & 15u, q);
+  tmcq_decode_row16(tile, tmcq_n, row & 15u, q, tmcq_table);
   const float scale = (float)scales[row];
   device vec<real, 4>* destination4 = reinterpret_cast<device vec<real, 4>*>(reinterpret_cast<device real*>(destination) + (ulong)row * row_length + (tc << 4));
   destination4[0] = vec<real, 4>(float4(q[0]) * scale);
