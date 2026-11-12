@@ -288,6 +288,44 @@ TEST_CASE("mps tmcq int8 decode matches the reference bit for bit")
 		}
 }
 
+TEST_CASE("mps tmcq int8 decode of 7168-wide rows matches the reference bit for bit at every rate")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	const int rows = 32;
+	const int cols = 7168;
+	const int datatype = CCV_16F;
+	int f;
+	for (f = 0; f < (int)(sizeof(tmcq_formats) / sizeof(tmcq_formats[0])); f++)
+	{
+		const int format = tmcq_formats[f];
+		const int n = tmcq_rate_of(format);
+		ccv_nnc_tensor_t* const hq = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(tmcq_params(CCV_TENSOR_CPU_MEMORY, datatype, rows, cols), format), 0);
+		ccv_nnc_tensor_t* const gq = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(tmcq_params(CCV_TENSOR_GPU_MEMORY, datatype, rows, cols), format), 0);
+		float* const scales = (float*)ccmalloc(sizeof(float) * rows);
+		tmcq_fill_weights(hq, datatype, rows, cols, n, 0, 0x7168u + f, scales);
+		const size_t out_scale_offset = ((size_t)rows * cols + 127) & ~(size_t)127;
+		const size_t out_bytes = out_scale_offset + rows * 2;
+		ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32S, (int)((out_bytes + 3) / 4)), 0);
+		ccv_nnc_tensor_t* const hout = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, (int)((out_bytes + 3) / 4)), 0);
+		ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(hq), TENSOR_LIST(gq), 0);
+		ccv_nnc_mps_dequantize_8i_rowwise_x_to_8i_rowwise(gq->data.u8, datatype, ccv_nnc_tensor_data_size_without_padding(hq->info), cols, format, gout->data.u8, (size_t)rows * cols, 0);
+		ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gout), TENSOR_LIST(hout), 0);
+		int8_t* const expected = (int8_t*)ccmalloc((size_t)rows * cols);
+		tmcq_ref_decode_matrix(hq->data.u8, rows, cols, n, expected);
+		size_t mismatches = 0, i;
+		for (i = 0; i < (size_t)rows * cols; i++)
+			mismatches += (int8_t)hout->data.u8[i] != expected[i];
+		REQUIRE_EQ(mismatches, 0, "TMCQ n=%d 7168-wide int8 decode: %zu mismatches", n, mismatches);
+		REQUIRE_EQ(memcmp(hout->data.u8 + out_scale_offset, hq->data.u8 + tmcq_scale_offset(rows, cols, n), rows * 2), 0, "TMCQ n=%d row scales are copied", n);
+		ccfree(expected);
+		ccfree(scales);
+		ccv_nnc_tensor_free(hout);
+		ccv_nnc_tensor_free(gout);
+		ccv_nnc_tensor_free(gq);
+		ccv_nnc_tensor_free(hq);
+	}
+}
+
 TEST_CASE("mps tmcq fp decode matches the reference bit for bit")
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
@@ -575,6 +613,78 @@ TEST_CASE("mps tmcq gemv for 1 to 3 rows matches the reference")
 					REQUIRE(max_rel_cpu < tmcq_tolerance(tmcq_datatypes[d]), "TMCQ n=%d datatype=%x M=%d bias=%d GEMV vs CPU max_rel=%g", tmcq_rate_of(formats[f]), tmcq_datatypes[d], m, bias, max_rel_cpu);
 					REQUIRE(max_rel_dense < tmcq_tolerance(tmcq_datatypes[d]), "TMCQ n=%d datatype=%x M=%d bias=%d GEMV vs dense GPU max_rel=%g", tmcq_rate_of(formats[f]), tmcq_datatypes[d], m, bias, max_rel_dense);
 				}
+}
+
+TEST_CASE("mps tmcq gemv covers K from 256 to 7168 and N from 16 to 4096")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	// The GEMV splits a tile row's K / 16 tiles over 2 streams in each of 4 SIMD groups. TMCQ GEMM
+	// requires K % 256 == 0, so K / 16 is a multiple of 16 and every stream runs the same number of
+	// steps: K = 256 is the shortest (2 steps per stream), K = 7168 the DeepSeek hidden width.
+	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N22, CCV_NNC_QX_8I_ROWWISE_TMCQ_N32 };
+	const int datatypes[] = { CCV_16F, CCV_32F };
+	const int ks[] = { 256, 512, 4096, 7168 };
+	const int ns[] = { 16, 1040, 4096 };
+	int f, d, ki, ni, m;
+	for (f = 0; f < 3; f++)
+		for (d = 0; d < 2; d++)
+			for (ki = 0; ki < 4; ki++)
+				for (ni = 0; ni < 3; ni++)
+					for (m = 1; m <= 3; m++)
+					{
+						const int bias = (ki + ni + m) & 1;
+						double max_rel_cpu = 0, max_rel_dense = 0;
+						tmcq_gemm_compare(datatypes[d], formats[f], bias, m, ns[ni], ks[ki], &max_rel_cpu, &max_rel_dense);
+						REQUIRE(max_rel_cpu < tmcq_tolerance(datatypes[d]), "TMCQ n=%d datatype=%x M=%d N=%d K=%d bias=%d GEMV vs CPU max_rel=%g", tmcq_rate_of(formats[f]), datatypes[d], m, ns[ni], ks[ki], bias, max_rel_cpu);
+						REQUIRE(max_rel_dense < tmcq_tolerance(datatypes[d]), "TMCQ n=%d datatype=%x M=%d N=%d K=%d bias=%d GEMV vs dense GPU max_rel=%g", tmcq_rate_of(formats[f]), datatypes[d], m, ns[ni], ks[ki], bias, max_rel_dense);
+					}
+	// Every rate at the widest K, so each n's window offsets k_j run across many tiles per row.
+	int format;
+	for (format = CCV_NNC_QX_8I_ROWWISE_TMCQ_N16; format <= CCV_NNC_QX_8I_ROWWISE_TMCQ_N32; format++)
+		for (m = 1; m <= 3; m++)
+		{
+			double max_rel_cpu = 0, max_rel_dense = 0;
+			tmcq_gemm_compare(CCV_16F, format, m == 2, m, 1040, 7168, &max_rel_cpu, &max_rel_dense);
+			REQUIRE(max_rel_cpu < tmcq_tolerance(CCV_16F), "TMCQ n=%d M=%d K=7168 GEMV vs CPU max_rel=%g", tmcq_rate_of(format), m, max_rel_cpu);
+			REQUIRE(max_rel_dense < tmcq_tolerance(CCV_16F), "TMCQ n=%d M=%d K=7168 GEMV vs dense GPU max_rel=%g", tmcq_rate_of(format), m, max_rel_dense);
+		}
+}
+
+TEST_CASE("mps tmcq gemm prefill covers K 256 and 7168 with partial row blocks")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	const uint64_t old_flags = ccv_nnc_flags();
+	// M = 16 and 64 fill whole row blocks; M = 65 leaves one row in the last block. Same three routing
+	// passes as the prefill case above.
+	const int ms[] = { 16, 64, 65 };
+	const int ks[] = { 256, 7168 };
+	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N22, CCV_NNC_QX_8I_ROWWISE_TMCQ_N32 };
+	int pass, f, ki, mi;
+	for (pass = 0; pass < 3; pass++)
+	{
+		if (pass >= 1)
+			ccv_nnc_enable_flag(CCV_NNC_DISABLE_MFA_ANE);
+		if (pass >= 2)
+			ccv_nnc_enable_flag(CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS);
+		for (f = 0; f < 3; f++)
+			for (ki = 0; ki < 2; ki++)
+				for (mi = 0; mi < 3; mi++)
+				{
+					double max_rel_cpu = 0, max_rel_dense = 0;
+					tmcq_gemm_compare(CCV_16F, formats[f], mi & 1, ms[mi], 528, ks[ki], &max_rel_cpu, &max_rel_dense);
+					// Passes 0 and 1 run the int8 scaled GEMM, which quantizes each activation row to int8:
+					// that error grows like sqrt(K) against the max(1, |x|) metric (measured about 6e-4 at
+					// K = 256 and 4e-3 at K = 7168), so the bound is the K = 1024 case's 2e-3 scaled by
+					// sqrt(K / 1024). Pass 2 decodes to fp16 and must equal the dense GEMM exactly.
+					const double dense_bound = pass < 2 ? 2e-3 * ccv_max(1.0, sqrt(ks[ki] / 1024.0)) : 0;
+					REQUIRE(max_rel_dense <= dense_bound, "TMCQ pass=%d n=%d M=%d K=%d GEMM vs dense GPU max_rel=%g bound=%g", pass, tmcq_rate_of(formats[f]), ms[mi], ks[ki], max_rel_dense, dense_bound);
+					REQUIRE(max_rel_cpu < 1e-2, "TMCQ pass=%d n=%d M=%d K=%d GEMM vs CPU max_rel=%g", pass, tmcq_rate_of(formats[f]), ms[mi], ks[ki], max_rel_cpu);
+				}
+	}
+	if (!(old_flags & CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS))
+		ccv_nnc_disable_flag(CCV_NNC_DISABLE_MFA_NEURAL_ACCELERATORS);
+	if (!(old_flags & CCV_NNC_DISABLE_MFA_ANE))
+		ccv_nnc_disable_flag(CCV_NNC_DISABLE_MFA_ANE);
 }
 
 TEST_CASE("mps tmcq gemm decodes then multiplies for prefill rows")

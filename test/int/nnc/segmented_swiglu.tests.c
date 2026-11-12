@@ -1085,9 +1085,10 @@ TEST_CASE("MPS segmented SwiGLU packed prefill with neural accelerators")
 
 // TMCQ decode (one input row per routed row, or one broadcast row): the vector path decodes the
 // 16 x 16 tiles in place, one SIMD group per 16-row tile row.
-static void _segmented_swiglu_mps_tmcq_decode_case(const int format, const int datatype, const int rows, const int broadcast_input, const float clamp, int* const __case_result__)
+static void _segmented_swiglu_mps_tmcq_decode_shape_case(const int format, const int datatype, const int rows, const int broadcast_input, const float clamp, const int experts, const int k, int* const __case_result__)
 {
-	const int segments = 6, experts = 8, n = 256, k = 512;
+	// One expert: a single bin holds every row. Otherwise 6 bins over 6 distinct experts.
+	const int segments = experts == 1 ? 1 : 6, n = 256;
 	const int activation_rows = broadcast_input ? 1 : rows;
 	dsfmt_t dsfmt;
 	dsfmt_init_gen_rand(&dsfmt, format * 31 + rows);
@@ -1128,9 +1129,12 @@ static void _segmented_swiglu_mps_tmcq_decode_case(const int format, const int d
 		memcpy(ha_ref->data.f32 + (size_t)i * k, ha_ref->data.f32, sizeof(float) * k);
 	ccv_nnc_tensor_t* const hindices = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, segments), 0);
 	ccv_nnc_tensor_t* const hcounts = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, segments), 0);
-	const int selected[] = { 7, 1, 5, 2, 6, 3 };
+	// experts = 8 gives { 7, 1, 5, 2, 6, 3 }.
+	const int selected[] = { experts == 1 ? 0 : experts - 1, 1, experts / 2 + 1, 2, experts - 2, 3 };
 	int counts[] = { 0, 0, 0, 0, 0, 0 };
-	if (rows == 1)
+	if (experts == 1)
+		counts[0] = rows;
+	else if (rows == 1)
 		counts[2] = 1;
 	else {
 		assert(rows >= 6);
@@ -1138,8 +1142,8 @@ static void _segmented_swiglu_mps_tmcq_decode_case(const int format, const int d
 		for (i = 2; i < 6; i++)
 			counts[i] = (rows - 2) / 4 + (i == 5 ? (rows - 2) % 4 : 0);
 	}
-	memcpy(hindices->data.i32, selected, sizeof(selected));
-	memcpy(hcounts->data.i32, counts, sizeof(counts));
+	memcpy(hindices->data.i32, selected, sizeof(int) * segments);
+	memcpy(hcounts->data.i32, counts, sizeof(int) * segments);
 	ccv_nnc_tensor_t* const expected = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32F, rows, n), 0);
 	_segmented_swiglu_reference(ha_ref->data.f32, hindices->data.i32, hcounts->data.i32, hgate->data.f32, hup->data.f32,
 		hroute_ref->data.f32, rows, segments, n, k, clamp, expected->data.f32);
@@ -1166,7 +1170,7 @@ static void _segmented_swiglu_mps_tmcq_decode_case(const int format, const int d
 		TENSOR_LIST(a, indices, counts_gpu, gate_q, up_q, route), TENSOR_LIST(output), 0);
 	if (old_flags & CCV_NNC_DISABLE_MFA)
 		ccv_nnc_enable_flag(CCV_NNC_DISABLE_MFA);
-	REQUIRE_EQ(status, CCV_NNC_EXEC_SUCCESS, "TMCQ segmented SwiGLU decode should execute: format=%d datatype=%d rows=%d", format, datatype, rows);
+	REQUIRE_EQ(status, CCV_NNC_EXEC_SUCCESS, "TMCQ segmented SwiGLU decode should execute: format=%d datatype=%d rows=%d broadcast=%d experts=%d K=%d", format, datatype, rows, broadcast_input, experts, k);
 	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(output), TENSOR_LIST(actual_raw), 0);
 	float* const actual = (float*)ccmalloc(sizeof(float) * rows * n);
 	if (datatype == CCV_16F)
@@ -1186,8 +1190,8 @@ static void _segmented_swiglu_mps_tmcq_decode_case(const int format, const int d
 		}
 		const double relative_l2 = sqrt(squared_error / ccv_max(squared_reference, 1e-20));
 		REQUIRE(relative_l2 < (datatype == CCV_16F ? 5e-3 : 1e-4),
-			"TMCQ decode row should match the spec reference: format=%d datatype=%d rows=%d broadcast=%d clamp=%g row=%d relative L2=%g",
-			format, datatype, rows, broadcast_input, clamp, i, relative_l2);
+			"TMCQ decode row should match the spec reference: format=%d datatype=%d rows=%d broadcast=%d clamp=%g experts=%d K=%d row=%d relative L2=%g",
+			format, datatype, rows, broadcast_input, clamp, experts, k, i, relative_l2);
 	}
 	ccfree(actual);
 	ccv_nnc_tensor_t* const tensors[] = {
@@ -1196,6 +1200,11 @@ static void _segmented_swiglu_mps_tmcq_decode_case(const int format, const int d
 	};
 	for (i = 0; i < sizeof(tensors) / sizeof(tensors[0]); i++)
 		ccv_nnc_tensor_free(tensors[i]);
+}
+
+static void _segmented_swiglu_mps_tmcq_decode_case(const int format, const int datatype, const int rows, const int broadcast_input, const float clamp, int* const __case_result__)
+{
+	_segmented_swiglu_mps_tmcq_decode_shape_case(format, datatype, rows, broadcast_input, clamp, 8, 512, __case_result__);
 }
 
 TEST_CASE("MPS segmented SwiGLU decodes TMCQ tiles for one row and short routed batches")
@@ -1217,6 +1226,27 @@ TEST_CASE("MPS segmented SwiGLU decodes TMCQ tiles for one row and short routed 
 		_segmented_swiglu_mps_tmcq_decode_case(formats[i], CCV_32F, 6, 1, 0.25f, __case_result__);
 		_segmented_swiglu_mps_tmcq_decode_case(formats[i], CCV_16F, 18, 0, 10, __case_result__);
 	}
+}
+
+TEST_CASE("MPS segmented SwiGLU TMCQ decode covers K 256 and 7168 over 1 and 64 experts")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
+	// K = 256 is the shortest K split over the 4 SIMD groups (two steps per stream); K = 7168 the
+	// DeepSeek hidden width. One route (1 row) and several: 6 rows over 6 of 64 experts, or 3 rows on
+	// the only expert (the decode path takes at most 3 rows per bin; more go to prefill).
+	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N22, CCV_NNC_QX_8I_ROWWISE_TMCQ_N32 };
+	const int ks[] = { 256, 7168 };
+	const int experts[] = { 1, 64 };
+	int f, ki, e;
+	for (f = 0; f < sizeof(formats) / sizeof(formats[0]); f++)
+		for (ki = 0; ki < 2; ki++)
+			for (e = 0; e < 2; e++)
+			{
+				_segmented_swiglu_mps_tmcq_decode_shape_case(formats[f], CCV_32F, 1, 0, 10, experts[e], ks[ki], __case_result__);
+				const int rows = experts[e] == 1 ? 3 : 6;
+				_segmented_swiglu_mps_tmcq_decode_shape_case(formats[f], CCV_16F, rows, 0, 10, experts[e], ks[ki], __case_result__);
+				_segmented_swiglu_mps_tmcq_decode_shape_case(formats[f], CCV_32F, rows, 1, 0.25f, experts[e], ks[ki], __case_result__);
+			}
 }
 
 TEST_CASE("MPS segmented SwiGLU TMCQ prefill matches the spec reference at 64 and 512 rows")

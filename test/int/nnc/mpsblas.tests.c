@@ -3185,6 +3185,57 @@ TEST_CASE("mps segmented int8 gemv with TMCQ weights")
 		}
 }
 
+TEST_CASE("mps segmented int8 gemv with TMCQ weights at K 256 and 7168 over 1 and 64 experts")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	// K = 256 is the shortest K split (two steps per stream over 4 SIMD groups); K = 7168 is the
+	// DeepSeek hidden width. Single route: one row on one expert. Multi route: 6 rows over 6 of 64
+	// experts, or 4 rows on the only expert.
+	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N22, CCV_NNC_QX_8I_ROWWISE_TMCQ_N32 };
+	const int ks[] = { 256, 7168 };
+	const int experts[] = { 1, 64 };
+	int f, ki, e, multi;
+	for (f = 0; f < sizeof(formats) / sizeof(formats[0]); f++)
+		for (ki = 0; ki < 2; ki++)
+			for (e = 0; e < 2; e++)
+				for (multi = 0; multi < 2; multi++)
+				{
+					const int total_m = multi ? (experts[e] == 1 ? 4 : 6) : 1;
+					const int bincount = multi && experts[e] > 1 ? 6 : 1;
+					double max_abs = 0;
+					double max_rel = 0;
+					REQUIRE_EQ(_mps_segmented_scaled_gemm_validate_format_shape_experts_dims(
+						CCV_16F, multi, 1, formats[f], total_m, experts[e], bincount, 0, 256, ks[ki], &max_abs, &max_rel), 0,
+						"TMCQ segmented Int8 GEMV validation should run for format=%d K=%d experts=%d rows=%d", formats[f], ks[ki], experts[e], total_m);
+					REQUIRE(max_rel < 3e-3, "TMCQ segmented Int8 GEMV should match the spec reference: format=%d K=%d experts=%d rows=%d bins=%d max_abs=%g max_rel=%g",
+						formats[f], ks[ki], experts[e], total_m, bincount, max_abs, max_rel);
+				}
+}
+
+TEST_CASE("mps segmented gemm with TMCQ weights at K 256 and 7168 with partial row blocks")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	// 16, 64 and 65 rows over 6 of 8 experts with guard rows; 65 leaves a partial block. Both the
+	// neural-accelerator fused decode (fallback = 0) and the fallback paths.
+	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N22, CCV_NNC_QX_8I_ROWWISE_TMCQ_N32 };
+	const int ks[] = { 256, 7168 };
+	const int row_counts[] = { 16, 64, 65 };
+	int f, ki, r, force_fallback;
+	for (f = 0; f < sizeof(formats) / sizeof(formats[0]); f++)
+		for (ki = 0; ki < 2; ki++)
+			for (r = 0; r < 3; r++)
+				for (force_fallback = 0; force_fallback < 2; force_fallback++)
+				{
+					double max_abs = 0;
+					double max_rel = 0;
+					REQUIRE_EQ(_mps_segmented_scaled_gemm_validate_format_shape_experts_dims(
+						CCV_16F, 0, force_fallback, formats[f], row_counts[r], 8, 6, 1, 256, ks[ki], &max_abs, &max_rel), 0,
+						"TMCQ segmented GEMM should execute without overwriting guard rows: format=%d K=%d rows=%d fallback=%d", formats[f], ks[ki], row_counts[r], force_fallback);
+					REQUIRE(max_rel < 3e-3, "TMCQ segmented GEMM should match the spec reference: format=%d K=%d rows=%d fallback=%d abs=%g rel=%g",
+						formats[f], ks[ki], row_counts[r], force_fallback, max_abs, max_rel);
+				}
+}
+
 TEST_CASE("mps segmented gemm with TMCQ weights at 64 and 512 rows")
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
