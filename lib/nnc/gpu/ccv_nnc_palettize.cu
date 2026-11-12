@@ -7,6 +7,7 @@ extern "C" {
 }
 #include <nnc/gpu/ccv_nnc_compat.h>
 #include <type_traits>
+#include "../ccv_nnc_tmcq_table.inc"
 
 template<typename NUM>
 __global__ void _ccv_nnc_q4_slow(const size_t count, const size_t length, const int number_in_blocks, const int number_in_blocks_2, const uint8_t* const a, NUM* const b)
@@ -1287,46 +1288,69 @@ static __global__ void _ccv_nnc_dequantize_8i_rowwise_x_fp_2d_oct_hadamard_256(c
 // TMCQ (see CCV_NNC_QX_8I_ROWWISE_TMCQ_N16) is not a per-row group codec: a 16 x 16 tile spans 16 rows, thus it
 // has its own kernels. A tile is 16 * N bits, N / 2 <= 16 little-endian 32-bit words (N is even), so every tile
 // starts on a word boundary. A warp decodes whole tiles: lanes load the words of a tile in one coalesced load, and
-// lane L decodes tile weights 8 L .. 8 L + 7, i.e. row L / 2, columns (L & 1) * 8 .. + 7 of the tile.
-static __device__ __forceinline__ int _ccv_nnc_8i_rowwise_x_tmcq_q8(const uint32_t cw)
+// lane L decodes tile weights 8 L .. 8 L + 7 (pairs 4 L .. 4 L + 3), i.e. row L / 2, columns (L & 1) * 8 .. + 7.
+//
+// The v1.2 P2 codebook (ccv_nnc_tmcq_table.inc) is passed by value as a __grid_constant__ kernel parameter, so every
+// device gets it without a symbol upload. Each block copies it to shared memory once; entry k, read as a
+// little-endian uint16, is the code pair (T[2k], T[2k + 1]) in output byte order.
+typedef struct {
+	uint32_t words[256];
+} ccv_nnc_8i_rowwise_x_tmcq_table_t;
+
+#define CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS (8)
+
+static const ccv_nnc_8i_rowwise_x_tmcq_table_t* _ccv_nnc_8i_rowwise_x_tmcq_table(void)
 {
-	const uint32_t x = cw * 0x83DCD12Du;
-	const int bs = (int)__dp4a(x, 0x01010101u, 0u); // The sum of the 4 bytes, 0 .. 1020.
-	return min((bs >> 2) - 127, 127);
+	static_assert(sizeof(ccv_nnc_tmcq_p2_table) == sizeof(ccv_nnc_8i_rowwise_x_tmcq_table_t), "the P2 table is 1024 bytes");
+	static const ccv_nnc_8i_rowwise_x_tmcq_table_t table = [] {
+		ccv_nnc_8i_rowwise_x_tmcq_table_t t;
+		memcpy(&t, ccv_nnc_tmcq_p2_table, sizeof(t));
+		return t;
+	}();
+	return &table;
 }
 
-// Lanes base .. base + N / 2 - 1 of the warp hold the words of the tile in `word`.
+// Copies the table into the block's shared memory; blocks have exactly 256 threads, one word each.
+static __device__ __forceinline__ const uint16_t* _ccv_nnc_8i_rowwise_x_tmcq_shared_table(const ccv_nnc_8i_rowwise_x_tmcq_table_t& table, uint32_t* const shared)
+{
+	static_assert(CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32 == 256, "one table word per thread");
+	shared[threadIdx.x] = table.words[threadIdx.x];
+	__syncthreads();
+	return (const uint16_t*)shared;
+}
+
+// The code pair of a 15-bit window: k = (cw * 0x83DCD12D) >> 23, (T[2k], T[2k + 1]) as two bytes.
+static __device__ __forceinline__ uint32_t _ccv_nnc_8i_rowwise_x_tmcq_pair(const uint16_t* const table, const uint32_t cw)
+{
+	return table[(cw * 0x83DCD12Du) >> 23];
+}
+
+// Lanes base .. base + N / 2 - 1 of the warp hold the words of the tile in `word`. Returns the 8 int8 codes of the
+// lane, weight 8 L + j in byte j & 3 of word j >> 2.
 template<int N>
-static __device__ __forceinline__ void _ccv_nnc_8i_rowwise_x_tmcq_decode_oct(const uint32_t word, const int base, const int lane, int* const values)
+static __device__ __forceinline__ uint2 _ccv_nnc_8i_rowwise_x_tmcq_decode_oct(const uint16_t* const table, const uint32_t word, const int base, const int lane)
 {
 	const int words = N / 2;
 	const int tile_bits = N * 16;
 	const int t0 = lane * 8;
-	// Weight t reads the 15-bit window that ends at E_t = (t + 1) N / 16 (exclusive), wrapping inside the tile.
-	const int e0 = ((t0 + 1) * N) >> 4;
+	// Pair j reads the 15-bit window that ends at E_{2j+1} = (2j + 2) N / 16 (exclusive), wrapping inside the tile.
+	const int e0 = ((t0 + 2) * N) >> 4;
 	const int start = (e0 + tile_bits - 15) % tile_bits;
-	// The 8 windows span 15 + E_{t0 + 7} - E_{t0} <= 29 bits from start, thus with start & 31 <= 31 they lie in the
-	// word that holds start and the next one (the first word again past the end of the tile).
+	// The 4 windows span 15 + E_{t0 + 7} - E_{t0 + 1} <= 27 bits from start, thus with start & 31 <= 31 they lie in
+	// the word that holds start and the next one (the first word again past the end of the tile).
 	const int w = start >> 5;
 	const uint32_t lo = __shfl_sync(0xffffffffu, word, base + w);
 	const uint32_t hi = __shfl_sync(0xffffffffu, word, base + (w + 1) % words);
-	const uint64_t pair = (uint64_t)lo | ((uint64_t)hi << 32);
+	const uint64_t bits = (uint64_t)lo | ((uint64_t)hi << 32);
 	const int shift = start & 31;
+	uint32_t codes[4];
 #pragma unroll
-	for (int i = 0; i < 8; i++)
+	for (int i = 0; i < 4; i++)
 	{
-		const int e = ((t0 + i + 1) * N) >> 4;
-		values[i] = _ccv_nnc_8i_rowwise_x_tmcq_q8((uint32_t)(pair >> (shift + e - e0)) & 0x7fffu);
+		const int e = ((t0 + 2 * i + 2) * N) >> 4;
+		codes[i] = _ccv_nnc_8i_rowwise_x_tmcq_pair(table, (uint32_t)(bits >> (shift + e - e0)) & 0x7fffu);
 	}
-}
-
-static __device__ __forceinline__ uint2 _ccv_nnc_8i_rowwise_x_tmcq_pack8(const int* const values)
-{
-	uint32_t packed[2] = {};
-#pragma unroll
-	for (int j = 0; j < 8; j++)
-		packed[j >> 2] |= (uint32_t)(uint8_t)(int8_t)values[j] << ((j & 3) * 8);
-	return make_uint2(packed[0], packed[1]);
+	return make_uint2(codes[0] | (codes[1] << 16), codes[2] | (codes[3] << 16));
 }
 
 // row_scale x q8 in the datatype, bit for bit what the CPU decode writes: the product is exact in float (at most
@@ -1352,11 +1376,15 @@ static __device__ __forceinline__ double _ccv_nnc_8i_rowwise_x_tmcq_mul(const do
 	return q * scale;
 }
 
-#define CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS (8)
-
+// At most one resident wave of blocks: each block copies the 1 KiB codebook into shared memory once, so the
+// grid-stride loops keep that copy amortized over many tiles.
 static size_t _ccv_nnc_8i_rowwise_x_tmcq_blocks(const size_t warp_tasks)
 {
-	return ccv_min((warp_tasks + CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS - 1) / CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS, (size_t)ccv_nnc_gpu_device_props().multi_processor_count * 64);
+	int device = 0, threads_per_sm = 0;
+	CUDA_ENFORCE(cudaGetDevice(&device));
+	CUDA_ENFORCE(cudaDeviceGetAttribute(&threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device));
+	const size_t blocks_per_sm = ccv_max(threads_per_sm / (CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32), 1);
+	return ccv_min((warp_tasks + CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS - 1) / CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS, (size_t)ccv_nnc_gpu_device_props().multi_processor_count * blocks_per_sm);
 }
 
 // One warp converts a pair of horizontally adjacent tiles (a tile row holds row_length / 16 tiles, an even count),
@@ -1364,18 +1392,17 @@ static size_t _ccv_nnc_8i_rowwise_x_tmcq_blocks(const size_t warp_tasks)
 // tile and lanes 16 .. 31 those of the right one, in one load. Lane 2 r then writes row r of the left tile and lane
 // 2 r + 1 row r of the right tile, 16 bytes each, after swapping halves. Consecutive warps take consecutive pairs.
 template<int N>
-static __global__ void __launch_bounds__(CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32) _ccv_nnc_dequantize_8i_rowwise_x_tmcq_8i(const size_t pair_count, const size_t pairs_per_row, const size_t row_length, const uint32_t* const input, uint8_t* const output, const int aligned)
+static __global__ void __launch_bounds__(CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32) _ccv_nnc_dequantize_8i_rowwise_x_tmcq_8i(const size_t pair_count, const size_t pairs_per_row, const size_t row_length, const uint32_t* const input, uint8_t* const output, const int aligned, const __grid_constant__ ccv_nnc_8i_rowwise_x_tmcq_table_t table)
 {
+	__shared__ uint32_t shared_table[256];
+	const uint16_t* const codebook = _ccv_nnc_8i_rowwise_x_tmcq_shared_table(table, shared_table);
 	const int lane = threadIdx.x & 31;
 	const size_t warp_count = (size_t)gridDim.x * CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS;
 	for (size_t p = (size_t)blockIdx.x * CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS + (threadIdx.x >> 5); p < pair_count; p += warp_count)
 	{
 		const uint32_t word = (lane & 15) < N / 2 ? input[(p * 2 + (lane >> 4)) * (N / 2) + (lane & 15)] : 0;
-		int decoded[8];
-		_ccv_nnc_8i_rowwise_x_tmcq_decode_oct<N>(word, 0, lane, decoded);
-		const uint2 left = _ccv_nnc_8i_rowwise_x_tmcq_pack8(decoded);
-		_ccv_nnc_8i_rowwise_x_tmcq_decode_oct<N>(word, 16, lane, decoded);
-		const uint2 right = _ccv_nnc_8i_rowwise_x_tmcq_pack8(decoded);
+		const uint2 left = _ccv_nnc_8i_rowwise_x_tmcq_decode_oct<N>(codebook, word, 0, lane);
+		const uint2 right = _ccv_nnc_8i_rowwise_x_tmcq_decode_oct<N>(codebook, word, 16, lane);
 		// Lane 2 r holds columns 0 .. 7 of row r of both tiles, lane 2 r + 1 columns 8 .. 15. Each sends its partner
 		// the half the partner writes.
 		const int odd = lane & 1;
@@ -1396,15 +1423,16 @@ static __global__ void __launch_bounds__(CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32) _
 }
 
 template<int N, typename NUM>
-static __global__ void __launch_bounds__(CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32) _ccv_nnc_dequantize_8i_rowwise_x_tmcq_fp(const size_t tile_count, const size_t tiles_per_row, const size_t row_length, const uint32_t* const input, const NUM* const scales, NUM* const output, const int aligned)
+static __global__ void __launch_bounds__(CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32) _ccv_nnc_dequantize_8i_rowwise_x_tmcq_fp(const size_t tile_count, const size_t tiles_per_row, const size_t row_length, const uint32_t* const input, const NUM* const scales, NUM* const output, const int aligned, const __grid_constant__ ccv_nnc_8i_rowwise_x_tmcq_table_t table)
 {
+	__shared__ uint32_t shared_table[256];
+	const uint16_t* const codebook = _ccv_nnc_8i_rowwise_x_tmcq_shared_table(table, shared_table);
 	const int lane = threadIdx.x & 31;
 	const size_t warp_count = (size_t)gridDim.x * CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS;
 	for (size_t g = (size_t)blockIdx.x * CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS + (threadIdx.x >> 5); g < tile_count; g += warp_count)
 	{
 		const uint32_t word = lane < N / 2 ? input[g * (N / 2) + lane] : 0;
-		int decoded[8];
-		_ccv_nnc_8i_rowwise_x_tmcq_decode_oct<N>(word, 0, lane, decoded);
+		const uint2 packed = _ccv_nnc_8i_rowwise_x_tmcq_decode_oct<N>(codebook, word, 0, lane);
 		const size_t tr = g / tiles_per_row;
 		const size_t row = tr * 16 + (lane >> 1);
 		const size_t col = (g - tr * tiles_per_row) * 16 + (lane & 1) * 8;
@@ -1412,7 +1440,7 @@ static __global__ void __launch_bounds__(CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32) _
 		NUM values[8];
 #pragma unroll
 		for (int j = 0; j < 8; j++)
-			values[j] = _ccv_nnc_8i_rowwise_x_tmcq_mul(scale, decoded[j]);
+			values[j] = _ccv_nnc_8i_rowwise_x_tmcq_mul(scale, (int)(int8_t)(uint8_t)((j < 4 ? packed.x : packed.y) >> ((j & 3) * 8)));
 		NUM* const out = output + row * row_length + col;
 		if (aligned)
 			_ccv_nnc_8i_rowwise_x_store8(out, values);
@@ -1458,7 +1486,8 @@ static void _ccv_nnc_dequantize_8i_rowwise_x_tmcq_fp_launch(const int format, co
 		return;
 	const size_t blocks = _ccv_nnc_8i_rowwise_x_tmcq_blocks(tile_count);
 	const int aligned = ((uintptr_t)output & 15) == 0;
-#define KERNEL(n) _ccv_nnc_dequantize_8i_rowwise_x_tmcq_fp<n><<<blocks, CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32, 0, stream>>>(tile_count, row_length / 16, row_length, (const uint32_t*)input, scales, output, aligned)
+#define KERNEL(n) _ccv_nnc_dequantize_8i_rowwise_x_tmcq_fp<n><<<blocks, CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32, 0, stream>>>(tile_count, row_length / 16, row_length, (const uint32_t*)input, scales, output, aligned, table)
+	const ccv_nnc_8i_rowwise_x_tmcq_table_t& table = *_ccv_nnc_8i_rowwise_x_tmcq_table();
 	CCV_NNC_8I_ROWWISE_X_TMCQ_DISPATCH(format, KERNEL);
 #undef KERNEL
 }
@@ -1920,7 +1949,8 @@ void ccv_nnc_compat_dequantize_8i_rowwise_x(const void* input, const int datatyp
 		const size_t pair_count = output_length / 512;
 		const size_t blocks = _ccv_nnc_8i_rowwise_x_tmcq_blocks(pair_count);
 		const int aligned = ((uintptr_t)output & 15) == 0;
-#define KERNEL(n) _ccv_nnc_dequantize_8i_rowwise_x_tmcq_8i<n><<<blocks, CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32, 0, stream>>>(pair_count, row_length / 32, row_length, (const uint32_t*)u8, (uint8_t*)output, aligned)
+#define KERNEL(n) _ccv_nnc_dequantize_8i_rowwise_x_tmcq_8i<n><<<blocks, CCV_NNC_8I_ROWWISE_X_TMCQ_WARPS * 32, 0, stream>>>(pair_count, row_length / 32, row_length, (const uint32_t*)u8, (uint8_t*)output, aligned, table)
+		const ccv_nnc_8i_rowwise_x_tmcq_table_t& table = *_ccv_nnc_8i_rowwise_x_tmcq_table();
 		if (pair_count)
 			CCV_NNC_8I_ROWWISE_X_TMCQ_DISPATCH(format, KERNEL);
 #undef KERNEL
