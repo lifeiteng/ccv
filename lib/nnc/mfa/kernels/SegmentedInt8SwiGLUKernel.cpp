@@ -638,7 +638,13 @@ inline void segmented_int8_swiglu_shared_rows(
     up = clamp(up, -clamp_limit, clamp_limit);
 )";
     shader += R"(
-    destination[row] = (real)(up * gate * stable_sigmoid(gate));
+    {
+      const float sigmoid_gate = stable_sigmoid(gate);
+      {
+#pragma METAL fp math_mode(safe)
+        destination[row] = (real)((up * gate) * sigmoid_gate);
+      }
+    }
   }
 }
 
@@ -778,7 +784,13 @@ inline void segmented_int8_swiglu_shared_rows(
       up = clamp(up, -clamp_limit, clamp_limit);
 )";
     shader += R"(
-      destination[row_base + 0] = (real)(up * gate * stable_sigmoid(gate));
+      {
+        const float sigmoid_gate = stable_sigmoid(gate);
+        {
+#pragma METAL fp math_mode(safe)
+          destination[row_base + 0] = (real)((up * gate) * sigmoid_gate);
+        }
+      }
     }
     if (lane == 1 && active1) {
       float gate = all_gate1 * (float)gate_scales[row_base + 1];
@@ -790,7 +802,13 @@ inline void segmented_int8_swiglu_shared_rows(
       up = clamp(up, -clamp_limit, clamp_limit);
 )";
     shader += R"(
-      destination[row_base + 1] = (real)(up * gate * stable_sigmoid(gate));
+      {
+        const float sigmoid_gate = stable_sigmoid(gate);
+        {
+#pragma METAL fp math_mode(safe)
+          destination[row_base + 1] = (real)((up * gate) * sigmoid_gate);
+        }
+      }
     }
   }
 }
@@ -870,7 +888,7 @@ using namespace metal;
 
 inline float stable_sigmoid(const float value)
 {
-  const float tail = 1.0f / (1.0f + exp(abs(value)));
+  const float tail = metal::precise::divide(1.0f, 1.0f + metal::precise::exp(abs(value)));
   return tail + step(0.0f, value) * (1.0f - 2.0f * tail);
 }
 
@@ -952,8 +970,15 @@ inline float stable_sigmoid(const float value)
     up0 = clamp(up0, -clamp_limit, clamp_limit);
 )";
   shader += R"(
-    destination[row_base + 0] = (real)(
-      route_weight * up0 * gate0 * stable_sigmoid(gate0));
+    {
+      const float sigmoid_gate0 = stable_sigmoid(gate0);
+      {
+#pragma METAL fp math_mode(safe)
+        // ((up * gate) * sigmoid) * weight, as in the weighted SwishMul: fast-math must not
+        // reassociate the weighted product.
+        destination[row_base + 0] = (real)(((up0 * gate0) * sigmoid_gate0) * route_weight);
+      }
+    }
   }
 }
 )";
@@ -992,7 +1017,7 @@ using namespace metal;
 
 inline float stable_sigmoid(const float value)
 {
-  const float tail = 1.0f / (1.0f + exp(abs(value)));
+  const float tail = metal::precise::divide(1.0f, 1.0f + metal::precise::exp(abs(value)));
   return tail + step(0.0f, value) * (1.0f - 2.0f * tail);
 }
 
@@ -1077,8 +1102,15 @@ inline float stable_sigmoid(const float value)
     up0 = clamp(up0, -clamp_limit, clamp_limit);
 )";
   shader += R"(
-    destination[row_base + 0] = (real)(
-      route_weight * up0 * gate0 * stable_sigmoid(gate0));
+    {
+      const float sigmoid_gate0 = stable_sigmoid(gate0);
+      {
+#pragma METAL fp math_mode(safe)
+        // ((up * gate) * sigmoid) * weight, as in the weighted SwishMul: fast-math must not
+        // reassociate the weighted product.
+        destination[row_base + 0] = (real)(((up0 * gate0) * sigmoid_gate0) * route_weight);
+      }
+    }
   }
 }
 )";
@@ -1117,7 +1149,7 @@ using namespace metal;
 
 inline float stable_sigmoid(const float value)
 {
-  const float tail = 1.0f / (1.0f + exp(abs(value)));
+  const float tail = metal::precise::divide(1.0f, 1.0f + metal::precise::exp(abs(value)));
   return tail + step(0.0f, value) * (1.0f - 2.0f * tail);
 }
 
@@ -1199,8 +1231,15 @@ inline float stable_sigmoid(const float value)
     up0 = clamp(up0, -clamp_limit, clamp_limit);
 )";
   shader += R"(
-    destination[row_base + 0] = (real)(
-      route_weight * up0 * gate0 * stable_sigmoid(gate0));
+    {
+      const float sigmoid_gate0 = stable_sigmoid(gate0);
+      {
+#pragma METAL fp math_mode(safe)
+        // ((up * gate) * sigmoid) * weight, as in the weighted SwishMul: fast-math must not
+        // reassociate the weighted product.
+        destination[row_base + 0] = (real)(((up0 * gate0) * sigmoid_gate0) * route_weight);
+      }
+    }
   }
 }
 )";
@@ -1421,7 +1460,7 @@ using namespace metal;
 
 inline float stable_sigmoid(const float value)
 {
-  const float tail = 1.0f / (1.0f + exp(abs(value)));
+  const float tail = metal::precise::divide(1.0f, 1.0f + metal::precise::exp(abs(value)));
   return tail + step(0.0f, value) * (1.0f - 2.0f * tail);
 }
 
@@ -1502,8 +1541,15 @@ inline float stable_sigmoid(const float value)
     up0 = clamp(up0, -clamp_limit, clamp_limit);
 )";
   shader += R"(
-    destination[row_base + 0] = (real)(
-      route_weight * up0 * gate0 * stable_sigmoid(gate0));
+    {
+      const float sigmoid_gate0 = stable_sigmoid(gate0);
+      {
+#pragma METAL fp math_mode(safe)
+        // ((up * gate) * sigmoid) * weight, as in the weighted SwishMul: fast-math must not
+        // reassociate the weighted product.
+        destination[row_base + 0] = (real)(((up0 * gate0) * sigmoid_gate0) * route_weight);
+      }
+    }
   }
 }
 )";
@@ -1645,7 +1691,7 @@ inline float2 dot_pair(
 
 inline float stable_sigmoid(const float value)
 {
-  const float tail = 1.0f / (1.0f + exp(abs(value)));
+  const float tail = metal::precise::divide(1.0f, 1.0f + metal::precise::exp(abs(value)));
   return tail + step(0.0f, value) * (1.0f - 2.0f * tail);
 }
 
@@ -1723,8 +1769,15 @@ inline float stable_sigmoid(const float value)
     up0 = clamp(up0, -clamp_limit, clamp_limit);
 )";
   shader += R"(
-    destination[row_base + 0] = (real)(
-      route_weight * up0 * gate0 * stable_sigmoid(gate0));
+    {
+      const float sigmoid_gate0 = stable_sigmoid(gate0);
+      {
+#pragma METAL fp math_mode(safe)
+        // ((up * gate) * sigmoid) * weight, as in the weighted SwishMul: fast-math must not
+        // reassociate the weighted product.
+        destination[row_base + 0] = (real)(((up0 * gate0) * sigmoid_gate0) * route_weight);
+      }
+    }
   }
 }
 )";
