@@ -377,6 +377,7 @@ kernel void dequantize_8i_rowwise_x_selected_plan(
 Dequantize8iRowwiseXKernel::Dequantize8iRowwiseXKernel(Dequantize8iRowwiseXKernelDescriptor descriptor, MTL::Device* const device)
 {
 	format = descriptor.format;
+	levelMask = descriptor.levelMask;
 	source = createSource();
 	threadgroupSize = MTL::Size(256, 1, 1);
 
@@ -806,6 +807,138 @@ kernel void dequantize_8i_rowwise_x(
 	return shader;
 }
 
+// Variable-rate FTQ (CCVFTQVR blobs, see CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16).
+static bool is_ftq_vr(const uint32_t format)
+{
+	const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64;
+}
+
+// The words of one row segment of a tile at the compile-time rate N: the same reads and windows as the static-rate
+// FTQ decode at rate N (create_ftq_source), from `t`, the tile's first word, into q[16]. Below n = 16 the first windows
+// of rows 0 and 1 start before the tile and wrap to its end.
+static std::string ftq_segment_source(const uint32_t n)
+{
+	std::string body = "      constexpr uint N = " + std::to_string(n) + "u;\n      constexpr uint W = N / 2u;\n";
+	if (n >= 16)
+		body += "      const uint lane_bit = (r == 0u ? 16u * N : r * N) + (N >> 3) - 16u;\n";
+	else
+		body += "      const uint lane_raw = r * N + (N >> 3) + 16u * N - 16u;\n"
+			"      const uint lane_bit = lane_raw >= 16u * N ? lane_raw - 16u * N : lane_raw;\n";
+	body += "      const uint o0 = lane_bit >> 5;\n"
+		"      const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;\n"
+		"      const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;\n"
+		"      const uint shift = lane_bit & 31u;\n";
+	if (n > 48)
+		body += "      const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;\n";
+	return body;
+}
+
+static std::string ftq_segment_decode_source(const uint32_t n)
+{
+	std::string body;
+	if (n > 48)
+		body += "        const uint w0 = t[o0], w1 = t[o1], w2 = t[o2], w3 = t[o3];\n"
+			"        const uint f1 = tmcq_funnel(w1, w2, shift);\n"
+			"        const ulong lo = ((ulong)f1 << 32) | tmcq_funnel(w0, w1, shift);\n"
+			"        const ulong hi = ((ulong)tmcq_funnel(w2, w3, shift) << 32) | f1;\n";
+	else
+		body += "        const uint w0 = t[o0], w1 = t[o1], w2 = t[o2];\n"
+			"        const ulong lo = ((ulong)tmcq_funnel(w1, w2, shift) << 32) | tmcq_funnel(w0, w1, shift);\n"
+			"        const ulong hi = 0;\n";
+	body += "        #pragma clang loop unroll(full)\n"
+		"        for (uint i = 0; i < 8u; i++) {\n"
+		"          const uint k = (((i + 1u) * N) >> 3) - (N >> 3);\n"
+		"          const char2 v = ftq_pair((k <= 48u ? uint(lo >> k) : uint(hi >> (k - 32u))) & 0xffffu);\n"
+		"          q[2 * i] = v.x;\n"
+		"          q[2 * i + 1] = v.y;\n"
+		"        }\n";
+	return body;
+}
+
+// Variable-rate FTQ int8 decode. Tile row tr spans words prefix[tr] .. prefix[tr + 1] of the code, which follows the
+// header and the R + 1 word prefix; n_r = 2 (prefix[tr + 1] - prefix[tr]) / tiles_per_row is uniform in a tile row.
+// The prefix is bound again as a constant buffer at buffer(6). A thread decodes T blocks of 2 tiles x 16 rows of one
+// tile row (ftq_vr_blocks_per_thread: 2, or 1 for a folded table on fewer than 2^20 row segments), strided so a SIMD
+// group reads adjacent code words; one switch over n_r per thread picks the per-rate body of the static-rate decode
+// for every level of `level_mask` (bit i is n = 8 + 2 i). `index_shift` and `fold` are as for static-rate FTQ.
+static std::string create_ftq_vr_source(const uint32_t level_mask, const uint32_t index_shift, const bool fold)
+{
+	std::string shader = R"(
+#include <metal_stdlib>
+using namespace metal;
+)";
+	shader += ccv_nnc_mfa_tmcq_decode_source();
+	shader += "constant uint ftq_index_shift = " + std::to_string(index_shift) + ";\n";
+	shader += std::string("#define FTQ_VR_FOLD ") + (fold ? "1" : "0") + "\n";
+	shader += R"(
+kernel void dequantize_8i_rowwise_x(
+  device const uchar* source [[buffer(0)]],
+  device uchar* destination [[buffer(1)]],
+  device const uchar* input_scales [[buffer(2)]],
+  device uchar* output_scales [[buffer(3)]],
+  constant uint* ftq_vr_prefix [[buffer(6)]],
+
+  uint3 tgid [[threadgroup_position_in_grid]],
+  ushort lid [[thread_index_in_threadgroup]]
+) {
+  const uint x = tgid.x * threadgroup_size + lid;
+  if (x >= dispatch_items)
+    return;
+  const uint tiles_per_row = row_length >> 4;
+  const uint segments = total_groups * 16u;
+  const uint T = (FTQ_VR_FOLD && segments < (1u << 20)) ? 1u : 2u;
+  if (x < segments / T) {
+    const uint per_tile_row = (16u * tiles_per_row) / T;
+    const uint tile_row = x / per_tile_row;
+    const uint in_tile_row = x - tile_row * per_tile_row;
+    const uint lane = in_tile_row & 31u;
+    const uint group = in_tile_row >> 5;
+    const uint row = tile_row * 16u + (lane >> 1);
+    const uint r = row & 15u;
+    const uint block_stride = tiles_per_row / (2u * T);
+    device const uint* code = reinterpret_cast<device const uint*>(source + 32) + (total_groups / tiles_per_row + 1u);
+    const uint off0 = ftq_vr_prefix[tile_row];
+    const uint VW = (ftq_vr_prefix[tile_row + 1u] - off0) / tiles_per_row;
+    device const uint* row_code = code + off0;
+    device char4* dst_row = reinterpret_cast<device char4*>(destination + (ulong)row * row_length);
+    char q[16];
+    auto ftq_pair = [&](const uint state) -> char2 { return tmcq_table[(state * 0x83DCD12Du) >> ftq_index_shift]; };
+    switch (VW) {
+)";
+	uint32_t i;
+	for (i = 0; i < 29; i++)
+		if (level_mask & (1u << i))
+		{
+			const uint32_t n = 8 + 2 * i;
+			shader += "    case " + std::to_string(n / 2) + "u: {\n" + ftq_segment_source(n) +
+				"      for (uint j = 0; j < T; j++) {\n"
+				"        const uint tc = ((group + j * block_stride) << 1) | (lane & 1u);\n"
+				"        device const uint* t = row_code + tc * W;\n" + ftq_segment_decode_source(n) +
+				"        device char4* d = dst_row + tc * 4u;\n"
+				"        d[0] = char4(q[0], q[1], q[2], q[3]);\n"
+				"        d[1] = char4(q[4], q[5], q[6], q[7]);\n"
+				"        d[2] = char4(q[8], q[9], q[10], q[11]);\n"
+				"        d[3] = char4(q[12], q[13], q[14], q[15]);\n"
+				"      }\n"
+				"    } break;\n";
+		}
+	shader += R"(    default:
+      // A rate outside the level mask (rejected when the weights are loaded): zeros.
+      for (uint j = 0; j < T; j++) {
+        device char4* d = dst_row + ((((group + j * block_stride) << 1) | (lane & 1u)) * 4u);
+        d[0] = d[1] = d[2] = d[3] = char4(0);
+      }
+      break;
+    }
+  }
+  if (x < scale_bytes)
+    output_scales[x] = input_scales[x];
+}
+)";
+	return shader;
+}
+
 // An external codebook (tmcq_codebook_log2(format) != 0) for the TMCQ / FTQ int8 decode: every decoding kernel of
 // the shader takes the table at buffer(5) (the plain kernel binds 0 - 3, the selected one 0 - 4). TMCQ copies its
 // half2 part into threadgroup memory before any thread returns and reads it through tmcq_codebook_char2; FTQ reads
@@ -856,10 +989,12 @@ std::string Dequantize8iRowwiseXKernel::createSource() const noexcept
 			rewrite_decode_codebook(shader, tmcq_codebook_log2(format), false);
 		return shader;
 	}
-	if (is_ftq(format)) {
+	if (is_ftq(format) || is_ftq_vr(format)) {
 		// FTQ takes the index shift as a source constant (ftq_index_shift), 32 - log2 of the table size.
 		const uint32_t log2 = tmcq_codebook_log2(format);
-		std::string shader = createConstants() + "\n" + create_ftq_source(8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST), log2 ? 32 - log2 : 23);
+		std::string shader = createConstants() + "\n" + (is_ftq_vr(format) ?
+			create_ftq_vr_source(levelMask, log2 ? 32 - log2 : 23, tmcq_codebook_fold(format)) :
+			create_ftq_source(8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST), log2 ? 32 - log2 : 23));
 		if (log2)
 			rewrite_decode_codebook(shader, log2, true);
 		if (tmcq_codebook_fold(format)) {

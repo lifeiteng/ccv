@@ -112,7 +112,7 @@ static int _ccv_nnc_swiglu_forw(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hi
 	if (rowwise_weights && !rowwise_shape_supported)
 		return CCV_NNC_EXEC_INVALID;
 	// FTQ only decodes through GEMM_FORWARD.
-	if (rowwise_weights && ccv_nnc_8i_rowwise_x_is_ftq(gate_format))
+	if (rowwise_weights && ccv_nnc_8i_rowwise_x_is_ftq_any(gate_format))
 		return CCV_NNC_EXEC_INVALID;
 	// TMCQ weights have no direct row kernel here: they take the matrix paths below, which decode
 	// their 16 x 16 tiles first (N % 256 covers the tiles' N % 16). No TMCQ codec takes a Hadamard

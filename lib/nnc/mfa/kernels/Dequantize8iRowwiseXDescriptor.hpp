@@ -7,14 +7,16 @@
 
 struct Dequantize8iRowwiseXKernelDescriptor {
 	uint32_t format;
-	constexpr bool operator==(const Dequantize8iRowwiseXKernelDescriptor& rhs) const { return format == rhs.format; }
+	// Variable-rate FTQ: the blob's level mask (bit i is rate 8 + 2 i), which picks the per-rate bodies; 0 otherwise.
+	uint32_t levelMask = 0;
+	constexpr bool operator==(const Dequantize8iRowwiseXKernelDescriptor& rhs) const { return format == rhs.format && levelMask == rhs.levelMask; }
 };
 
 template<>
 struct std::hash<Dequantize8iRowwiseXKernelDescriptor>
 {
 	std::size_t operator()(const Dequantize8iRowwiseXKernelDescriptor& hash) const noexcept {
-		return std::hash<uint32_t>()(hash.format);
+		return std::hash<uint64_t>()((uint64_t)hash.format | ((uint64_t)hash.levelMask << 32));
 	}
 };
 
@@ -25,6 +27,8 @@ struct Dequantize8iRowwiseXDescriptor {
 	uint32_t scaleSize;
 	uint32_t rowLength;
 	uint32_t length;
+	// Variable-rate FTQ: the level mask of the blob's header; 0 for every other format.
+	uint32_t levelMask = 0;
 
 	bool operator==(const Dequantize8iRowwiseXDescriptor& rhs) const;
 

@@ -293,7 +293,7 @@ static int _ccv_nnc_segmented_gemm_routed_forw(const ccv_nnc_cmd_t cmd, const cc
 		// 256-weight groups (K % 256), and no codec takes a Hadamard rotation with them. The GEMV
 		// decodes tiles in place; prefill decodes them per weight block or expands the selected experts.
 		// FTQ only decodes through GEMM_FORWARD.
-		if (ccv_nnc_8i_rowwise_x_is_ftq(w_8i_rowwise_x_format))
+		if (ccv_nnc_8i_rowwise_x_is_ftq_any(w_8i_rowwise_x_format))
 			return CCV_NNC_EXEC_INVALID;
 		const int w_tmcq = ccv_nnc_8i_rowwise_x_is_tmcq(w_8i_rowwise_x_format);
 		const int w_tmcq_supported = !w_tmcq ||

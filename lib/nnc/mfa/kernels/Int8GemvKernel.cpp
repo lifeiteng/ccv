@@ -1138,9 +1138,61 @@ bool is_ftq(const uint32_t format)
 // (ccv_nnc_mfa_codebook_buffer).
 // fold: a quadrant-folded external table (CCV_NNC_MFA_CODEBOOK_FOLD, log2Entries 9): base pair (h >> 16) & 511 of
 // h = state * 0x83DCD12D, signs from bits 15 / 31 of h xored straight into the half2's sign bits.
-static void append_ftq_kernel(std::string& shader, const uint32_t format, const uint32_t mrows, const bool fusedBias, const uint32_t log2Entries = 9, const bool externalTable = false, const bool fold = false)
+// Variable-rate FTQ (CCVFTQVR blobs, see CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16).
+static bool is_ftq_vr(const uint32_t format)
 {
-  const uint32_t n = 8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST);
+  const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+  return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64;
+}
+
+// The tile loop of one threadgroup's 16 rows at the compile-time rate n, over row_code (the tile row's first word):
+// the lane's three (n <= 48) or four words from its first window's start and its 8 windows at compile-time offsets.
+// Below n = 16 the first windows of rows 0 and 1 start before the tile and wrap to its end.
+static std::string ftq_gemv_rate_source(const uint32_t n)
+{
+  std::string body = "  {\n  constexpr uint N = " + std::to_string(n) + "u;\n  constexpr uint W = N / 2u;\n";
+  if (n >= 16)
+    body += "  const uint lane_bit = (r == 0u ? 16u * N : r * N) + (N >> 3) - 16u;\n";
+  else
+    body += "  const uint lane_raw = r * N + (N >> 3) + 16u * N - 16u;\n"
+      "  const uint lane_bit = lane_raw >= 16u * N ? lane_raw - 16u * N : lane_raw;\n";
+  body += "  const uint o0 = lane_bit >> 5;\n"
+    "  const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;\n"
+    "  const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;\n";
+  if (n > 48)
+    body += "  const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;\n";
+  body += "  const uint sh = lane_bit & 31u;\n"
+    "  // One tile per iteration.\n"
+    "  for (uint tc = stream; tc < tiles_per_row; tc += STREAMS) {\n"
+    "    device const uint* t = row_code + tc * W;\n";
+  if (n > 48)
+    body += "    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2], w3 = t[o3];\n"
+      "    const uint f1 = tmcq_funnel(w1, w2, sh);\n"
+      "    const ulong lo = ((ulong)f1 << 32) | tmcq_funnel(w0, w1, sh);\n"
+      "    const ulong hi = ((ulong)tmcq_funnel(w2, w3, sh) << 32) | f1;\n";
+  else
+    body += "    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2];\n"
+      "    const ulong lo = ((ulong)tmcq_funnel(w1, w2, sh) << 32) | tmcq_funnel(w0, w1, sh);\n"
+      "    const ulong hi = 0;\n";
+  body += "    float4 qa[4];\n"
+    "    ftq_decode_lane<N>(lo, hi, qa, (threadgroup const half2*)tmcq_tg);\n"
+    "    for (uint m = 0; m < M; m++) {\n"
+    "      device const real4* y0 = (device const real4*)(src1 + (ulong)vector_row_stride * m) + tc * 4;\n"
+    "      acc0[m] += dot(qa[0], float4(y0[0])) + dot(qa[1], float4(y0[1])) + dot(qa[2], float4(y0[2])) + dot(qa[3], float4(y0[3]));\n"
+    "    }\n"
+    "  }\n"
+    "  }\n";
+  return body;
+}
+
+// levelMask (variable-rate FTQ): tile row tr spans words prefix[tr] .. prefix[tr + 1] of the code after the header and
+// the R + 1 word prefix (bound again as a constant buffer at buffer(6)); n_r = 2 (prefix[tr + 1] - prefix[tr]) /
+// tiles_per_row is uniform in the threadgroup, which switches once to the static-rate loop at n_r for every level of
+// the mask (bit i is n = 8 + 2 i).
+static void append_ftq_kernel(std::string& shader, const uint32_t format, const uint32_t mrows, const bool fusedBias, const uint32_t log2Entries = 9, const bool externalTable = false, const bool fold = false, const uint32_t levelMask = 0)
+{
+  const bool vr = is_ftq_vr(format);
+  const uint32_t n = vr ? 0 : 8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST);
   const uint32_t S = int8GemvTMCQSIMDGroups(mrows);
   shader += R"(
 #include <metal_stdlib>
@@ -1149,7 +1201,6 @@ using namespace metal;
   // Table id 0 is the built-in table.
   shader += ccv_nnc_mfa_tmcq_decode_source();
   shader += ccv_nnc_mfa_tmcq_w1_helpers;
-  shader += "constant uint ftq_n = " + std::to_string(n) + ";\n";
   // 32 - log2 of the pair count.
   shader += "constant uint ftq_index_shift = " + std::to_string(32 - log2Entries) + ";\n";
   shader += "constant uint ftq_entries = " + std::to_string(1u << log2Entries) + ";\n";
@@ -1169,14 +1220,15 @@ inline float2 ftq_lookup(threadgroup const half2* table, uint state)
 #endif
 }
 
-// The 8 windows of a lane from its funnelled bits: window i at offset floor((i + 1) n / 8) - floor(n / 8) of the lane's
-// first window start, from the low 64 bits or (n > 48 only, offsets past 48) from bits 32 .. 95.
+// The 8 windows of a lane from its funnelled bits at rate N: window i at offset floor((i + 1) N / 8) - floor(N / 8) of the
+// lane's first window start, from the low 64 bits or (N > 48 only, offsets past 48) from bits 32 .. 95.
+template <uint N>
 inline void ftq_decode_lane(ulong lo, ulong hi, thread float4* q, threadgroup const half2* table)
 {
   float2 c[8];
   #pragma clang loop unroll(full)
   for (uint i = 0; i < 8u; i++) {
-    const uint k = (((i + 1u) * ftq_n) >> 3) - (ftq_n >> 3);
+    const uint k = (((i + 1u) * N) >> 3) - (N >> 3);
     const uint state = (k <= 48u ? uint(lo >> k) : uint(hi >> (k - 32u))) & 0xffffu;
     c[i] = ftq_lookup(table, state);
   }
@@ -1200,6 +1252,11 @@ kernel void int8_gemv(
   if (externalTable) {
     shader += R"(
   device const uint4 *codebook [[buffer(5)]],
+)";
+  }
+  if (vr) {
+    shader += R"(
+  constant uint *ftq_vr_prefix [[buffer(6)]],
 )";
   }
   shader += R"(
@@ -1240,49 +1297,26 @@ kernel void int8_gemv(
 
 )";
   shader += R"(
-  const uint W = ftq_n / 2u;
-  device const uint* row_code = code + (ulong)(rb >> 4) * tiles_per_row * W;
-  const uint lane_bit = (r == 0u ? 16u * ftq_n : r * ftq_n) + (ftq_n >> 3) - 16u;
-  const uint o0 = lane_bit >> 5;
-  const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;
-  const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;
-)";
-  if (n > 48)
-    shader += R"(
-  const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;
-)";
-  shader += R"(
-  const uint sh = lane_bit & 31u;
-
   float acc0[M], acc1[M];
   for (uint m = 0; m < M; m++)
     acc0[m] = acc1[m] = 0;
-  // One tile per iteration.
-  for (uint tc = stream; tc < tiles_per_row; tc += STREAMS) {
-    device const uint* t = row_code + tc * W;
 )";
-  if (n > 48)
+  if (vr) {
     shader += R"(
-    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2], w3 = t[o3];
-    const uint f1 = tmcq_funnel(w1, w2, sh);
-    const ulong lo = ((ulong)f1 << 32) | tmcq_funnel(w0, w1, sh);
-    const ulong hi = ((ulong)tmcq_funnel(w2, w3, sh) << 32) | f1;
+  const uint off0 = ftq_vr_prefix[rb >> 4];
+  const uint VW = (ftq_vr_prefix[(rb >> 4) + 1u] - off0) / tiles_per_row;
+  device const uint* row_code = code + ((nrows >> 4) + 1u) + off0;
+  switch (VW) {
 )";
-  else
-    shader += R"(
-    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2];
-    const ulong lo = ((ulong)tmcq_funnel(w1, w2, sh) << 32) | tmcq_funnel(w0, w1, sh);
-    const ulong hi = 0;
-)";
-  shader += R"(
-    float4 qa[4];
-    ftq_decode_lane(lo, hi, qa, (threadgroup const half2*)tmcq_tg);
-    for (uint m = 0; m < M; m++) {
-      device const real4* y0 = (device const real4*)(src1 + (ulong)vector_row_stride * m) + tc * 4;
-      acc0[m] += dot(qa[0], float4(y0[0])) + dot(qa[1], float4(y0[1])) + dot(qa[2], float4(y0[2])) + dot(qa[3], float4(y0[3]));
-    }
+    for (uint32_t i = 0; i < 29; i++)
+      if (levelMask & (1u << i))
+        shader += "  case " + std::to_string((8 + 2 * i) / 2) + "u:\n" + ftq_gemv_rate_source(8 + 2 * i) + "  break;\n";
+    // A rate outside the level mask (rejected when the weights are loaded) adds nothing.
+    shader += "  default:\n  break;\n  }\n";
+  } else {
+    shader += "  device const uint* row_code = code + (ulong)(rb >> 4) * tiles_per_row * " + std::to_string(n / 2) + "u;\n";
+    shader += ftq_gemv_rate_source(n);
   }
-)";
   shader += R"(
   float acc[M];
   for (uint m = 0; m < M; m++)
@@ -1328,6 +1362,7 @@ Int8GemvKernel::Int8GemvKernel(Int8GemvKernelDescriptor descriptor, MTL::Device*
   mrows = descriptor.mrows;
   batched = descriptor.batched;
   format = descriptor.format;
+  levelMask = descriptor.levelMask;
   memoryPrecision = descriptor.memoryPrecision;
   CCV_NNC_MFA_PRECONDITION(!batched || !fusedBias);
   CCV_NNC_MFA_PRECONDITION(mrows <= 3 || format == 0 || format == CCV_NNC_QX_8I_ROWWISE_Q5_K || format == CCV_NNC_QX_8I_ROWWISE_Q6_K);
@@ -1367,13 +1402,13 @@ std::string Int8GemvKernel::createSource() const noexcept {
       rewrite_w1_codebook(shader, tmcq_codebook_log2(format));
     return shader;
   }
-  if (is_ftq(format)) {
+  if (is_ftq(format) || is_ftq_vr(format)) {
     CCV_NNC_MFA_PRECONDITION(mrows >= 1 && mrows <= 3);
     // The FTQ kernel takes an external codebook natively (log2Entries / externalTable).
     const uint32_t log2 = tmcq_codebook_log2(format);
     CCV_NNC_MFA_PRECONDITION(log2 == 0 || (log2 >= 9 && log2 <= 11));
     CCV_NNC_MFA_PRECONDITION(!tmcq_codebook_fold(format) || log2 == 9);
-    append_ftq_kernel(shader, format, mrows, fusedBias, log2 ? log2 : 9, log2 != 0, tmcq_codebook_fold(format));
+    append_ftq_kernel(shader, format, mrows, fusedBias, log2 ? log2 : 9, log2 != 0, tmcq_codebook_fold(format), levelMask);
     return shader;
   }
   if (format != 0) {

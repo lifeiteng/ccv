@@ -103,7 +103,7 @@ static uint32_t _ccv_nnc_mps_codebook_format(ccv_nnc_mfa_context_t* const contex
 	*codebook = ccv_nnc_mfa_codebook_buffer(context, slot, &entries);
 	assert(*codebook && "the tensor names a codebook slot that is not registered");
 	const int fold = !!(ccv_nnc_codebook_flags(slot) & CCV_NNC_CODEBOOK_FOLD);
-	assert((!fold || ccv_nnc_8i_rowwise_x_is_ftq(format)) && "folded codebooks exist for FTQ only");
+	assert((!fold || ccv_nnc_8i_rowwise_x_is_ftq_any(format)) && "folded codebooks exist for FTQ only");
 	// A quadrant-folded table is bit 24 of the MFA format (CCV_NNC_MFA_CODEBOOK_FOLD).
 	return (kernel & ~(uint32_t)CCV_NNC_CODEBOOK_SLOT_MASK) | ((uint32_t)ccv_nnc_codebook_log2_entries(entries) << 16) | (fold ? 1u << 24 : 0);
 }

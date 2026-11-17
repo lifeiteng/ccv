@@ -268,11 +268,25 @@ static inline int ccv_nnc_8i_rowwise_x_is_ftq(const int format)
 	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
 }
 
+/* Variable-rate FTQ (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N64, the open codes of its block): whole CCVFTQVR blobs with
+ * FP16 scales. */
+static inline int ccv_nnc_8i_rowwise_x_is_ftq_vr(const int format)
+{
+	const int codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64;
+}
+
+/* Static- or variable-rate FTQ. */
+static inline int ccv_nnc_8i_rowwise_x_is_ftq_any(const int format)
+{
+	return ccv_nnc_8i_rowwise_x_is_ftq(format) || ccv_nnc_8i_rowwise_x_is_ftq_vr(format);
+}
+
 /* Whether the codec may name the codebook slot of format: TMCQ and FTQ any (0 is the built-in table; the FTQ
  * blob header carries the same table id), every other codec only slot 0. */
 static inline int ccv_nnc_8i_rowwise_x_codebook_is_valid(const int format)
 {
-	if (ccv_nnc_8i_rowwise_x_is_tmcq(format) || ccv_nnc_8i_rowwise_x_is_ftq(format))
+	if (ccv_nnc_8i_rowwise_x_is_tmcq(format) || ccv_nnc_8i_rowwise_x_is_ftq_any(format))
 		return 1;
 	return ccv_nnc_8i_rowwise_x_codebook_slot(format) == 0;
 }
@@ -284,10 +298,17 @@ static inline int ccv_nnc_8i_rowwise_x_ftq_rate(const int format)
 	return 8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST);
 }
 
+/* The variable-rate FTQ mean rate nm: the code has R C 2 nm bytes at most, see CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16. */
+static inline int ccv_nnc_8i_rowwise_x_ftq_vr_rate(const int format)
+{
+	assert(ccv_nnc_8i_rowwise_x_is_ftq_vr(format));
+	return 8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST);
+}
+
 /* Formats on the 16 x 16 tile grid (row_count % 16, row_length % 256, no H256). */
 static inline int ccv_nnc_8i_rowwise_x_is_tiled(const int format)
 {
-	return ccv_nnc_8i_rowwise_x_is_tmcq(format) || ccv_nnc_8i_rowwise_x_is_ftq(format);
+	return ccv_nnc_8i_rowwise_x_is_tmcq(format) || ccv_nnc_8i_rowwise_x_is_ftq_any(format);
 }
 
 static inline ccv_nnc_8i_rowwise_x_ftq_schedule_t ccv_nnc_8i_rowwise_x_ftq_schedule(const int format, const uint64_t row_count, const uint64_t row_length)
@@ -329,6 +350,9 @@ static inline int ccv_nnc_8i_rowwise_x_group_bits(const int format)
 	// 16 n bits per tile, after the 32-byte FTQ header (ccv_nnc_8i_rowwise_x_payload_header).
 	if (ccv_nnc_8i_rowwise_x_is_ftq(format))
 		return 16 * ccv_nnc_8i_rowwise_x_ftq_rate(format);
+	// The budget of variable-rate FTQ: 16 nm bits per tile on average.
+	if (ccv_nnc_8i_rowwise_x_is_ftq_vr(format))
+		return 16 * ccv_nnc_8i_rowwise_x_ftq_vr_rate(format);
 	switch (format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK)
 	{
 		case CCV_NNC_QX_8I_ROWWISE_Q5_K:
@@ -359,9 +383,12 @@ static inline int ccv_nnc_8i_rowwise_x_group_bits(const int format)
 }
 
 /* Bytes in front of the packed payload: the 32-byte CCVFTQSR header for FTQ (its scales start at align128(32 +
- * payload)), 0 for every other format. */
-static inline int ccv_nnc_8i_rowwise_x_payload_header(const int format)
+ * payload)), the 32-byte CCVFTQVR header and the R + 1 word tile row offsets for variable-rate FTQ, 0 for every
+ * other format. */
+static inline size_t ccv_nnc_8i_rowwise_x_payload_header(const int format, const size_t row_count)
 {
+	if (ccv_nnc_8i_rowwise_x_is_ftq_vr(format))
+		return 32 + 4 * (row_count / 16 + 1);
 	return ccv_nnc_8i_rowwise_x_is_ftq(format) ? 32 : 0;
 }
 
@@ -434,7 +461,7 @@ static inline size_t ccv_nnc_tensor_data_size_without_padding(const ccv_nnc_tens
 			const ssize_t group_size = ccv_nnc_8i_rowwise_x_group_size(params.reserved);
 			const ssize_t groups_per_row = (row_length + group_size - 1) / group_size;
 			const ssize_t group_bits = ccv_nnc_8i_rowwise_x_group_bits(params.reserved);
-			const ssize_t payload_size = (row_count * groups_per_row * group_bits + 7) / 8 + ccv_nnc_8i_rowwise_x_payload_header(params.reserved);
+			const ssize_t payload_size = (row_count * groups_per_row * group_bits + 7) / 8 + ccv_nnc_8i_rowwise_x_payload_header(params.reserved, row_count);
 			const ssize_t scale_offset = (payload_size + 127) & -128;
 			data_size = scale_offset + row_count * CCV_GET_DATA_TYPE_SIZE(qx_datatype);
 		} else {

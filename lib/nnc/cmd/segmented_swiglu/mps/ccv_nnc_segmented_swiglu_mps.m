@@ -108,7 +108,7 @@ static int _ccv_nnc_segmented_swiglu_shared_forw(const float clamp, const ccv_nn
 	if (rowwise_weights && !rowwise_shape_supported)
 		return CCV_NNC_EXEC_INVALID;
 	// FTQ only decodes through GEMM_FORWARD.
-	if (rowwise_weights && ccv_nnc_8i_rowwise_x_is_ftq(gate_format))
+	if (rowwise_weights && ccv_nnc_8i_rowwise_x_is_ftq_any(gate_format))
 		return CCV_NNC_EXEC_INVALID;
 	// TMCQ shared weights take the matrix paths below, as in SWIGLU_FORWARD.
 	if (rowwise_weights && ccv_nnc_8i_rowwise_x_is_tmcq(gate_format) && (gate_format & ~CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK))

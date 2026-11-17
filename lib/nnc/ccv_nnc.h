@@ -1228,6 +1228,50 @@ enum {
 	CCV_NNC_QX_8I_ROWWISE_FTQ_N64,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_LAST = CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST + 63,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST = CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_LAST + 1,
+	/* Variable-rate FTQ (VR: variable rate), CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N64, mean rate
+	 * nm = 8 + 2 (format - FTQ_VR_BLOCK_FIRST), so FTQ_VR_N<nm>. FP16 tensors only, rows % 16 == 0, cols % 256 == 0.
+	 * R = rows / 16 tile rows of C = cols / 16 tiles. Blob (little endian):
+	 *   [0, 8)    magic "CCVFTQVR"
+	 *   [8, 32)   uint32 rows, cols, 16 * nm, level_mask, table, table_crc
+	 *             level_mask: bit i set when rate n = 8 + 2 i (8 ... 64) occurs; at most 6 bits set.
+	 *             table, table_crc: as in static-rate FTQ (id bits 0 - 7, log2 pairs 8 - 15, structure 16 - 17;
+	 *             crc32, 0 for id 0).
+	 *   [32, 32 + 4 (R + 1))  uint32 off[R + 1], word offsets from the code start, off[0] = 0, non-decreasing.
+	 *   code      starts at word 8 + R + 1; tile row r is words off[r] .. off[r + 1] and holds C tiles of 16 n_r bits
+	 *             each, n_r = 2 (off[r + 1] - off[r]) / C, so every tile starts on a word; inside a tile it is
+	 *             static-rate FTQ at rate n_r (including the wrap of the first windows; for n_r < 16 rows 0 and 1
+	 *             of the tile wrap).
+	 *   padding   zero bytes up to scale_offset = align128(32 + 4 (R + 1) + R C 2 nm).
+	 *   scales    FP16 row scales, 2 rows bytes. Blob size = scale_offset + 2 rows.
+	 * A reader rejects the blob unless: the magic matches, rows / cols / 16 nm match the tensor and format, every n_r
+	 * is a set bit of level_mask, at most 6 bits are set, off is non-decreasing with off[R] <= R C nm / 2, every
+	 * off[r + 1] - off[r] is a multiple of C (so n_r is even), the padding is zero, and the table checks of
+	 * static-rate FTQ pass. */
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 = CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST + (16 - 8) / 2,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N18,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N22,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N24,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N26,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N28,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N30,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N32,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N34,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N36,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N38,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N40,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N42,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N44,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N46,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N48,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N50,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N52,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N54,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N56,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N58,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N60,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N62,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_LAST = CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST + 63,
 };
 
@@ -1329,6 +1373,14 @@ CCV_WARN_UNUSED(size_t) ccv_nnc_8i_rowwise_x_data_size(const int format, const i
  * writes the whole CCVFTQSR blob.
  */
 CCV_WARN_UNUSED(size_t) ccv_nnc_quantize_8i_rowwise_x(const void* input, const int datatype, const int memory_type, const size_t input_length, const size_t row_length, const int format, const float* const imatrix, const size_t imatrix_length, const float* const hessian, const size_t hessian_length, void* output, const size_t output_length);
+/**
+ * Quantize FP16 weights into variable-rate FTQ (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N64), fitted as
+ * ccv_nnc_quantize_8i_rowwise_x fits static-rate FTQ, with the built-in table.
+ * @param rates The rate n_r of each tile row (rows / 16 of them): even, 8 ... 64, at most 6 distinct values and
+ * sum n_r <= (rows / 16) nm. 0 gives every tile row the mean rate nm of the format.
+ * @return The blob size, or 0 without writing output for invalid rates, shape or insufficient output space.
+ */
+CCV_WARN_UNUSED(size_t) ccv_nnc_quantize_8i_rowwise_x_ftq_vr(const void* input, const int datatype, const int memory_type, const size_t input_length, const size_t row_length, const int format, const int* const rates, void* output, const size_t output_length);
 /**
  * Dequantize a row-wise-x int8-compatible format back to @p datatype.
  * H256 logical-weight decoding is not supported yet.

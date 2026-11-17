@@ -136,7 +136,7 @@ static ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t _ccv_nnc_8i_rowwise_x_decode
 // registered.
 static int _ccv_nnc_mps_codebook(ccv_nnc_mfa_context_t* const context, const int slot, uint32_t* const format, mtl_buffer_t** const codebook)
 {
-	return ccv_nnc_mfa_codebook_format(context, slot, ccv_nnc_8i_rowwise_x_is_ftq((int)*format), format, codebook);
+	return ccv_nnc_mfa_codebook_format(context, slot, ccv_nnc_8i_rowwise_x_is_ftq_any((int)*format), format, codebook);
 }
 
 static void _ccv_nnc_mfa_encode_8i_rowwise_x_decode(ccv_nnc_mfa_context_t* const context, const ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t params, mtl_command_batch_t* const command_batch, mtl_buffer_t* const source, const size_t source_offset, mtl_buffer_t* const destination, const size_t destination_offset)
@@ -336,7 +336,7 @@ static int _ccv_nnc_gemm_forw(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint
 		// FTQ runs a fused GEMV for 1 to 3 rows; every other path decodes them to 8I_ROWWISE scratch
 		// first (the scaled GEMM, the ANE), and anything else is rejected below. The blob is one 2-D FP16
 		// tensor, so batched weights are rejected too.
-		const int w_8i_rowwise_x_ftq = ccv_nnc_8i_rowwise_x_is_ftq(w_8i_rowwise_x_format);
+		const int w_8i_rowwise_x_ftq = ccv_nnc_8i_rowwise_x_is_ftq_any(w_8i_rowwise_x_format);
 		if (w_8i_rowwise_x_ftq && (activation_hadamard_256 || w_datatype != CCV_16F || w_batch_size != 1 || w->info.dim[w_nd - 1] <= 0 || w->info.dim[w_nd - 1] % 256 != 0 || (ccv_nnc_tensor_count(w->info) / w->info.dim[w_nd - 1]) % 16 != 0))
 			return CCV_NNC_EXEC_INVALID;
 		const int is_same_dtype =
@@ -1093,7 +1093,7 @@ static int _ccv_nnc_gemm_back(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint
 	const int a_datatype = a ? (CCV_GET_DATA_TYPE(a->info.datatype) == CCV_QX ? ((a->info.datatype & 0xff) << 12) : a->info.datatype) : 0;
 	const int w_datatype = w ? (CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX ? ((w->info.datatype & 0xff) << 12) : w->info.datatype) : 0;
 	// FTQ weights only decode to int8 for the forward GEMM paths; the backward decode reads the built-in TMCQ table only.
-	if (w && CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX && (w->info.datatype & 0xf00) == CCV_NNC_QX_8I_ROWWISE_X && (ccv_nnc_8i_rowwise_x_is_ftq(w->info.reserved) || ccv_nnc_codebook_slot_of(w->info.reserved)))
+	if (w && CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX && (w->info.datatype & 0xf00) == CCV_NNC_QX_8I_ROWWISE_X && (ccv_nnc_8i_rowwise_x_is_ftq_any(w->info.reserved) || ccv_nnc_codebook_slot_of(w->info.reserved)))
 		return CCV_NNC_EXEC_INVALID;
 
 	@autoreleasepool {

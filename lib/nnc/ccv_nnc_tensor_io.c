@@ -434,6 +434,9 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 	// A row-wise-x weight stored with a codebook id: resolve it to the process-wide slot first, so a missing or invalid
 	// codebook fails the read instead of decoding with the built-in table. codebook_slot < 0: not such a weight.
 	int codebook_slot = -1;
+	// A variable-rate FTQ weight (its stored format with the resolved codebook slot): the whole blob is checked once
+	// it is read. -1: not such a weight.
+	int ftq_vr_format = -1;
 	{
 		const sqlite_int64 stored_datatype_mix = sqlite3_column_int64(tensor_select_stmt, 3);
 		const int stored_datatype = (int)(stored_datatype_mix & 0xffffffff);
@@ -450,14 +453,23 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 			// header sits at the start of the stored data (the first part of a split tensor); data encoded by an
 			// identifier codec is not looked into here and is rejected if it names an FTQ codebook.
 			const int stored_reserved = (int)((stored_datatype_mix >> 32) & 0xffffffff);
-			if (ccv_nnc_8i_rowwise_x_is_ftq(stored_reserved))
+			if (ccv_nnc_8i_rowwise_x_is_ftq_any(stored_reserved))
 			{
+				const int vr = ccv_nnc_8i_rowwise_x_is_ftq_vr(stored_reserved);
 				const int stored_identifier = (int)((sqlite3_column_int64(tensor_select_stmt, 1) >> 32) & 0xffffffff);
 				const uint8_t* const head = (const uint8_t*)sqlite3_column_blob(tensor_select_stmt, 0);
 				const int head_bytes = sqlite3_column_bytes(tensor_select_stmt, 0);
 				uint32_t table_field = 0;
-				if (head && head_bytes >= 32 && memcmp(head, "CCVFTQSR", 8) == 0)
+				if (vr)
 				{
+					// Variable-rate FTQ is only stored raw, so its whole blob can be checked below.
+					if (stored_identifier != 0 || !head || head_bytes < 32 || memcmp(head, "CCVFTQVR", 8) != 0)
+					{
+						sqlite3_finalize(tensor_select_stmt);
+						return CCV_IO_ERROR;
+					}
+					memcpy(&table_field, head + 24, 4);
+				} else if (head && head_bytes >= 32 && memcmp(head, "CCVFTQSR", 8) == 0) {
 					// Every tile has 16 n bits and nothing is dropped (see CCV_NNC_QX_8I_ROWWISE_FTQ_N16).
 					uint32_t high_drop[2];
 					memcpy(high_drop, head + 16, sizeof(high_drop));
@@ -480,6 +492,8 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 						return CCV_IO_ERROR;
 					}
 				}
+				if (vr)
+					ftq_vr_format = ccv_nnc_codebook_with_slot(stored_reserved, codebook_slot);
 			}
 		}
 	}
@@ -547,6 +561,25 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 	int dim[CCV_NNC_MAX_DIM_ALLOC];
 	memcpy(dim, sqlite3_column_blob(tensor_select_stmt, 4), ccv_min(sizeof(dim), sqlite3_column_bytes(tensor_select_stmt, 4)));
 	const int nd = ccv_nnc_tensor_nd(dim);
+	if (ftq_vr_format >= 0)
+	{
+		// Every rule of CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 on the stored blob, against the stored shape and format.
+		size_t count = 1;
+		int i;
+		for (i = 0; i < nd; i++)
+			count *= dim[i] > 0 ? (size_t)dim[i] : 0;
+		const size_t row_length = nd > 0 && dim[nd - 1] > 0 ? (size_t)dim[nd - 1] : 0;
+		if (row_length == 0 || count % row_length != 0 || datatype != (((CCV_16F >> 12) & 0xff) | CCV_QX | CCV_NNC_QX_8I_ROWWISE_X) ||
+			ccv_nnc_8i_rowwise_x_ftq_vr_check(data, data_bytes, ftq_vr_format, count / row_length, row_length, 0) != 0)
+		{
+			if (split_workspace)
+				ccfree(split_workspace);
+			sqlite3_reset(tensor_select_stmt);
+			sqlite3_clear_bindings(tensor_select_stmt);
+			sqlite3_finalize(tensor_select_stmt);
+			return CCV_IO_ERROR;
+		}
+	}
 	if (datatype != tensor_params.datatype && CCV_GET_DATA_TYPE(tensor_params.datatype) != CCV_QX)
 	{
 		// Only ever works for 16F to 32F or 32F to 16F transparently.

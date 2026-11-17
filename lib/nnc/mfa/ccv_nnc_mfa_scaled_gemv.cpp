@@ -1,6 +1,7 @@
 #include "ccv_nnc_mfa.hpp"
 #include "kernels/Int8GemvDescriptor.hpp"
 #include "kernels/Int8GemvKernel.hpp"
+#include <cstring>
 using namespace ccv::nnc;
 
 namespace {
@@ -31,6 +32,13 @@ bool is_ftq(const uint32_t format) noexcept
 {
   const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
   return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
+}
+
+// Variable-rate FTQ (CCVFTQVR blobs, see CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16).
+bool is_ftq_vr(const uint32_t format) noexcept
+{
+  const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+  return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64;
 }
 
 }
@@ -66,7 +74,7 @@ void ccv_nnc_mfa_encode_scaled_gemv(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_
   }
   // TMCQ tiles span 16 rows, so TMCQ only needs N % 16; its kernel reads the payload as 32-bit words.
   // FTQ uses the same tile grid and reads its code as 32-bit words too.
-  if (is_tmcq(params.format) || is_ftq(params.format)) {
+  if (is_tmcq(params.format) || is_ftq(params.format) || is_ftq_vr(params.format)) {
     CCV_NNC_MFA_PRECONDITION((params.ncols % 256) == 0 && (params.nrows % 16) == 0);
     CCV_NNC_MFA_PRECONDITION((tensor_offsets[0] % 4) == 0 && (batchDimension == 1 || (params.batch_stride_weights % 4) == 0));
   } else {
@@ -83,6 +91,13 @@ void ccv_nnc_mfa_encode_scaled_gemv(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_
   descriptor.ncols = params.ncols;
   descriptor.vectorRowStride = vectorRowStride;
   descriptor.outputRowStride = outputRowStride;
+  if (is_ftq_vr(params.format)) {
+    // The kernel switches over the blob's level mask (header word 3), read from the shared buffer: the pipeline is keyed
+    // by it.
+    const uint8_t* const blob = static_cast<const uint8_t*>(tensors[0]->contents());
+    CCV_NNC_MFA_PRECONDITION(blob != nullptr && batchDimension == 1);
+    memcpy(&descriptor.levelMask, blob + tensor_offsets[0] + 20, sizeof(uint32_t));
+  }
   if (batchDimension > 1) {
     descriptor.batchStrides = simd::uint4 {
       params.batch_stride_weights,
@@ -109,6 +124,9 @@ void ccv_nnc_mfa_encode_scaled_gemv(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_
   if (num_tensors == 4) {
     encoder->setBuffer(tensors[3], tensor_offsets[3], NS::UInteger(4));
   }
+  // Variable-rate FTQ: the tile row prefix after the header, bound again as a constant buffer.
+  if (is_ftq_vr(params.format))
+    encoder->setBuffer(tensors[0], tensor_offsets[0] + 32, NS::UInteger(6));
 
   if ((params.format >> 16) & 0xffu) {
     // External codebook (TMCQ / FTQ only), see ccv_nnc_mfa_scaled_gemv_params_t::codebook.

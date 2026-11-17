@@ -38,6 +38,23 @@ static uint32_t ftq_rate(const uint32_t format) noexcept
 	return 8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST);
 }
 
+// Variable-rate FTQ (CCVFTQVR blobs, see CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16); its mean rate.
+static bool is_ftq_vr(const uint32_t format) noexcept
+{
+	const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64;
+}
+
+static uint32_t ftq_vr_rate(const uint32_t format) noexcept
+{
+	return 8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST);
+}
+
+static bool is_ftq_any(const uint32_t format) noexcept
+{
+	return is_ftq(format) || is_ftq_vr(format);
+}
+
 }
 
 bool Dequantize8iRowwiseXDescriptor::operator==(const Dequantize8iRowwiseXDescriptor& rhs) const {
@@ -45,7 +62,8 @@ bool Dequantize8iRowwiseXDescriptor::operator==(const Dequantize8iRowwiseXDescri
 	format == rhs.format &&
 	scaleSize == rhs.scaleSize &&
 	rowLength == rhs.rowLength &&
-	length == rhs.length;
+	length == rhs.length &&
+	levelMask == rhs.levelMask;
 }
 
 uint32_t Dequantize8iRowwiseXDescriptor::rowCount() const noexcept {
@@ -54,7 +72,7 @@ uint32_t Dequantize8iRowwiseXDescriptor::rowCount() const noexcept {
 
 uint32_t Dequantize8iRowwiseXDescriptor::groupSize() const noexcept {
 	// A TMCQ or FTQ group is one 16 x 16 tile, so groupsPerRow() * rowCount() counts tiles.
-	if (is_tmcq(format) || is_ftq(format))
+	if (is_tmcq(format) || is_ftq_any(format))
 		return 256;
 	switch (format) {
 		case CCV_NNC_QX_8I_ROWWISE_Q5_K:
@@ -89,6 +107,9 @@ uint32_t Dequantize8iRowwiseXDescriptor::groupBits() const noexcept {
 	// 16 n bits per tile, after the 32-byte FTQ header (inputScaleOffset).
 	if (is_ftq(format))
 		return 16 * ftq_rate(format);
+	// The variable-rate FTQ budget: 16 nm bits per tile on average.
+	if (is_ftq_vr(format))
+		return 16 * ftq_vr_rate(format);
 	switch (format) {
 		case CCV_NNC_QX_8I_ROWWISE_Q5_K:
 			return 88;
@@ -123,7 +144,8 @@ uint32_t Dequantize8iRowwiseXDescriptor::totalGroups() const noexcept {
 
 uint64_t Dequantize8iRowwiseXDescriptor::inputScaleOffset() const noexcept {
 	const uint64_t payloadBits = (uint64_t)totalGroups() * groupBits();
-	const uint64_t payloadBytes = (payloadBits + 7) / 8 + (is_ftq(format) ? 32 : 0);
+	// The 32-byte header, and for variable-rate FTQ the R + 1 word tile row offsets after it.
+	const uint64_t payloadBytes = (payloadBits + 7) / 8 + (is_ftq(format) ? 32 : 0) + (is_ftq_vr(format) ? 32 + 4 * ((uint64_t)rowCount() / 16 + 1) : 0);
 	return align_up_64(payloadBytes, 128);
 }
 
@@ -138,6 +160,9 @@ uint32_t Dequantize8iRowwiseXDescriptor::scaleBytes() const noexcept {
 uint32_t Dequantize8iRowwiseXDescriptor::dispatchItems() const noexcept {
 	// TMCQ decodes one tile row segment (16 weights of one row inside one tile) per thread, see
 	// Dequantize8iRowwiseXKernel::createTMCQSource.
+	// Variable-rate FTQ: ftq_vr_blocks_per_thread blocks of 2 tiles x 16 rows per 32 threads.
+	if (is_ftq_vr(format))
+		return std::max(rowCount() * (rowLength / 16) / ftq_vr_blocks_per_thread((uint64_t)rowCount() * (rowLength / 16), tmcq_codebook_fold(format)), scaleBytes());
 	if (is_tmcq(format) || is_ftq(format))
 		return std::max(rowCount() * (rowLength / 16), scaleBytes());
 	return std::max(totalGroups(), scaleBytes());
@@ -148,6 +173,7 @@ std::size_t std::hash<Dequantize8iRowwiseXDescriptor>::operator()(const Dequanti
 	std::size_t seed = 0;
 	seed = combine_64(seed, pack_64(simd::uint2 { hash.format, hash.scaleSize }));
 	seed = combine_64(seed, pack_64(simd::uint2 { hash.rowLength, hash.length }));
+	seed = combine_32(seed, hash.levelMask);
 	return seed;
 }
 
@@ -156,15 +182,17 @@ std::pair<Dequantize8iRowwiseXKernelDescriptor, PipelineValue<Dequantize8iRowwis
 	(void)binaryArchivesToRead;
 	(void)binaryArchiveToWrite;
 	(void)pathToWrite;
-	if (is_tmcq(format) || is_ftq(format)) {
+	if (is_tmcq(format) || is_ftq_any(format)) {
 		// Bits 16 - 23: log2 of an external codebook's entry count, 0 for the built-in table; bit 24 (FTQ only): a
 		// quadrant-folded codebook (TMCQDecodeSource.hpp).
-		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_format_ok(format, is_ftq(format)));
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_format_ok(format, is_ftq_any(format)));
 		CCV_NNC_MFA_PRECONDITION(rowLength > 0 && (rowLength % 256) == 0 && (length % rowLength) == 0 && (rowCount() % 16) == 0);
 	}
 	// The FTQ blob carries FP16 scales.
-	if (is_ftq(format))
+	if (is_ftq_any(format))
 		CCV_NNC_MFA_PRECONDITION(scaleSize == 2);
+	// Variable-rate FTQ: a non-empty level mask of rates 8 ... 64, at most 6 of them; nothing else carries one.
+	CCV_NNC_MFA_PRECONDITION(is_ftq_vr(format) ? (levelMask != 0 && (levelMask >> 29) == 0 && __builtin_popcount(levelMask) <= 6) : levelMask == 0);
 	auto createKernel =
 	[=](Dequantize8iRowwiseXKernelDescriptor descriptor) -> Dequantize8iRowwiseXKernel* {
 		auto iterator = libraryCache->find(descriptor);
@@ -179,6 +207,7 @@ std::pair<Dequantize8iRowwiseXKernelDescriptor, PipelineValue<Dequantize8iRowwis
 
 	Dequantize8iRowwiseXKernelDescriptor kernelDesc;
 	kernelDesc.format = format;
+	kernelDesc.levelMask = levelMask;
 
 	auto createPipeline =
 	[=](MTL::Library* library) -> MTL::ComputePipelineState* {
@@ -296,7 +325,7 @@ std::pair<Dequantize8iRowwiseXKernelDescriptor, PipelineValue<Dequantize8iRowwis
 	(void)binaryArchiveToWrite;
 	(void)pathToWrite;
 	// An FTQ blob is one 2-D tensor with its own header, so experts cannot be indexed by count.
-	CCV_NNC_MFA_PRECONDITION(!is_ftq(format));
+	CCV_NNC_MFA_PRECONDITION(!is_ftq_any(format));
 	if (is_tmcq(format)) {
 		// Tiles span 16 rows, so every expert must start on a tile row.
 		// Bits 16 - 23: log2 of an external codebook's entry count, 0 for the built-in table (TMCQDecodeSource.hpp).

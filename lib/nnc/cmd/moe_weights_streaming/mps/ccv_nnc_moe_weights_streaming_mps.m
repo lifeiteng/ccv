@@ -145,7 +145,7 @@ static int _ccv_nnc_moe_weight_layout(const ccv_nnc_tensor_param_t source_info, 
 		// groups, so that copying payload_per_expert bytes moves exactly that expert's tiles. Then
 		// the per-row formula below (rows x K / 256 x 16n bits, a multiple of 8) is its tile grid.
 		// An FTQ blob is one tensor with its own header; experts cannot be sliced out of it.
-		if (ccv_nnc_8i_rowwise_x_is_ftq(source_info.reserved))
+		if (ccv_nnc_8i_rowwise_x_is_ftq_any(source_info.reserved))
 			return 0;
 		// The resident bank keeps the reserved field, so a TMCQ codebook slot (bits 16 - 23) carries over to it; no
 		// other modifier bit is taken.

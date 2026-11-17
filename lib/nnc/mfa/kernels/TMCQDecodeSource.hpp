@@ -343,6 +343,14 @@ static inline bool tmcq_codebook_fold(const uint32_t format)
   return (format & CCV_NNC_MFA_CODEBOOK_FOLD) != 0;
 }
 
+// Variable-rate FTQ int8 decode: blocks of 2 tiles x 16 rows (one per 32 threads) each thread takes in its tile row
+// out of `segments` row segments (16 weights of one row inside one tile). 2, except 1 for a folded table on fewer
+// than 2^20 segments, whose longer lookups need the threads. The kernel computes the same value.
+static inline uint32_t ftq_vr_blocks_per_thread(const uint64_t segments, const bool fold)
+{
+  return fold && segments < (UINT64_C(1) << 20) ? 1 : 2;
+}
+
 // The format bits an MFA trellis kernel accepts: the codec, the codebook's log2 (bits 16 - 23) and, for FTQ, the fold
 // bit with log2 9.
 static inline bool tmcq_codebook_format_ok(const uint32_t format, const bool ftq)
