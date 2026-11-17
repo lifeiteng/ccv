@@ -26,6 +26,13 @@ bool is_tmcq(const uint32_t format) noexcept
   return codec >= CCV_NNC_QX_8I_ROWWISE_TMCQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_TMCQ_N32;
 }
 
+// FTQ (CCVFTQSR blobs, see CCV_NNC_QX_8I_ROWWISE_FTQ_N16).
+bool is_ftq(const uint32_t format) noexcept
+{
+  const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+  return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
+}
+
 }
 
 void ccv_nnc_mfa_prepare_scaled_gemv(mfa::context* context, ccv_nnc_mfa_scaled_gemv_params_t params)
@@ -58,7 +65,8 @@ void ccv_nnc_mfa_encode_scaled_gemv(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_
     CCV_NNC_MFA_PRECONDITION(params.batch_stride_scale > 0);
   }
   // TMCQ tiles span 16 rows, so TMCQ only needs N % 16; its kernel reads the payload as 32-bit words.
-  if (is_tmcq(params.format)) {
+  // FTQ uses the same tile grid and reads its code as 32-bit words too.
+  if (is_tmcq(params.format) || is_ftq(params.format)) {
     CCV_NNC_MFA_PRECONDITION((params.ncols % 256) == 0 && (params.nrows % 16) == 0);
     CCV_NNC_MFA_PRECONDITION((tensor_offsets[0] % 4) == 0 && (batchDimension == 1 || (params.batch_stride_weights % 4) == 0));
   } else {
@@ -102,6 +110,12 @@ void ccv_nnc_mfa_encode_scaled_gemv(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_
     encoder->setBuffer(tensors[3], tensor_offsets[3], NS::UInteger(4));
   }
 
+  if ((params.format >> 16) & 0xffu) {
+    // External codebook (TMCQ / FTQ only), see ccv_nnc_mfa_scaled_gemv_params_t::codebook.
+    CCV_NNC_MFA_PRECONDITION(params.codebook != nullptr);
+    encoder->setBuffer(params.codebook, 0, NS::UInteger(5));
+    encoder->useResource(params.codebook, MTL::ResourceUsageRead);
+  }
   encoder->setComputePipelineState(pipeline.get());
   encoder->useResource(tensors[0], MTL::ResourceUsageRead);
   encoder->useResource(tensors[1], MTL::ResourceUsageRead);

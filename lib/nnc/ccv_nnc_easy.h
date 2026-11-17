@@ -13,6 +13,7 @@
 #include "ccv.h"
 #include "ccv_internal.h"
 #include "nnc/ccv_nnc.h"
+#include "nnc/ccv_nnc_ftq_schedule.inc"
 #ifdef HAVE_MPS
 #ifdef __APPLE__
 #include "TargetConditionals.h"
@@ -226,6 +227,7 @@ static inline ccv_nnc_tensor_param_t ccv_nnc_tensor_8i_rowwise(const ccv_nnc_ten
 	return new_params;
 }
 
+/* TMCQ, with the built-in table (codebook slot 0) or the codebook in its slot. */
 static inline int ccv_nnc_8i_rowwise_x_is_tmcq(const int format)
 {
 	const int codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
@@ -239,9 +241,63 @@ static inline int ccv_nnc_8i_rowwise_x_tmcq_rate(const int format)
 	return 16 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_TMCQ_N16);
 }
 
+/* The codebook slot of a format / reserved field (0 is the built-in table, see ccv_nnc_codebook.h). */
+static inline int ccv_nnc_8i_rowwise_x_codebook_slot(const int format)
+{
+	return (format & CCV_NNC_QX_8I_ROWWISE_CODEBOOK_SLOT_MASK) >> CCV_NNC_QX_8I_ROWWISE_CODEBOOK_SLOT_SHIFT;
+}
+
+/* The codec (bits 0 - 7). */
+static inline int ccv_nnc_8i_rowwise_x_codec(const int format)
+{
+	return format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+}
+
+/* The format handed to kernels and their descriptors: the codec and the modifier bits, without the codebook slot.
+ * For a slot 0 tensor this is its reserved field unchanged. */
+static inline int ccv_nnc_8i_rowwise_x_kernel_format(const int format)
+{
+	return format & ~CCV_NNC_QX_8I_ROWWISE_CODEBOOK_SLOT_MASK;
+}
+
+/* Static-rate FTQ (CCV_NNC_QX_8I_ROWWISE_FTQ_N16 .. N64, the open codes of its block): whole CCVFTQSR blobs with FP16
+ * scales. */
+static inline int ccv_nnc_8i_rowwise_x_is_ftq(const int format)
+{
+	const int codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
+}
+
+/* Whether the codec may name the codebook slot of format: TMCQ and FTQ any (0 is the built-in table; the FTQ
+ * blob header carries the same table id), every other codec only slot 0. */
+static inline int ccv_nnc_8i_rowwise_x_codebook_is_valid(const int format)
+{
+	if (ccv_nnc_8i_rowwise_x_is_tmcq(format) || ccv_nnc_8i_rowwise_x_is_ftq(format))
+		return 1;
+	return ccv_nnc_8i_rowwise_x_codebook_slot(format) == 0;
+}
+
+/* The FTQ rate n: every tile has 16 n bits, see CCV_NNC_QX_8I_ROWWISE_FTQ_N16. */
+static inline int ccv_nnc_8i_rowwise_x_ftq_rate(const int format)
+{
+	assert(ccv_nnc_8i_rowwise_x_is_ftq(format));
+	return 8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST);
+}
+
+/* Formats on the 16 x 16 tile grid (row_count % 16, row_length % 256, no H256). */
+static inline int ccv_nnc_8i_rowwise_x_is_tiled(const int format)
+{
+	return ccv_nnc_8i_rowwise_x_is_tmcq(format) || ccv_nnc_8i_rowwise_x_is_ftq(format);
+}
+
+static inline ccv_nnc_8i_rowwise_x_ftq_schedule_t ccv_nnc_8i_rowwise_x_ftq_schedule(const int format, const uint64_t row_count, const uint64_t row_length)
+{
+	return ccv_nnc_8i_rowwise_x_ftq_schedule_of_rate((uint64_t)ccv_nnc_8i_rowwise_x_ftq_rate(format), row_count, row_length);
+}
+
 static inline int ccv_nnc_8i_rowwise_x_group_size(const int format)
 {
-	if (ccv_nnc_8i_rowwise_x_is_tmcq(format))
+	if (ccv_nnc_8i_rowwise_x_is_tiled(format))
 		return 256; // One 16 x 16 tile; it spans 16 rows, see CCV_NNC_QX_8I_ROWWISE_TMCQ_N16.
 	switch (format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK)
 	{
@@ -270,6 +326,9 @@ static inline int ccv_nnc_8i_rowwise_x_group_bits(const int format)
 {
 	if (ccv_nnc_8i_rowwise_x_is_tmcq(format))
 		return 16 * ccv_nnc_8i_rowwise_x_tmcq_rate(format);
+	// 16 n bits per tile, after the 32-byte FTQ header (ccv_nnc_8i_rowwise_x_payload_header).
+	if (ccv_nnc_8i_rowwise_x_is_ftq(format))
+		return 16 * ccv_nnc_8i_rowwise_x_ftq_rate(format);
 	switch (format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK)
 	{
 		case CCV_NNC_QX_8I_ROWWISE_Q5_K:
@@ -299,6 +358,13 @@ static inline int ccv_nnc_8i_rowwise_x_group_bits(const int format)
 	}
 }
 
+/* Bytes in front of the packed payload: the 32-byte CCVFTQSR header for FTQ (its scales start at align128(32 +
+ * payload)), 0 for every other format. */
+static inline int ccv_nnc_8i_rowwise_x_payload_header(const int format)
+{
+	return ccv_nnc_8i_rowwise_x_is_ftq(format) ? 32 : 0;
+}
+
 static inline ccv_nnc_tensor_param_t ccv_nnc_tensor_8i_rowwise_x(const ccv_nnc_tensor_param_t params, const int format)
 {
 	assert(params.datatype == CCV_16F || params.datatype == CCV_32F || params.datatype == CCV_64F || params.datatype == CCV_16BF);
@@ -310,6 +376,14 @@ static inline ccv_nnc_tensor_param_t ccv_nnc_tensor_8i_rowwise_x(const ccv_nnc_t
 	if (ccv_nnc_8i_rowwise_x_is_tmcq(format))
 	{
 		// Tiles span 16 rows and 16 columns; with row_length % 256 the payload size matches the row-wise formula.
+		assert(nd > 0 && params.dim[nd - 1] > 0 && params.dim[nd - 1] % 256 == 0);
+		assert((ccv_nnc_tensor_count(params) / params.dim[nd - 1]) % 16 == 0);
+		assert(!(format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256));
+	}
+	if (ccv_nnc_8i_rowwise_x_is_ftq(format))
+	{
+		// FP16 scales are part of the FTQ blob, so only FP16 tensors match its size.
+		assert(params.datatype == CCV_16F);
 		assert(nd > 0 && params.dim[nd - 1] > 0 && params.dim[nd - 1] % 256 == 0);
 		assert((ccv_nnc_tensor_count(params) / params.dim[nd - 1]) % 16 == 0);
 		assert(!(format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256));
@@ -360,7 +434,7 @@ static inline size_t ccv_nnc_tensor_data_size_without_padding(const ccv_nnc_tens
 			const ssize_t group_size = ccv_nnc_8i_rowwise_x_group_size(params.reserved);
 			const ssize_t groups_per_row = (row_length + group_size - 1) / group_size;
 			const ssize_t group_bits = ccv_nnc_8i_rowwise_x_group_bits(params.reserved);
-			const ssize_t payload_size = (row_count * groups_per_row * group_bits + 7) / 8;
+			const ssize_t payload_size = (row_count * groups_per_row * group_bits + 7) / 8 + ccv_nnc_8i_rowwise_x_payload_header(params.reserved);
 			const ssize_t scale_offset = (payload_size + 127) & -128;
 			data_size = scale_offset + row_count * CCV_GET_DATA_TYPE_SIZE(qx_datatype);
 		} else {

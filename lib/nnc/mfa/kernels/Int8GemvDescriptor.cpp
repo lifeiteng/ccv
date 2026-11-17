@@ -1,8 +1,10 @@
 #include "Int8GemvDescriptor.hpp"
+#include "TMCQDecodeSource.hpp"
 #include "Int8GemvKernel.hpp"
 #include "../ccv_nnc_mfa.hpp"
 #include "../ccv_nnc_mfa_hash.hpp"
 #include "../ccv_nnc_mfa_error.hpp"
+#include "../../ccv_nnc_ftq_schedule.inc"
 
 namespace {
 
@@ -10,6 +12,18 @@ bool is_tmcq(const uint32_t format)
 {
   const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
   return codec >= CCV_NNC_QX_8I_ROWWISE_TMCQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_TMCQ_N32;
+}
+
+// FTQ (CCVFTQSR blobs, see CCV_NNC_QX_8I_ROWWISE_FTQ_N16).
+bool is_ftq(const uint32_t format)
+{
+  const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+  return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
+}
+
+uint32_t ftq_rate(const uint32_t format)
+{
+  return 8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST);
 }
 
 }
@@ -47,7 +61,7 @@ std::size_t std::hash<Int8GemvDescriptor>::operator()(const Int8GemvDescriptor& 
 uint32_t Int8GemvDescriptor::groupSize() const noexcept {
   // A TMCQ group is one 16 x 16 tile: with nrows % 16 == 0, nrows * groupsPerRow() is the tile
   // count and inputScaleOffset() stays the row-wise-x formula.
-  if (is_tmcq(format))
+  if (is_tmcq(format) || is_ftq(format))
     return 256;
   switch (format) {
     case 0:
@@ -81,6 +95,9 @@ uint32_t Int8GemvDescriptor::groupsPerRow() const noexcept {
 uint32_t Int8GemvDescriptor::groupBits() const noexcept {
   if (is_tmcq(format))
     return 16 * (16 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_TMCQ_N16));
+  // 16 n bits per tile, after the 32-byte FTQ header (inputScaleOffset).
+  if (is_ftq(format))
+    return 16 * ftq_rate(format);
   switch (format) {
     case 0:
       return 0;
@@ -112,7 +129,7 @@ uint32_t Int8GemvDescriptor::groupBits() const noexcept {
 }
 
 uint32_t Int8GemvDescriptor::rowsPerThreadgroup() const noexcept {
-  if (is_tmcq(format))
+  if (is_tmcq(format) || is_ftq(format))
     return kInt8GemvTMCQRowsPerThreadgroup;
   // The 4 to 8 row packed kernel gives each half SIMD group a row of its own.
   if (format != 0 && mrows > 3)
@@ -121,7 +138,7 @@ uint32_t Int8GemvDescriptor::rowsPerThreadgroup() const noexcept {
 }
 
 uint32_t Int8GemvDescriptor::threadsPerThreadgroup() const noexcept {
-  if (is_tmcq(format))
+  if (is_tmcq(format) || is_ftq(format))
     return int8GemvTMCQSIMDGroups(mrows) * 32;
   return kInt8GemvSIMDGroupsPerThreadgroup * 32;
 }
@@ -133,16 +150,21 @@ uint32_t int8GemvTMCQSIMDGroups(const uint32_t mrows)
 
 uint64_t Int8GemvDescriptor::inputScaleOffset() const noexcept {
   const uint64_t payloadBits = (uint64_t)nrows * groupsPerRow() * groupBits();
-  const uint64_t payloadBytes = (payloadBits + 7) / 8;
+  const uint64_t payloadBytes = (payloadBits + 7) / 8 + (is_ftq(format) ? 32 : 0);
   return (payloadBytes + 127) & ~UINT64_C(127);
 }
 
 std::pair<Int8GemvKernelDescriptor, PipelineValue<Int8GemvKernel>*> Int8GemvDescriptor::findKernel(MTL::Device* const device, const DeviceProperties& dprops, NS::Array* const binaryArchivesToRead, MTL::BinaryArchive* const binaryArchiveToWrite, const std::string& pathToWrite, std::unordered_map<Int8GemvKernelDescriptor, std::unique_ptr<Int8GemvKernel>> *const libraryCache) const noexcept {
-  if (is_tmcq(format)) {
-    CCV_NNC_MFA_PRECONDITION((format & ~CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) == 0);
+  if (is_tmcq(format) || is_ftq(format)) {
+    // Bits 16 - 23: log2 of an external codebook's entry count, 0 for the built-in table (TMCQDecodeSource.hpp).
+    // Bit 24 (FTQ only): a quadrant-folded codebook.
+    CCV_NNC_MFA_PRECONDITION(tmcq_codebook_format_ok(format, is_ftq(format)));
     CCV_NNC_MFA_PRECONDITION(mrows >= 1 && mrows <= 3);
     CCV_NNC_MFA_PRECONDITION((nrows % 16) == 0 && (ncols % 256) == 0);
   }
+  // FTQ: FP16 scales in the blob, no batched weights (one blob is one 2-D tensor).
+  if (is_ftq(format))
+    CCV_NNC_MFA_PRECONDITION(memoryPrecision == GEMMOperandPrecision::FP16 && !batchStrides.has_value());
   auto createKernel =
   [=](Int8GemvKernelDescriptor descriptor) -> Int8GemvKernel* {
     auto iterator = libraryCache->find(descriptor);
@@ -174,6 +196,11 @@ std::pair<Int8GemvKernelDescriptor, PipelineValue<Int8GemvKernel>*> Int8GemvDesc
     constants->setConstantValue(&groupsPerRow, MTL::DataTypeUInt, NS::UInteger(4));
     constants->setConstantValue(&vectorRowStride, MTL::DataTypeUInt, NS::UInteger(9));
     constants->setConstantValue(&outputRowStride, MTL::DataTypeUInt, NS::UInteger(10));
+    if (is_ftq(format)) {
+      // Every tile has 16 n bits (the kernel takes n as a source constant and needs no schedule constants).
+      const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule_of_rate(ftq_rate(format), nrows, ncols);
+      CCV_NNC_MFA_PRECONDITION(schedule.tile_count <= UINT32_MAX && schedule.scale_offset == inputScaleOffset());
+    }
     if (batchStrides.has_value()) {
       const uint32_t batchStrideWeights = batchStrides.value()[0];
       const uint32_t batchStrideVector = batchStrides.value()[1];

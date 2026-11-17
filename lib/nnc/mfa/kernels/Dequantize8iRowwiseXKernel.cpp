@@ -253,11 +253,10 @@ static bool is_tmcq(const uint32_t format)
 
 // TMCQ int8 decode. A tile spans 16 rows, so the per-group kernels above do not apply. Thread
 // mapping: one thread per row segment, i.e. the 16 weights one output row takes from one tile.
-// Thread x covers row x / (K / 16) and tile column x % (K / 16), so the lanes of a SIMD group
-// write consecutive 16-byte pieces of the same output row (512 contiguous bytes, the int8 output
-// being 8 bits per weight against n / 16 bits read), and the 16 threads that share a tile read
-// the same n / 2 words, which stay in cache. dispatch_items (see the descriptors) is
-// max(rows * K / 16, scale bytes); total_groups / groups_per_expert count tiles.
+// Threads go in blocks of 2 neighbouring tiles x 16 rows (tile_pair_row_column): the 32 lanes of a
+// SIMD group read the n adjacent words of two tiles (coalesced) and write 32-byte pieces of 16 output
+// rows. dispatch_items (see the descriptors) is max(rows * K / 16, scale bytes); total_groups /
+// groups_per_expert count tiles.
 static std::string create_tmcq_source(const uint32_t format)
 {
 	const uint32_t n = 16 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_TMCQ_N16);
@@ -269,6 +268,16 @@ using namespace metal;
 	shader += "constant uint tmcq_tile_words = " + std::to_string(n / 2) + ";\n";
 	shader += ccv_nnc_mfa_tmcq_decode_source();
 	shader += R"(
+// Thread x of a tile grid -> (output row, tile column) in blocks of 2 neighbouring tiles x 16 rows: the 32 lanes of a
+// SIMD group decode the 16 rows of two adjacent tiles, so they read adjacent code words (the row-major order spread a
+// tile's 16 readers over 16 SIMD groups, uncoalesced). Needs tiles_per_row even (row_length % 256 == 0 here).
+inline uint2 tile_pair_row_column(const uint x, const uint tiles_per_row)
+{
+  const uint tile_row = x / (16u * tiles_per_row);
+  const uint in_tile_row = x - tile_row * (16u * tiles_per_row);
+  return uint2(tile_row * 16u + ((in_tile_row & 31u) >> 1), (in_tile_row >> 5) * 2u + (in_tile_row & 1u));
+}
+
 // Writes the 16 int8 weights of `row` (local to the tile grid starting at `source`) in tile column
 // `tc` to destination[row * row_length + 16 * tc ...].
 inline void tmcq_store_segment(device const uchar* source, device uchar* destination, const uint row, const uint tc)
@@ -299,9 +308,8 @@ kernel void dequantize_8i_rowwise_x(
     return;
   // total_groups tiles of 16 segments each.
   if (x < total_groups * 16u) {
-    const uint tiles_per_row = row_length >> 4;
-    const uint row = x / tiles_per_row;
-    tmcq_store_segment(source, destination, row, x - row * tiles_per_row);
+    const uint2 rc = tile_pair_row_column(x, row_length >> 4);
+    tmcq_store_segment(source, destination, rc.x, rc.y);
   }
   if (x < scale_bytes)
     output_scales[x] = input_scales[x];
@@ -327,11 +335,10 @@ kernel void dequantize_8i_rowwise_x_selected(
   // groups_per_expert tiles of 16 segments each; rows_per_expert % 16 == 0, so experts start on
   // tile rows and the 16-byte tile stride keeps every expert on a word boundary.
   if (x < groups_per_expert * 16u) {
-    const uint tiles_per_row = row_length >> 4;
-    const uint row = x / tiles_per_row;
+    const uint2 rc = tile_pair_row_column(x, row_length >> 4);
     device const uchar* expert_source = source + (ulong)expert * groups_per_expert * (tmcq_tile_words * 4u);
     device uchar* expert_destination = destination + (ulong)expert * rows_per_expert * row_length;
-    tmcq_store_segment(expert_source, expert_destination, row, x - row * tiles_per_row);
+    tmcq_store_segment(expert_source, expert_destination, rc.x, rc.y);
   }
   if (x < scale_bytes_per_expert) {
     output_scales[expert * scale_bytes_per_expert + x] =
@@ -706,10 +713,172 @@ inline void decode_group(device const uchar* source, const ulong group_index, th
 	return shader;
 }
 
+// FTQ (CCVFTQSR blobs, see CCV_NNC_QX_8I_ROWWISE_FTQ_N16).
+static bool is_ftq(const uint32_t format)
+{
+	const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
+}
+
+// FTQ int8 decode (see CCV_NNC_QX_8I_ROWWISE_FTQ_N16): one thread per row segment, the 8 pairs of one output row
+// inside one tile, in blocks of 2 tiles x 16 rows (tile_pair_row_column). Tile g has 16 n bits from word g n / 2 of
+// the code, which follows the 32-byte header. A row segment's windows start at bit r n + floor(n / 8) - 16 of the
+// tile: the thread reads three (n <= 48) or four (n > 48, the windows span 7 n / 8 + 16 > 64 bits) of the tile's
+// n / 2 words taken mod n / 2 and funnels them once, fixed per row r: row 0 starts before its tile and wraps to the
+// tile end (a tail-biting loop, indexed like TMCQ's words), and row 15's unused high bits wrap to the tile start, so
+// every read stays inside the tile. The window offsets are compile-time. `ftq_n` is n; `index_shift` is 32 - log2 of
+// the table's pair count (23 for the built-in 512-pair table).
+static std::string create_ftq_source(const uint32_t n, const uint32_t index_shift)
+{
+	std::string shader = R"(
+#include <metal_stdlib>
+using namespace metal;
+)";
+	// Table id 0 is the built-in table.
+	shader += ccv_nnc_mfa_tmcq_decode_source();
+	shader += "constant uint ftq_index_shift = " + std::to_string(index_shift) + ";\n";
+	shader += "constant uint ftq_n = " + std::to_string(n) + ";\n";
+	shader += std::string("#define FTQ_WIDE ") + (n > 48 ? "1" : "0") + "\n";
+	shader += R"(
+inline uint2 tile_pair_row_column(const uint x, const uint tiles_per_row)
+{
+  const uint tile_row = x / (16u * tiles_per_row);
+  const uint in_tile_row = x - tile_row * (16u * tiles_per_row);
+  return uint2(tile_row * 16u + ((in_tile_row & 31u) >> 1), (in_tile_row >> 5) * 2u + (in_tile_row & 1u));
+}
+
+kernel void dequantize_8i_rowwise_x(
+  device const uchar* source [[buffer(0)]],
+  device uchar* destination [[buffer(1)]],
+  device const uchar* input_scales [[buffer(2)]],
+  device uchar* output_scales [[buffer(3)]],
+
+  uint3 tgid [[threadgroup_position_in_grid]],
+  ushort lid [[thread_index_in_threadgroup]]
+) {
+  const uint x = tgid.x * threadgroup_size + lid;
+  if (x >= dispatch_items)
+    return;
+  if (x < total_groups * 16u) {
+    const uint tiles_per_row = row_length >> 4;
+    const uint2 rc = tile_pair_row_column(x, tiles_per_row);
+    const uint row = rc.x;
+    const uint tc = rc.y;
+    char q[16];
+    auto ftq_pair = [&](const uint state) -> char2 { return tmcq_table[(state * 0x83DCD12Du) >> ftq_index_shift]; };
+    const uint W = ftq_n / 2u;
+    const uint r = row & 15u;
+    device const uint* t = reinterpret_cast<device const uint*>(source + 32) + (ulong)((row >> 4) * tiles_per_row + tc) * W;
+    const uint lane_bit = (r == 0u ? 16u * ftq_n : r * ftq_n) + (ftq_n >> 3) - 16u;
+    const uint o0 = lane_bit >> 5;
+    const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;
+    const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;
+    const uint shift = lane_bit & 31u;
+#if FTQ_WIDE
+    const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;
+    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2], w3 = t[o3];
+    const uint f1 = tmcq_funnel(w1, w2, shift);
+    const ulong lo = ((ulong)f1 << 32) | tmcq_funnel(w0, w1, shift);
+    const ulong hi = ((ulong)tmcq_funnel(w2, w3, shift) << 32) | f1;
+#else
+    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2];
+    const ulong lo = ((ulong)tmcq_funnel(w1, w2, shift) << 32) | tmcq_funnel(w0, w1, shift);
+    const ulong hi = 0;
+#endif
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8u; i++) {
+      // Window i at offset floor((i + 1) n / 8) - floor(n / 8), from the low 64 bits or (n > 48) bits 32 .. 95.
+      const uint k = (((i + 1u) * ftq_n) >> 3) - (ftq_n >> 3);
+      const char2 v = ftq_pair((k <= 48u ? uint(lo >> k) : uint(hi >> (k - 32u))) & 0xffffu);
+      q[2 * i] = v.x;
+      q[2 * i + 1] = v.y;
+    }
+    device char4* destination4 = reinterpret_cast<device char4*>(destination + (ulong)row * row_length + (tc << 4));
+    destination4[0] = char4(q[0], q[1], q[2], q[3]);
+    destination4[1] = char4(q[4], q[5], q[6], q[7]);
+    destination4[2] = char4(q[8], q[9], q[10], q[11]);
+    destination4[3] = char4(q[12], q[13], q[14], q[15]);
+  }
+  if (x < scale_bytes)
+    output_scales[x] = input_scales[x];
+}
+)";
+	return shader;
+}
+
+// An external codebook (tmcq_codebook_log2(format) != 0) for the TMCQ / FTQ int8 decode: every decoding kernel of
+// the shader takes the table at buffer(5) (the plain kernel binds 0 - 3, the selected one 0 - 4). TMCQ copies its
+// half2 part into threadgroup memory before any thread returns and reads it through tmcq_codebook_char2; FTQ reads
+// its int8 part as constant char2, like the built-in tmcq_table.
+static void rewrite_decode_codebook(std::string& shader, const uint32_t log2, const bool ftq)
+{
+	CCV_NNC_MFA_PRECONDITION(log2 >= 9 && log2 <= 11);
+	if (ftq) {
+		// The FTQ source already shifts by ftq_index_shift; only the helpers go in.
+		const std::string anchor = "using namespace metal;\n";
+		const size_t at = shader.find(anchor);
+		CCV_NNC_MFA_PRECONDITION(at != std::string::npos);
+		shader.insert(at + anchor.size(), tmcq_codebook_source(log2));
+	} else
+		tmcq_codebook_rewrite(shader, log2);
+	if (ftq) {
+		// FTQ reads the int8 copy of the pairs that follows the half2 table in the buffer (see
+		// ccv_nnc_mfa_codebook_buffer) straight from the constant address space, like the built-in tmcq_table:
+		// no threadgroup copy or barrier, and no half2 -> char2 conversion per lookup (the lookups are most of
+		// this decode's work).
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "\n\n  uint3 tgid [[threadgroup_position_in_grid]],", "\n  constant char2* codebook [[buffer(5)]],\n\n  uint3 tgid [[threadgroup_position_in_grid]],") >= 1);
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "  const uint x = tgid.x * threadgroup_size + lid;\n",
+			"  constant char2* const tmcq_ext = codebook + 2u * TMCQ_CODEBOOK_ENTRIES;\n"
+			"  const uint x = tgid.x * threadgroup_size + lid;\n") >= 1);
+	} else {
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "\n\n  uint3 tgid [[threadgroup_position_in_grid]],", "\n  device const uint4* codebook [[buffer(5)]],\n\n  uint3 tgid [[threadgroup_position_in_grid]],") >= 1);
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "  const uint x = tgid.x * threadgroup_size + lid;\n",
+			"  threadgroup half2 tmcq_codes[TMCQ_CODEBOOK_ENTRIES];\n"
+			"  tmcq_codebook_load(tmcq_codes, codebook, lid, threadgroup_size);\n"
+			"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+			"  const tmcq_codebook_char2 tmcq_ext = { tmcq_codes };\n"
+			"  const uint x = tgid.x * threadgroup_size + lid;\n") >= 1);
+	}
+	if (ftq) {
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "tmcq_table[(state", "tmcq_ext[(state") == 1);
+	} else {
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "const uint row, const uint tc)\n{", "const uint row, const uint tc, const tmcq_codebook_char2 tmcq_ext)\n{") == 1);
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "q, tmcq_table);", "q, tmcq_ext);") == 1);
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "rc.x, rc.y);", "rc.x, rc.y, tmcq_ext);") == 2);
+	}
+}
+
 std::string Dequantize8iRowwiseXKernel::createSource() const noexcept
 {
-	if (is_tmcq(format))
-		return createConstants() + "\n" + create_tmcq_source(format);
+	if (is_tmcq(format)) {
+		std::string shader = createConstants() + "\n" + create_tmcq_source(format);
+		if (tmcq_codebook_log2(format))
+			rewrite_decode_codebook(shader, tmcq_codebook_log2(format), false);
+		return shader;
+	}
+	if (is_ftq(format)) {
+		// FTQ takes the index shift as a source constant (ftq_index_shift), 32 - log2 of the table size.
+		const uint32_t log2 = tmcq_codebook_log2(format);
+		std::string shader = createConstants() + "\n" + create_ftq_source(8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST), log2 ? 32 - log2 : 23);
+		if (log2)
+			rewrite_decode_codebook(shader, log2, true);
+		if (tmcq_codebook_fold(format)) {
+			// Quadrant fold (512 base pairs): base pair (h >> 16) & 511 of h = state * 0x83DCD12D, the values
+			// negated in the int8 domain by bits 15 / 31 of h, as the fused GEMV does on the half2 bits.
+			CCV_NNC_MFA_PRECONDITION(log2 == 9);
+			const std::string anchor = "struct tmcq_codebook_ushort";
+			const size_t at = shader.find(anchor);
+			CCV_NNC_MFA_PRECONDITION(at != std::string::npos);
+			shader.insert(at, "inline char2 ftq_fold_lookup(constant char2* t, uint state)\n"
+				"{\n"
+				"  const uint h = state * 0x83DCD12Du;\n"
+				"  const char2 v = t[(h >> 16) & 511u];\n"
+				"  return char2((h & 0x8000u) ? -v.x : v.x, (h & 0x80000000u) ? -v.y : v.y);\n"
+				"}\n\n");
+			CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "tmcq_ext[(state * 0x83DCD12Du) >> ftq_index_shift]", "ftq_fold_lookup(tmcq_ext, state)") == 1);
+		}
+		return shader;
+	}
 	std::string shader = createConstants() + "\n";
 	shader += R"(
 #include <metal_stdlib>

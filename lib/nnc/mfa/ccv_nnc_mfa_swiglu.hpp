@@ -21,6 +21,9 @@ typedef struct {
   uint8_t loadM;
   uint8_t use_neural_accelerators;
   float clamp;
+  // The external codebook of a TMCQ format whose bits 16 - 23 hold its log2 entry count (ccv_nnc_mfa_codebook_format),
+  // for both gate and up; NULL for the built-in table.
+  mtl_buffer_t* codebook;
 } ccv_nnc_mfa_scaled_swiglu_params_t;
 
 #ifdef __cplusplus

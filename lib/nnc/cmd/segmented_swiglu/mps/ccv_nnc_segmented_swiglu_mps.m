@@ -2,6 +2,7 @@
 #include "ccv_internal.h"
 #include "nnc/ccv_nnc.h"
 #include "nnc/ccv_nnc_easy.h"
+#include "nnc/ccv_nnc_codebook.h"
 #include "nnc/ccv_nnc_internal.h"
 #include "nnc/mps/ccv_nnc_mps.h"
 
@@ -17,6 +18,27 @@ static uint64_t _ccv_nnc_segmented_swiglu_mtl_datatype(const int datatype)
 		default:
 			return UINT64_MAX;
 	}
+}
+
+// The MFA format and codebook of a TMCQ gate / up pair reading an external pair codebook (ccv_nnc_codebook.h): format
+// is the kernel format, with log2 of the entry count of the codebook in bits 16 - 23 for a nonzero slot. Both weights
+// must name the same slot, and only TMCQ takes a nonzero one. Returns 0 if they cannot run together.
+static int _ccv_nnc_segmented_swiglu_codebook(const ccv_nnc_tensor_view_t* const gate_w, const ccv_nnc_tensor_view_t* const up_w, uint32_t* const format, mtl_buffer_t** const codebook)
+{
+	*codebook = NULL;
+	const ccv_nnc_tensor_view_t* const weights[2] = { gate_w, up_w };
+	int slots[2] = { 0, 0 };
+	int i;
+	for (i = 0; i < 2; i++)
+		if ((weights[i]->info.datatype & 0xf00) == CCV_NNC_QX_8I_ROWWISE_X)
+		{
+			slots[i] = ccv_nnc_codebook_slot_of(weights[i]->info.reserved);
+			if (slots[i] && !ccv_nnc_8i_rowwise_x_is_tmcq(weights[i]->info.reserved))
+				return 0;
+		}
+	if (slots[0] != slots[1])
+		return 0;
+	return ccv_nnc_mfa_codebook_format(ccv_nnc_default_mfa_context(), slots[0], 0, format, codebook);
 }
 
 static size_t _ccv_nnc_segmented_swiglu_align_up(const size_t value, const size_t alignment)
@@ -51,8 +73,13 @@ static int _ccv_nnc_segmented_swiglu_shared_forw(const float clamp, const ccv_nn
 	const int up_subtype = up_w->info.datatype & 0xf00;
 	const int gate_rowwise = gate_subtype == CCV_NNC_QX_8I_ROWWISE || gate_subtype == CCV_NNC_QX_8I_ROWWISE_X;
 	const int up_rowwise = up_subtype == CCV_NNC_QX_8I_ROWWISE || up_subtype == CCV_NNC_QX_8I_ROWWISE_X;
-	const uint32_t gate_format = gate_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)gate_w->info.reserved : 0;
-	const uint32_t up_format = up_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)up_w->info.reserved : 0;
+	const uint32_t gate_format = gate_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(gate_w->info.reserved) : 0;
+	const uint32_t up_format = up_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(up_w->info.reserved) : 0;
+	// TMCQ kernels take the codebook format; it equals gate_format for the built-in table.
+	uint32_t gate_codebook_format = gate_format;
+	mtl_buffer_t* codebook;
+	if (!_ccv_nnc_segmented_swiglu_codebook(gate_w, up_w, &gate_codebook_format, &codebook))
+		return CCV_NNC_EXEC_INVALID;
 	const uint64_t mtl_datatype = _ccv_nnc_segmented_swiglu_mtl_datatype(a->info.datatype);
 	ccv_nnc_mfa_context_t* const context = ccv_nnc_default_mfa_context();
 	const int shape_supported =
@@ -79,6 +106,9 @@ static int _ccv_nnc_segmented_swiglu_shared_forw(const float clamp, const ccv_nn
 	const int rowwise_shape_supported = gate_format == 0 ?
 		(K % 4) == 0 : (K % 256) == 0 && (N % 256) == 0;
 	if (rowwise_weights && !rowwise_shape_supported)
+		return CCV_NNC_EXEC_INVALID;
+	// FTQ only decodes through GEMM_FORWARD.
+	if (rowwise_weights && ccv_nnc_8i_rowwise_x_is_ftq(gate_format))
 		return CCV_NNC_EXEC_INVALID;
 	// TMCQ shared weights take the matrix paths below, as in SWIGLU_FORWARD.
 	if (rowwise_weights && ccv_nnc_8i_rowwise_x_is_tmcq(gate_format) && (gate_format & ~CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK))
@@ -131,7 +161,8 @@ static int _ccv_nnc_segmented_swiglu_shared_forw(const float clamp, const ccv_nn
 	{
 		const ccv_nnc_mfa_scaled_swiglu_params_t params = {
 			.data_type = mtl_datatype,
-			.format = gate_format,
+			.format = gate_codebook_format,
+			.codebook = codebook,
 			.M = M,
 			.N = N,
 			.K = K,
@@ -202,9 +233,10 @@ static int _ccv_nnc_segmented_swiglu_shared_forw(const float clamp, const ccv_nn
 		{
 			rowwise_x_decode_params = (ccv_nnc_mfa_dequantize_8i_rowwise_x_fp_params_t){
 				.data_type = mtl_datatype,
-				.format = gate_format,
+				.format = gate_codebook_format,
 				.row_length = K,
 				.length = (uint64_t)N * K,
+				.codebook = codebook,
 			};
 			ccv_nnc_mfa_prepare_dequantize_8i_rowwise_x_fp(context, rowwise_x_decode_params);
 		} else {
@@ -322,8 +354,13 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 	const int up_subtype = up_w->info.datatype & 0xf00;
 	const int gate_rowwise = gate_subtype == CCV_NNC_QX_8I_ROWWISE || gate_subtype == CCV_NNC_QX_8I_ROWWISE_X;
 	const int up_rowwise = up_subtype == CCV_NNC_QX_8I_ROWWISE || up_subtype == CCV_NNC_QX_8I_ROWWISE_X;
-	const uint32_t gate_format = gate_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)gate_w->info.reserved : 0;
-	const uint32_t up_format = up_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)up_w->info.reserved : 0;
+	const uint32_t gate_format = gate_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(gate_w->info.reserved) : 0;
+	const uint32_t up_format = up_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(up_w->info.reserved) : 0;
+	// TMCQ kernels take the codebook format; it equals gate_format for the built-in table.
+	uint32_t gate_codebook_format = gate_format;
+	mtl_buffer_t* codebook;
+	if (!_ccv_nnc_segmented_swiglu_codebook(gate_w, up_w, &gate_codebook_format, &codebook))
+		return CCV_NNC_EXEC_INVALID;
 	const int rowwise_shape_supported = gate_format == 0 ? (K % 4) == 0 : (K % 256) == 0 && (N % 256) == 0;
 	const uint64_t mtl_datatype = _ccv_nnc_segmented_swiglu_mtl_datatype(a->info.datatype);
 	ccv_nnc_mfa_context_t* const context = ccv_nnc_default_mfa_context();
@@ -381,7 +418,9 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 	ccv_nnc_tensor_view_t* const shared_output = shared ? (ccv_nnc_tensor_view_t*)shared[3] : 0;
 	const int shared_gate_nd = shared ? ccv_nnc_tensor_nd(shared_gate_w->info.dim) : 0;
 	const uint32_t shared_rows = shared_gate_nd == 2 ? (uint32_t)shared_gate_w->info.dim[0] : 0;
-	const uint32_t shared_format = shared && (shared_gate_w->info.datatype & 0xf00) == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)shared_gate_w->info.reserved : 0;
+	const uint32_t shared_format = shared && (shared_gate_w->info.datatype & 0xf00) == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(shared_gate_w->info.reserved) : 0;
+	// The shared expert never joins the dispatch with a codebook slot (only Q8_0 / Q5_K / Q6_K do); a TMCQ shared expert
+	// with one runs through _ccv_nnc_segmented_swiglu_shared_forw, which checks it.
 	// A TMCQ shared expert does not join the dispatch: it runs as SWIGLU_FORWARD, which decodes its
 	// tiles to int8 first.
 	const int shared_weights_supported = shared && (
@@ -414,7 +453,7 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 		{
 			const ccv_nnc_mfa_segmented_int8_swiglu_params_t params = {
 				.data_type = mtl_datatype,
-				.format = gate_format,
+				.format = gate_codebook_format,
 				.M = M,
 				.N = N,
 				.K = K,
@@ -424,6 +463,7 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 				.clamp = cmd.info.segmented_swiglu.clamp,
 				.shared_rows = fuse_shared ? shared_rows : 0,
 				.shared_format = fuse_shared ? shared_format : 0,
+				.codebook = codebook,
 			};
 			ccv_nnc_mfa_prepare_segmented_int8_swiglu(context, params);
 			mtl_command_batch_t* const command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
@@ -459,13 +499,14 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 		mtl_buffer_t* const scratch = ccv_nnc_mfa_request_scratch(context, intermediate_size);
 		const ccv_nnc_mfa_segmented_int8_gemv_params_t gemv_params = {
 			.data_type = mtl_datatype,
-			.format = gate_format,
+			.format = gate_codebook_format,
 			.M = M,
 			.N = N,
 			.K = K,
 			.expert_count = expert_count,
 			.bincount = bincount,
 			.broadcast_input = broadcast_input,
+			.codebook = codebook,
 		};
 		const ccv_nnc_mfa_swish_mul_params_t swish_params = {
 			.beta = 1,
@@ -551,7 +592,7 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 	{
 		const ccv_nnc_mfa_segmented_scaled_swiglu_params_t params = {
 			.data_type = mtl_datatype,
-			.format = gate_format,
+			.format = gate_codebook_format,
 			.M = M,
 			.N = N,
 			.K = K,
@@ -564,6 +605,7 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 			// Their shared readiness covers gate and up; down has a separate fence.
 			.readiness_buffer = (__bridge mtl_buffer_t*)gate_weight_view.readiness_buffer,
 			.readiness_value = gate_weight_view.readiness_value,
+			.codebook = codebook,
 		};
 		ccv_nnc_mfa_prepare_segmented_scaled_swiglu(context, params);
 		mtl_command_batch_t* const command_batch = ccv_nnc_stream_context_start_command_batch(stream_context);
@@ -632,9 +674,10 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 		{
 			rowwise_x_decode_params = (ccv_nnc_mfa_dequantize_8i_rowwise_x_fp_params_t){
 				.data_type = mtl_datatype,
-				.format = gate_format,
+				.format = gate_codebook_format,
 				.row_length = K,
 				.length = (uint64_t)expert_count * N * K,
+				.codebook = codebook,
 			};
 			ccv_nnc_mfa_prepare_dequantize_8i_rowwise_x_fp(context, rowwise_x_decode_params);
 		} else {
