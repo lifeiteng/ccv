@@ -98,7 +98,7 @@ TEST_CASE("rmsprop in half precision")
 	ccv_nnc_tensor_t* const u = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32F, 10), 0);
 	ccv_nnc_tensor_t* const g16 = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(16F, 10), 0);
 	ccv_nnc_tensor_t* const a16 = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(16F, 10), 0);
-	ccv_nnc_tensor_t* const m16 = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(16F, 10), 0);
+	ccv_nnc_tensor_t* const m_half = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(16F, 10), 0);
 	ccv_nnc_tensor_t* const v16 = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(16F, 10), 0);
 	ccv_nnc_tensor_t* const b16 = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(16F, 10), 0);
 	ccv_nnc_tensor_t* const n16 = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(16F, 10), 0);
@@ -119,8 +119,8 @@ TEST_CASE("rmsprop in half precision")
 	ccv_nnc_tensor_t* const ga = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 16F, 10), 0);
 	ccv_nnc_tensor_t* const gm = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 16F, 10), 0);
 	ccv_nnc_tensor_t* const gv = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 16F, 10), 0);
-	ccv_nnc_cmd_exec(CMD_DATATYPE_CONVERSION_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(g, a, m, v), TENSOR_LIST(g16, a16, m16, v16), 0);
-	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(g16, a16, m16, v16), TENSOR_LIST(gg, ga, gm, gv), 0);
+	ccv_nnc_cmd_exec(CMD_DATATYPE_CONVERSION_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(g, a, m, v), TENSOR_LIST(g16, a16, m_half, v16), 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(g16, a16, m_half, v16), TENSOR_LIST(gg, ga, gm, gv), 0);
 	ccv_nnc_cmd_exec(CMD_RMSPROP_FORWARD(0.001, 0.0001, 0.9, 0.9, 1e-9), ccv_nnc_no_hint, 0, TENSOR_LIST(gg, ga, gm, gv), TENSOR_LIST(ga, gm, gv), 0);
 	ccv_nnc_tensor_t* const gbt = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32F, 10), 0);
 	ccv_nnc_tensor_t* const gnt = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32F, 10), 0);
@@ -136,7 +136,7 @@ TEST_CASE("rmsprop in half precision")
 	ccv_nnc_tensor_t* const gb = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 16F, 10), 0);
 	ccv_nnc_tensor_t* const gn = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 16F, 10), 0);
 	ccv_nnc_tensor_t* const gu = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 16F, 10), 0);
-	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(a16, m16, v16), TENSOR_LIST(ga, gm, gv), 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(a16, m_half, v16), TENSOR_LIST(ga, gm, gv), 0);
 	ccv_nnc_cmd_exec(CMD_RMSPROP_FORWARD(0.001, 0.0001, 0.9, 0.9, 1e-9), ccv_nnc_no_hint, 0, TENSOR_LIST(gg, ga, gm, gv), TENSOR_LIST(gb, gn, gu), 0);
 	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gb, gn, gu), TENSOR_LIST(gbt16, gnt16, gut16), 0);
 	ccv_nnc_cmd_exec(CMD_DATATYPE_CONVERSION_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gbt16, gnt16, gut16), TENSOR_LIST(gbt, gnt, gut), 0);
@@ -152,7 +152,7 @@ TEST_CASE("rmsprop in half precision")
 	ccv_nnc_tensor_free(u);
 	ccv_nnc_tensor_free(g16);
 	ccv_nnc_tensor_free(a16);
-	ccv_nnc_tensor_free(m16);
+	ccv_nnc_tensor_free(m_half);
 	ccv_nnc_tensor_free(v16);
 	ccv_nnc_tensor_free(b16);
 	ccv_nnc_tensor_free(n16);
