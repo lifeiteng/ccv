@@ -1761,6 +1761,246 @@ TEST_CASE("an ftq_vr checkpoint loads only when every rule of the format holds")
 	sqlite3_close(db);
 }
 
+// A folded-table blob (slot with CCV_NNC_CODEBOOK_FOLD, table field 1 | 9 << 8 | 1 << 16) at rate n against the explicit
+// 2048-pair reference: CPU decode, GPU int8 codes, the fused GEMV for M = 1 .. 3 (one-hot and bit for bit with onehot,
+// else within FP16 rounding of an FP64 sum) and the GEMM for M = 4, 8 and 64 equal to the GEMM on resident 8I_ROWWISE of
+// the reference codes, with and without the ANE path. Returns the number of failed checks (each printed).
+static int ftq_fold_rate_checks(const int slot, const uint32_t crc, const int8_t* const base, const int rows, const int cols, const int n, const int onehot, const uint32_t seed)
+{
+	int failures = 0;
+	const uint64_t old_flags = ccv_nnc_flags();
+	const int format = ftq_format(n) | (slot << CCV_NNC_CODEBOOK_SLOT_SHIFT);
+	const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(format, rows, cols);
+	ccv_nnc_tensor_t* const hq = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), format), 0);
+	ccv_nnc_tensor_t* const gq = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_GPU_MEMORY, rows, cols), format), 0);
+	const size_t size = ccv_nnc_tensor_data_size_without_padding(hq->info);
+	ftq_fill(hq->data.u8, size, format, rows, cols, 1u | (9u << 8) | (1u << 16), crc, seed);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(hq), TENSOR_LIST(gq), 0);
+	int8_t* const q8 = (int8_t*)ccmalloc((size_t)rows * cols);
+	ftq_ref_decode_fold(hq->data.u8 + 32, rows, cols, schedule.high_bits, schedule.drop_count, base, q8);
+	float* const scales = (float*)ccmalloc(sizeof(float) * rows);
+	ccv_half_precision_to_float((uint16_t*)(hq->data.u8 + schedule.scale_offset), scales, rows);
+	// CPU decode.
+	uint16_t* const out = (uint16_t*)ccmalloc(sizeof(uint16_t) * rows * cols);
+	FTQ_VR_EXPECT(ccv_nnc_dequantize_8i_rowwise_x(hq->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, size, cols, format, out, (size_t)rows * cols) == 0, "fold %dx%d n%d CPU decode runs", rows, cols, n);
+	size_t k, mismatches = 0;
+	for (k = 0; k < (size_t)rows * cols; k++)
+	{
+		const float v = (float)q8[k] * scales[k / cols];
+		uint16_t e;
+		ccv_float_to_half_precision(&v, &e, 1);
+		mismatches += out[k] != e;
+	}
+	ccfree(out);
+	FTQ_VR_EXPECT(mismatches == 0, "fold %dx%d n%d CPU decode, %zu mismatches", rows, cols, n, mismatches);
+	// GPU int8 decode.
+	const size_t out_scale_offset = ((size_t)rows * cols + 127) & ~(size_t)127;
+	const size_t out_bytes = out_scale_offset + rows * 2;
+	ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32S, (int)((out_bytes + 3) / 4)), 0);
+	ccv_nnc_tensor_t* const hout = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, (int)((out_bytes + 3) / 4)), 0);
+	ccv_nnc_mps_dequantize_8i_rowwise_x_to_8i_rowwise(gq->data.u8, CCV_16F, size, cols, format, gout->data.u8, (size_t)rows * cols, 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gout), TENSOR_LIST(hout), 0);
+	FTQ_VR_EXPECT(memcmp(hout->data.u8, q8, (size_t)rows * cols) == 0, "fold %dx%d n%d GPU codes", rows, cols, n);
+	FTQ_VR_EXPECT(memcmp(hout->data.u8 + out_scale_offset, hq->data.u8 + schedule.scale_offset, rows * 2) == 0, "fold %dx%d n%d GPU scales", rows, cols, n);
+	ccv_nnc_tensor_param_t bias_params = ftq_params(CCV_TENSOR_CPU_MEMORY, rows, 0);
+	bias_params.dim[1] = 0;
+	ccv_nnc_tensor_t* const hbias = ccv_nnc_tensor_new(0, bias_params, 0);
+	bias_params.type = CCV_TENSOR_GPU_MEMORY;
+	ccv_nnc_tensor_t* const gbias = ccv_nnc_tensor_new(0, bias_params, 0);
+	float* const bias = (float*)ccmalloc(sizeof(float) * rows);
+	int i, j, m;
+	for (j = 0; j < rows; j++)
+	{
+		const float v = ftq_bias_value(j);
+		ccv_float_to_half_precision(&v, (uint16_t*)hbias->data.u8 + j, 1);
+	}
+	ccv_half_precision_to_float((uint16_t*)hbias->data.u8, bias, rows);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(hbias), TENSOR_LIST(gbias), 0);
+	if (onehot)
+		for (m = 1; m <= 3; m++)
+			FTQ_VR_EXPECT(ftq_onehot_mismatches(gq, gbias, q8, scales, bias, rows, cols, m) == 0, "fold %dx%d n%d GEMV M=%d one-hot", rows, cols, n, m);
+	ccv_nnc_tensor_t* const hr = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols)), 0);
+	memset(hr->data.u8, 0, out_scale_offset);
+	memcpy(hr->data.u8, q8, (size_t)rows * cols);
+	memcpy(hr->data.u8 + out_scale_offset, hq->data.u8 + schedule.scale_offset, rows * 2);
+	ccv_nnc_tensor_t* const gr = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise(ftq_params(CCV_TENSOR_GPU_MEMORY, rows, cols)), 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(hr), TENSOR_LIST(gr), 0);
+	// M = 1 .. 3 without onehot: the fused GEMV within rounding of an FP64 sum; M = 4, 8, 64: the GEMM equals the GEMM on
+	// the resident reference codes, both passes. The reference GEMM takes at least 9 rows (the first M are the same), so
+	// it never runs the 8I_ROWWISE vector kernel, which sums in another order.
+	static const int ms[] = { 1, 2, 3, 4, 8, 64 };
+	int pass, mi;
+	for (pass = 0; pass < 2; pass++)
+	{
+		if (pass == 1)
+			ccv_nnc_enable_flag(CCV_NNC_DISABLE_MFA_ANE);
+		for (mi = 0; mi < (int)(sizeof(ms) / sizeof(ms[0])); mi++)
+		{
+			const int mm = ms[mi];
+			if (mm < 4 && (onehot || pass == 1))
+				continue;
+			const int mr = mm < 9 ? 9 : mm;
+			ccv_nnc_tensor_t* const har = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_CPU_MEMORY, mr, cols), 0);
+			for (i = 0; i < mr; i++)
+				for (k = 0; k < (size_t)cols; k++)
+				{
+					const float v = ftq_activation_value(i, (int)k);
+					ccv_float_to_half_precision(&v, (uint16_t*)har->data.u8 + (size_t)i * cols + k, 1);
+				}
+			ccv_nnc_tensor_t* const ha = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_CPU_MEMORY, mm, cols), 0);
+			memcpy(ha->data.u8, har->data.u8, (size_t)mm * cols * 2);
+			ccv_nnc_tensor_t* const ga = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_GPU_MEMORY, mm, cols), 0);
+			ccv_nnc_tensor_t* const gar = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_GPU_MEMORY, mr, cols), 0);
+			ccv_nnc_tensor_t* const gb1 = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_GPU_MEMORY, mm, rows), 0);
+			ccv_nnc_tensor_t* const gb2 = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_GPU_MEMORY, mr, rows), 0);
+			ccv_nnc_tensor_t* const hb1 = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_CPU_MEMORY, mm, rows), 0);
+			ccv_nnc_tensor_t* const hb2 = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_CPU_MEMORY, mr, rows), 0);
+			ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(ha, har), TENSOR_LIST(ga, gar), 0);
+			FTQ_VR_EXPECT(ccv_nnc_cmd_exec(CMD_GEMM_FORWARD(NO_TRANSPOSE, TRANSPOSE(0, 1)), ccv_nnc_no_hint, 0, TENSOR_LIST(ga, gq, gbias), TENSOR_LIST(gb1), 0) == CCV_NNC_EXEC_SUCCESS, "fold %dx%d n%d GEMM M=%d runs", rows, cols, n, mm);
+			if (mm >= 4)
+			{
+				FTQ_VR_EXPECT(ccv_nnc_cmd_exec(CMD_GEMM_FORWARD(NO_TRANSPOSE, TRANSPOSE(0, 1)), ccv_nnc_no_hint, 0, TENSOR_LIST(gar, gr, gbias), TENSOR_LIST(gb2), 0) == CCV_NNC_EXEC_SUCCESS, "8I_ROWWISE GEMM M=%d runs", mr);
+				ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gb1, gb2), TENSOR_LIST(hb1, hb2), 0);
+				FTQ_VR_EXPECT(memcmp(hb1->data.u8, hb2->data.u8, (size_t)mm * rows * 2) == 0, "fold %dx%d n%d pass %d GEMM M=%d equals 8I_ROWWISE", rows, cols, n, pass, mm);
+			} else {
+				ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gb1), TENSOR_LIST(hb1), 0);
+				float* const f1 = (float*)ccmalloc(sizeof(float) * mm * rows);
+				ccv_half_precision_to_float((uint16_t*)hb1->data.u8, f1, (size_t)mm * rows);
+				float* const fa = (float*)ccmalloc(sizeof(float) * mm * cols);
+				ccv_half_precision_to_float((uint16_t*)ha->data.u8, fa, (size_t)mm * cols);
+				int bad = 0;
+				for (i = 0; i < mm && !bad; i++)
+					for (j = 0; j < rows && !bad; j++)
+					{
+						double sum = 0, magnitude = 0;
+						for (k = 0; k < (size_t)cols; k++)
+						{
+							const double term = (double)q8[(size_t)j * cols + k] * fa[(size_t)i * cols + k];
+							sum += term;
+							magnitude += fabs(term);
+						}
+						const double expected = sum * scales[j] + bias[j];
+						if (fabs((double)f1[(size_t)i * rows + j] - expected) > fabs(expected) * (2.0 / 2048) + magnitude * scales[j] * 1e-6 + 1e-6)
+							bad = 1;
+					}
+				ccfree(fa);
+				ccfree(f1);
+				FTQ_VR_EXPECT(!bad, "fold %dx%d n%d GEMV M=%d within rounding of the FP64 sum", rows, cols, n, mm);
+			}
+			ccv_nnc_tensor_free(hb2);
+			ccv_nnc_tensor_free(hb1);
+			ccv_nnc_tensor_free(gb2);
+			ccv_nnc_tensor_free(gb1);
+			ccv_nnc_tensor_free(gar);
+			ccv_nnc_tensor_free(ga);
+			ccv_nnc_tensor_free(ha);
+			ccv_nnc_tensor_free(har);
+		}
+	}
+	if (!(old_flags & CCV_NNC_DISABLE_MFA_ANE))
+		ccv_nnc_disable_flag(CCV_NNC_DISABLE_MFA_ANE);
+	ccfree(bias);
+	ccfree(scales);
+	ccfree(q8);
+	ccv_nnc_tensor_free(gr);
+	ccv_nnc_tensor_free(hr);
+	ccv_nnc_tensor_free(gbias);
+	ccv_nnc_tensor_free(hbias);
+	ccv_nnc_tensor_free(hout);
+	ccv_nnc_tensor_free(gout);
+	ccv_nnc_tensor_free(gq);
+	ccv_nnc_tensor_free(hq);
+	return failures;
+}
+
+TEST_CASE("ftq with a folded table is exact at every open static rate, and at the 4B size for n16, n20 and n24")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	int8_t* const base = ftq_fold_base_new(0x0f41u);
+	const int slot = ccv_nnc_codebook_register_with_flags(base, 512, CCV_NNC_CODEBOOK_FOLD);
+	REQUIRE(slot >= 1, "folded table registers");
+	uint32_t crc = 0;
+	ccv_nnc_codebook_get(slot, 0, &crc);
+	int n;
+	// 3 tile rows x 32 tiles, every rate n = 16, 18, .., 64, one-hot GEMV.
+	for (n = 16; n <= 64; n += 2)
+		REQUIRE_EQ(ftq_fold_rate_checks(slot, crc, base, 48, 512, n, 1, 0x4100u + n), 0, "fold 48x512 n%d", n);
+	static const int large[] = { 16, 20, 24 };
+	int i;
+	for (i = 0; i < 3; i++)
+		REQUIRE_EQ(ftq_fold_rate_checks(slot, crc, base, 9216, 2560, large[i], 0, 0x4200u + large[i]), 0, "fold 9216x2560 n%d", large[i]);
+	ccfree(base);
+}
+
+TEST_CASE("an ftq checkpoint with the folded table as file id 1 loads and decodes like the reference at n16 and n20")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	int8_t* const base = ftq_fold_base_new(0x0f51u);
+	const int plain = ccv_nnc_codebook_register(base, 512);
+	REQUIRE(plain >= 1, "base table registers");
+	uint32_t crc = 0;
+	ccv_nnc_codebook_get(plain, 0, &crc);
+	sqlite3* db = 0;
+	REQUIRE_EQ(sqlite3_open(":memory:", &db), SQLITE_OK, "in-memory database opens");
+	REQUIRE_EQ(ccv_nnc_tensor_write_codebook(db, plain, 1), CCV_IO_FINAL, "the base table writes as id 1");
+	const int rows = 64, cols = 1024;
+	static const int rates[] = { 16, 20 };
+	int i;
+	for (i = 0; i < 2; i++)
+	{
+		const int n = rates[i];
+		const int file_format = ftq_format(n) | (1 << CCV_NNC_CODEBOOK_SLOT_SHIFT); // file-local id 1
+		ccv_nnc_tensor_t* const t = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), file_format), 0);
+		const size_t size = ccv_nnc_tensor_data_size_without_padding(t->info);
+		ftq_fill(t->data.u8, size, file_format, rows, cols, 1u | (9u << 8) | (1u << 16), crc, 0x5100u + n);
+		char name[16];
+		snprintf(name, sizeof(name), "w_n%d", n);
+		REQUIRE_EQ(ccv_nnc_tensor_write(t, db, name, 0), CCV_IO_FINAL, "%s writes", name);
+		const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(ftq_format(n), rows, cols);
+		int8_t* const q8 = (int8_t*)ccmalloc((size_t)rows * cols);
+		ftq_ref_decode_fold(t->data.u8 + 32, rows, cols, schedule.high_bits, schedule.drop_count, base, q8);
+		float* const scales = (float*)ccmalloc(sizeof(float) * rows);
+		ccv_half_precision_to_float((uint16_t*)(t->data.u8 + schedule.scale_offset), scales, rows);
+		ccv_nnc_tensor_free(t);
+		ccv_nnc_tensor_t* restored = 0;
+		REQUIRE_EQ(ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored), CCV_IO_FINAL, "%s reads", name);
+		const int slot = ccv_nnc_codebook_slot_of(restored->info.reserved);
+		REQUIRE_EQ(ccv_nnc_codebook_flags(slot), CCV_NNC_CODEBOOK_FOLD, "%s takes a folded slot", name);
+		REQUIRE_EQ(ccv_nnc_codebook_fold_slot(plain), slot, "%s takes the folded slot of the written table", name);
+		const int format = restored->info.reserved;
+		const size_t rsize = ccv_nnc_tensor_data_size_without_padding(restored->info);
+		uint16_t* const out = (uint16_t*)ccmalloc(sizeof(uint16_t) * rows * cols);
+		REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(restored->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, rsize, cols, format, out, (size_t)rows * cols), 0, "%s decodes", name);
+		size_t k, mismatches = 0;
+		for (k = 0; k < (size_t)rows * cols; k++)
+		{
+			const float v = (float)q8[k] * scales[k / cols];
+			uint16_t e;
+			ccv_float_to_half_precision(&v, &e, 1);
+			mismatches += out[k] != e;
+		}
+		REQUIRE_EQ((int)mismatches, 0, "%s CPU decode equals the reference", name);
+		// The loaded weights on the GPU: int8 codes equal the reference.
+		ccv_nnc_tensor_t* const gq = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_GPU_MEMORY, rows, cols), format), 0);
+		ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(restored), TENSOR_LIST(gq), 0);
+		const size_t out_bytes = (((size_t)rows * cols + 127) & ~(size_t)127) + rows * 2;
+		ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32S, (int)((out_bytes + 3) / 4)), 0);
+		ccv_nnc_tensor_t* const hout = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, (int)((out_bytes + 3) / 4)), 0);
+		ccv_nnc_mps_dequantize_8i_rowwise_x_to_8i_rowwise(gq->data.u8, CCV_16F, rsize, cols, format, gout->data.u8, (size_t)rows * cols, 0);
+		ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gout), TENSOR_LIST(hout), 0);
+		REQUIRE_EQ(memcmp(hout->data.u8, q8, (size_t)rows * cols), 0, "%s GPU codes equal the reference", name);
+		ccv_nnc_tensor_free(hout);
+		ccv_nnc_tensor_free(gout);
+		ccv_nnc_tensor_free(gq);
+		ccfree(out);
+		ccfree(scales);
+		ccfree(q8);
+		ccv_nnc_tensor_free(restored);
+	}
+	sqlite3_close(db);
+	ccfree(base);
+}
+
 #endif
 
 #include "case_main.h"
