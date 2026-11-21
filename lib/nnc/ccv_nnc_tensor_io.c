@@ -400,12 +400,12 @@ int ccv_nnc_tensor_write_codebook(void* const handle, const int slot, const int 
 
 // The codebook slot for a row-wise-x weight stored with reserved field `reserved` (a file-local codebook id in bits
 // 16 - 23): 0 for id 0 (the built-in table, for files without a codebook), the registered slot of the file's
-// __ccv_codebook__/<id> for TMCQ and FTQ, -1 if that codebook is missing or invalid or the codec takes no file
+// __ccv_codebook__/<id> for TMCQ, FTQ and FTQ-VR, -1 if that codebook is missing or invalid or the codec takes no file
 // codebook (the non-trellis codecs).
 static int _ccv_nnc_tensor_read_codebook_slot(sqlite3* const conn, const int reserved)
 {
 	const int id = ccv_nnc_8i_rowwise_x_codebook_slot(reserved);
-	if (id && !ccv_nnc_8i_rowwise_x_is_tmcq(reserved) && !ccv_nnc_8i_rowwise_x_is_ftq(reserved))
+	if (id && !ccv_nnc_8i_rowwise_x_is_tiled(reserved))
 		return -1;
 	return id ? ccv_nnc_tensor_read_codebook(conn, id) : 0;
 }
