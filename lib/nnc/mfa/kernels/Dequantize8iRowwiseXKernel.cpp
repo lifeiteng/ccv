@@ -251,13 +251,33 @@ static bool is_tmcq(const uint32_t format)
 	return codec >= CCV_NNC_QX_8I_ROWWISE_TMCQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_TMCQ_N32;
 }
 
+// The 2-tile block map of tile_pair_row_column covers 16 tiles_per_row threads of a tile row only for an even
+// tiles_per_row. For an odd one the last 16 threads (from 16 (tiles_per_row - 1), a multiple of 32) take the last tile,
+// one row each, so every (row, tile column) segment is still decoded by exactly one of the 16 tiles_per_row threads.
+// The same rewrite serves TMCQ and static-rate FTQ, whose sources share the function.
+static void tile_pair_tail_source(std::string& shader)
+{
+	const std::string body = "  return uint2(tile_row * 16u + ((in_tile_row & 31u) >> 1), (in_tile_row >> 5) * 2u + (in_tile_row & 1u));\n";
+	const size_t at = shader.find(body);
+	CCV_NNC_MFA_PRECONDITION(at != std::string::npos && shader.find(body, at + 1) == std::string::npos);
+	shader.insert(at,
+		"  // An odd tiles_per_row: the last 16 threads of the tile row take its last tile, one row each.\n"
+		"  if ((tiles_per_row & 1u) && in_tile_row >= 16u * (tiles_per_row - 1u))\n"
+		"    return uint2(tile_row * 16u + (in_tile_row & 15u), tiles_per_row - 1u);\n");
+	const std::string note = "Needs tiles_per_row even (row_length % 256 == 0 here).";
+	const size_t comment = shader.find(note);
+	if (comment != std::string::npos)
+		shader.replace(comment, note.size(), "An odd tiles_per_row ends in 16 threads on its last tile.");
+}
+
 // TMCQ int8 decode. A tile spans 16 rows, so the per-group kernels above do not apply. Thread
 // mapping: one thread per row segment, i.e. the 16 weights one output row takes from one tile.
 // Threads go in blocks of 2 neighbouring tiles x 16 rows (tile_pair_row_column): the 32 lanes of a
 // SIMD group read the n adjacent words of two tiles (coalesced) and write 32-byte pieces of 16 output
 // rows. dispatch_items (see the descriptors) is max(rows * K / 16, scale bytes); total_groups /
-// groups_per_expert count tiles.
-static std::string create_tmcq_source(const uint32_t format)
+// groups_per_expert count tiles. `tail` (an odd tiles_per_row, K % 32 == 16) gives the last tile of every tile row to
+// 16 threads of its own (tile_pair_tail_source); without it the source is the original one for even tiles_per_row.
+static std::string create_tmcq_source(const uint32_t format, const bool tail)
 {
 	const uint32_t n = 16 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_TMCQ_N16);
 	std::string shader = R"(
@@ -369,6 +389,8 @@ kernel void dequantize_8i_rowwise_x_selected_plan(
   dispatch_args[2] = 1;
 }
 )";
+	if (tail)
+		tile_pair_tail_source(shader);
 	return shader;
 }
 
@@ -378,6 +400,7 @@ Dequantize8iRowwiseXKernel::Dequantize8iRowwiseXKernel(Dequantize8iRowwiseXKerne
 {
 	format = descriptor.format;
 	levelMask = descriptor.levelMask;
+	tileTail = descriptor.tileTail;
 	source = createSource();
 	threadgroupSize = MTL::Size(256, 1, 1);
 
@@ -728,8 +751,9 @@ static bool is_ftq(const uint32_t format)
 // n / 2 words taken mod n / 2 and funnels them once, fixed per row r: row 0 starts before its tile and wraps to the
 // tile end (a tail-biting loop, indexed like TMCQ's words), and row 15's unused high bits wrap to the tile start, so
 // every read stays inside the tile. The window offsets are compile-time. `ftq_n` is n; `index_shift` is 32 - log2 of
-// the table's pair count (23 for the built-in 512-pair table).
-static std::string create_ftq_source(const uint32_t n, const uint32_t index_shift)
+// the table's pair count (23 for the built-in 512-pair table). `tail` is TMCQ's (tile_pair_tail_source): an odd
+// tiles_per_row.
+static std::string create_ftq_source(const uint32_t n, const uint32_t index_shift, const bool tail)
 {
 	std::string shader = R"(
 #include <metal_stdlib>
@@ -804,6 +828,8 @@ kernel void dequantize_8i_rowwise_x(
     output_scales[x] = input_scales[x];
 }
 )";
+	if (tail)
+		tile_pair_tail_source(shader);
 	return shader;
 }
 
@@ -862,7 +888,10 @@ static std::string ftq_segment_decode_source(const uint32_t n)
 // tile row (ftq_vr_blocks_per_thread: 2, or 1 for a folded table on fewer than 2^20 row segments), strided so a SIMD
 // group reads adjacent code words; one switch over n_r per thread picks the per-rate body of the static-rate decode
 // for every level of `level_mask` (bit i is n = 8 + 2 i). `index_shift` and `fold` are as for static-rate FTQ.
-static std::string create_ftq_vr_source(const uint32_t level_mask, const uint32_t index_shift, const bool fold)
+// `generic` (ftq_vr_generic_blocks: tiles_per_row % (2 T) != 0) strides G = ceil(floor(tiles_per_row / 2) / T) blocks,
+// skips the block indices past the row, and gives the last tile of an odd row to 16 threads of its own, one row each
+// (ftq_vr_threads_per_tile_row threads per tile row); without it the source is the original one.
+static std::string create_ftq_vr_source(const uint32_t level_mask, const uint32_t index_shift, const bool fold, const bool generic)
 {
 	std::string shader = R"(
 #include <metal_stdlib>
@@ -885,7 +914,24 @@ kernel void dequantize_8i_rowwise_x(
   const uint x = tgid.x * threadgroup_size + lid;
   if (x >= dispatch_items)
     return;
-  const uint tiles_per_row = row_length >> 4;
+)";
+	shader += generic ? R"(  const uint tiles_per_row = row_length >> 4;
+  const uint segments = total_groups * 16u;
+  const uint T = (FTQ_VR_FOLD && segments < (1u << 20)) ? 1u : 2u;
+  // ftq_vr_threads_per_tile_row: G strided blocks of 2 tiles x 16 rows, then 16 threads for the last tile of an odd
+  // tile row (one row each).
+  const uint pairs = tiles_per_row >> 1;
+  const uint block_stride = (pairs + T - 1u) / T;
+  const uint per_tile_row = 32u * block_stride + ((tiles_per_row & 1u) << 4);
+  if (x < (total_groups / tiles_per_row) * per_tile_row) {
+    const uint tile_row = x / per_tile_row;
+    const uint in_tile_row = x - tile_row * per_tile_row;
+    const bool tail = in_tile_row >= 32u * block_stride;
+    const uint lane = in_tile_row & 31u;
+    const uint group = in_tile_row >> 5;
+    const uint row = tile_row * 16u + (tail ? (in_tile_row & 15u) : (lane >> 1));
+    const uint r = row & 15u;
+)" : R"(  const uint tiles_per_row = row_length >> 4;
   const uint segments = total_groups * 16u;
   const uint T = (FTQ_VR_FOLD && segments < (1u << 20)) ? 1u : 2u;
   if (x < segments / T) {
@@ -897,7 +943,8 @@ kernel void dequantize_8i_rowwise_x(
     const uint row = tile_row * 16u + (lane >> 1);
     const uint r = row & 15u;
     const uint block_stride = tiles_per_row / (2u * T);
-    device const uint* code = reinterpret_cast<device const uint*>(source + 32) + (total_groups / tiles_per_row + 1u);
+)";
+	shader += R"(    device const uint* code = reinterpret_cast<device const uint*>(source + 32) + (total_groups / tiles_per_row + 1u);
     const uint off0 = ftq_vr_prefix[tile_row];
     const uint VW = (ftq_vr_prefix[tile_row + 1u] - off0) / tiles_per_row;
     device const uint* row_code = code + off0;
@@ -906,14 +953,20 @@ kernel void dequantize_8i_rowwise_x(
     auto ftq_pair = [&](const uint state) -> char2 { return tmcq_table[(state * 0x83DCD12Du) >> ftq_index_shift]; };
     switch (VW) {
 )";
+	// Tile column tc of block j of this thread; the generic map skips the columns past the row.
+	const std::string tile_column = generic ?
+		"        const uint block = group + j * block_stride;\n"
+		"        const uint tc = tail ? (j == 0u ? tiles_per_row - 1u : tiles_per_row) : (block < pairs ? ((block << 1) | (lane & 1u)) : tiles_per_row);\n"
+		"        if (tc >= tiles_per_row)\n"
+		"          continue;\n" :
+		"        const uint tc = ((group + j * block_stride) << 1) | (lane & 1u);\n";
 	uint32_t i;
 	for (i = 0; i < 29; i++)
 		if (level_mask & (1u << i))
 		{
 			const uint32_t n = 8 + 2 * i;
 			shader += "    case " + std::to_string(n / 2) + "u: {\n" + ftq_segment_source(n) +
-				"      for (uint j = 0; j < T; j++) {\n"
-				"        const uint tc = ((group + j * block_stride) << 1) | (lane & 1u);\n"
+				"      for (uint j = 0; j < T; j++) {\n" + tile_column +
 				"        device const uint* t = row_code + tc * W;\n" + ftq_segment_decode_source(n) +
 				"        device char4* d = dst_row + tc * 4u;\n"
 				"        d[0] = char4(q[0], q[1], q[2], q[3]);\n"
@@ -923,14 +976,24 @@ kernel void dequantize_8i_rowwise_x(
 				"      }\n"
 				"    } break;\n";
 		}
-	shader += R"(    default:
+	if (generic)
+		shader += "    default:\n"
+			"      // A rate outside the level mask (rejected when the weights are loaded): zeros.\n"
+			"      for (uint j = 0; j < T; j++) {\n" + tile_column +
+			"        device char4* d = dst_row + tc * 4u;\n"
+			"        d[0] = d[1] = d[2] = d[3] = char4(0);\n"
+			"      }\n"
+			"      break;\n";
+	else
+		shader += R"(    default:
       // A rate outside the level mask (rejected when the weights are loaded): zeros.
       for (uint j = 0; j < T; j++) {
         device char4* d = dst_row + ((((group + j * block_stride) << 1) | (lane & 1u)) * 4u);
         d[0] = d[1] = d[2] = d[3] = char4(0);
       }
       break;
-    }
+)";
+	shader += R"(    }
   }
   if (x < scale_bytes)
     output_scales[x] = input_scales[x];
@@ -984,7 +1047,7 @@ static void rewrite_decode_codebook(std::string& shader, const uint32_t log2, co
 std::string Dequantize8iRowwiseXKernel::createSource() const noexcept
 {
 	if (is_tmcq(format)) {
-		std::string shader = createConstants() + "\n" + create_tmcq_source(format);
+		std::string shader = createConstants() + "\n" + create_tmcq_source(format, (tileTail & 1) != 0);
 		if (tmcq_codebook_log2(format))
 			rewrite_decode_codebook(shader, tmcq_codebook_log2(format), false);
 		return shader;
@@ -993,8 +1056,8 @@ std::string Dequantize8iRowwiseXKernel::createSource() const noexcept
 		// FTQ takes the index shift as a source constant (ftq_index_shift), 32 - log2 of the table size.
 		const uint32_t log2 = tmcq_codebook_log2(format);
 		std::string shader = createConstants() + "\n" + (is_ftq_vr(format) ?
-			create_ftq_vr_source(levelMask, log2 ? 32 - log2 : 23, tmcq_codebook_fold(format)) :
-			create_ftq_source(8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST), log2 ? 32 - log2 : 23));
+			create_ftq_vr_source(levelMask, log2 ? 32 - log2 : 23, tmcq_codebook_fold(format), (tileTail & 2) != 0) :
+			create_ftq_source(8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST), log2 ? 32 - log2 : 23, (tileTail & 1) != 0));
 		if (log2)
 			rewrite_decode_codebook(shader, log2, true);
 		if (tmcq_codebook_fold(format)) {

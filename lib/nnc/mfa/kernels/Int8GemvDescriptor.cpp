@@ -77,8 +77,8 @@ std::size_t std::hash<Int8GemvDescriptor>::operator()(const Int8GemvDescriptor& 
 }
 
 uint32_t Int8GemvDescriptor::groupSize() const noexcept {
-  // A TMCQ group is one 16 x 16 tile: with nrows % 16 == 0, nrows * groupsPerRow() is the tile
-  // count and inputScaleOffset() stays the row-wise-x formula.
+  // A TMCQ group is one 16 x 16 tile; it spans 16 rows, so inputScaleOffset() counts the tiles of the grid
+  // (tmcq_tile_count) instead of nrows * groupsPerRow().
   if (is_tmcq(format) || is_ftq_any(format))
     return 256;
   switch (format) {
@@ -170,7 +170,10 @@ uint32_t int8GemvTMCQSIMDGroups(const uint32_t mrows)
 }
 
 uint64_t Int8GemvDescriptor::inputScaleOffset() const noexcept {
-  const uint64_t payloadBits = (uint64_t)nrows * groupsPerRow() * groupBits();
+  // TMCQ / FTQ: (nrows / 16) (ncols / 16) tiles of groupBits() bits for any ncols % 16 == 0.
+  const uint64_t payloadBits = (is_tmcq(format) || is_ftq_any(format)) ?
+    tmcq_tile_count(nrows, ncols) * groupBits() :
+    (uint64_t)nrows * groupsPerRow() * groupBits();
   // The 32-byte header, and for variable-rate FTQ the R + 1 word tile row offsets after it.
   const uint64_t payloadBytes = (payloadBits + 7) / 8 + (is_ftq(format) ? 32 : 0) + (is_ftq_vr(format) ? 32 + 4 * ((uint64_t)nrows / 16 + 1) : 0);
   return (payloadBytes + 127) & ~UINT64_C(127);
@@ -182,7 +185,8 @@ std::pair<Int8GemvKernelDescriptor, PipelineValue<Int8GemvKernel>*> Int8GemvDesc
     // Bit 24 (FTQ only): a quadrant-folded codebook.
     CCV_NNC_MFA_PRECONDITION(tmcq_codebook_format_ok(format, is_ftq_any(format)));
     CCV_NNC_MFA_PRECONDITION(mrows >= 1 && mrows <= 3);
-    CCV_NNC_MFA_PRECONDITION((nrows % 16) == 0 && (ncols % 256) == 0);
+    // The 16 x 16 tile grid: one threadgroup per tile row, the tile loop runs over any ncols / 16 tiles.
+    CCV_NNC_MFA_PRECONDITION((nrows % 16) == 0 && (ncols % 16) == 0 && ncols > 0);
   }
   // FTQ: FP16 scales in the blob, no batched weights (one blob is one 2-D tensor).
   if (is_ftq_any(format))

@@ -8,6 +8,7 @@
 // The built-in pair codebook, ccv_nnc_trellis_builtin_table[1024] (512 pairs, interleaved int8), for TMCQ and
 // FTQ table id 0. The Metal tables below are generated from it, so the .inc file stays the only copy.
 #include "../../ccv_nnc_trellis_builtin_table.inc"
+#include "../../ccv_nnc_ftq_schedule.inc"
 
 // Metal helpers shared by every kernel that decodes CCV_NNC_QX_8I_ROWWISE_TMCQ_N* weights.
 // Codec definition: see CCV_NNC_QX_8I_ROWWISE_TMCQ_N16 in ccv_nnc.h. A tile is 16 * n bits = n / 2
@@ -349,6 +350,38 @@ static inline bool tmcq_codebook_fold(const uint32_t format)
 static inline uint32_t ftq_vr_blocks_per_thread(const uint64_t segments, const bool fold)
 {
   return fold && segments < (UINT64_C(1) << 20) ? 1 : 2;
+}
+
+// The 16 x 16 tile grid of a rows x cols TMCQ / FTQ weight (rows % 16 == 0, cols % 16 == 0): rows / 16 tile rows of
+// cols / 16 tiles, tile-row-major. Every size and offset is a whole number of tiles; with cols % 256 != 0 the row-wise
+// "groups of 256 weights per row" count ceil(cols / 256) is not the tile count (cols = 1152 has 4.5 tiles' worth of
+// bits per row, cols = 272 has 17 tiles per tile row).
+static inline uint64_t tmcq_tile_count(const uint64_t rows, const uint64_t cols)
+{
+  // The CPU codec's count (ccv_nnc_ftq_schedule.inc), so sizes and offsets agree with ccv_nnc_tensor_data_size.
+  return ccv_nnc_8i_rowwise_x_tile_count(rows, cols);
+}
+
+// Bytes of the tiles of `rows` rows (rows % 16 == 0) at tile_bits = 16 n bits per tile (n even, a whole number of
+// 32-bit words per tile).
+static inline uint64_t tmcq_tile_rows_bytes(const uint64_t rows, const uint64_t cols, const uint32_t tile_bits)
+{
+  return tmcq_tile_count(rows, cols) * tile_bits / 8;
+}
+
+// Variable-rate FTQ int8 decode threads per tile row of tiles_per_row tiles at blocks_per_thread = T: 32 threads per
+// G = ceil(floor(tiles_per_row / 2) / T) strided blocks of 2 tiles x 16 rows, plus 16 (one per row) for the last tile
+// of an odd tiles_per_row. With tiles_per_row % (2 T) == 0 this is 16 tiles_per_row / T, the original mapping
+// (ftq_vr_generic_blocks false); the descriptor's dispatch count and the kernel use this same value.
+static inline uint32_t ftq_vr_threads_per_tile_row(const uint32_t tiles_per_row, const uint32_t blocks_per_thread)
+{
+  const uint32_t pairs = tiles_per_row / 2;
+  return 32 * ((pairs + blocks_per_thread - 1) / blocks_per_thread) + 16 * (tiles_per_row & 1);
+}
+
+static inline bool ftq_vr_generic_blocks(const uint32_t tiles_per_row, const uint32_t blocks_per_thread)
+{
+  return (tiles_per_row % (2 * blocks_per_thread)) != 0;
 }
 
 // The format bits an MFA trellis kernel accepts: the codec, the codebook's log2 (bits 16 - 23) and, for FTQ, the fold
