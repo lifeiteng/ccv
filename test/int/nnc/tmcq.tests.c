@@ -438,17 +438,19 @@ TEST_CASE("TMCQ rejects invalid shapes and H256")
 	for (i = 0; i < 64 * 512; i++)
 		values[i] = sinf(i * 0.1f);
 	const int format = CCV_NNC_QX_8I_ROWWISE_TMCQ_N24;
-	// Rows not a multiple of 16, K not a multiple of 256.
+	// Rows not a multiple of 16, K not a multiple of 16 (whole 16 x 16 tiles; K % 256 is not needed).
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 15 * cols, cols), 0, "15 rows have no size");
-	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 16 * 128, 128), 0, "K = 128 has no size");
-	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 16 * 272, 272), 0, "K = 272 has no size");
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 16 * 8, 8), 0, "K = 8 has no size");
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 16 * 264, 264), 0, "K = 264 has no size");
+	REQUIRE(ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 16 * 128, 128) > 0, "K = 128 is valid");
+	REQUIRE(ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 16 * 272, 272) > 0, "K = 272 is valid");
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(format | CCV_NNC_QX_8I_ROWWISE_HADAMARD_256, CCV_32F, 16 * cols, cols), 0, "H256 has no size");
 	REQUIRE(ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 16 * cols, cols) > 0, "16 x 256 is valid");
 	memset(output, 0xa5, sizeof(output));
 	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, 15 * cols, cols, format, 0, 0, 0, 0, output, sizeof(output)), 0, "15 rows must fail");
 	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, 24 * cols, cols, format, 0, 0, 0, 0, output, sizeof(output)), 0, "24 rows must fail");
-	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, 16 * 128, 128, format, 0, 0, 0, 0, output, sizeof(output)), 0, "K = 128 must fail");
-	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, 16 * 384, 384, format, 0, 0, 0, 0, output, sizeof(output)), 0, "K = 384 must fail");
+	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, 16 * 8, 8, format, 0, 0, 0, 0, output, sizeof(output)), 0, "K = 8 must fail");
+	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, 16 * 392, 392, format, 0, 0, 0, 0, output, sizeof(output)), 0, "K = 392 must fail");
 	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, 16 * cols, cols, format | CCV_NNC_QX_8I_ROWWISE_HADAMARD_256, 0, 0, 0, 0, output, sizeof(output)), 0, "H256 must fail");
 	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, 16 * cols, cols, format, 0, 0, 0, 0, output, ccv_nnc_8i_rowwise_x_data_size(format, CCV_32F, 16 * cols, cols) - 1), 0, "short output must fail");
 	for (i = 0; i < (int)sizeof(output); i++)
@@ -1092,6 +1094,327 @@ TEST_CASE("TMCQ weights with a codebook id read their codebook from the checkpoi
 	ccfree(a);
 	ccv_nnc_tensor_free(packed);
 	ccv_nnc_tensor_free(source);
+}
+
+// K % 16: the tiled codecs (TMCQ, FTQ, variable-rate FTQ) cut the weight into (rows / 16) x (K / 16) tiles of 16 n
+// bits, so any K % 16 == 0 is a whole tile grid. The cases below cover K % 256 (sizes must not change), the MoE
+// down projection K = 1152 (72 tiles, 4.5 groups of 256), and K = 272 / 48 / 16 (an odd tile count per tile row).
+
+static size_t _test_tiled_align128(const size_t x)
+{
+	return (x + 127) & ~(size_t)127;
+}
+
+static const int tiled_shapes[][2] = {
+	{ 16, 256 }, { 32, 512 }, { 48, 768 }, { 16, 4352 }, { 2304, 1152 }, { 32, 1152 }, { 16, 272 }, { 48, 144 }, { 16, 16 }, { 64, 48 },
+};
+
+TEST_CASE("tiled row-wise-x sizes follow the 16 x 16 tile grid for K % 16 and are unchanged for K % 256")
+{
+	int s, f;
+	for (s = 0; s < (int)(sizeof(tiled_shapes) / sizeof(tiled_shapes[0])); s++)
+	{
+		const int rows = tiled_shapes[s][0], cols = tiled_shapes[s][1];
+		const size_t count = (size_t)rows * cols;
+		const size_t tiles = (size_t)rows / 16 * (cols / 16);
+		REQUIRE_EQ(ccv_nnc_8i_rowwise_x_tile_count(rows, cols), (uint64_t)tiles, "%d x %d tile count", rows, cols);
+		// TMCQ_N16 .. N32, FTQ_N16 .. N64, FTQ_VR_N16 .. N64.
+		for (f = 0; f < 9 + 25 + 25; f++)
+		{
+			const int vr = f >= 34, ftq = f >= 9 && !vr;
+			const int format = f < 9 ? tmcq_formats[f] : ftq ? CCV_NNC_QX_8I_ROWWISE_FTQ_N16 + (f - 9) : CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 + (f - 34);
+			const int n = f < 9 ? ccv_nnc_8i_rowwise_x_tmcq_rate(format) : ftq ? ccv_nnc_8i_rowwise_x_ftq_rate(format) : ccv_nnc_8i_rowwise_x_ftq_vr_rate(format);
+			const int datatype = f < 9 ? CCV_32F : CCV_16F;
+			const size_t code = tiles * 2 * n;
+			const size_t header = vr ? 32 + 4 * ((size_t)rows / 16 + 1) : ftq ? 32 : 0;
+			const size_t expected = _test_tiled_align128(header + code) + (size_t)rows * CCV_GET_DATA_TYPE_SIZE(datatype);
+			const size_t size = ccv_nnc_8i_rowwise_x_data_size(format, datatype, count, cols);
+			REQUIRE_EQ(size, expected, "format %d %d x %d is the tile grid plus the header and aligned scales", format, rows, cols);
+			ccv_nnc_tensor_param_t params = CPU_TENSOR_NHWC(32F, rows, cols);
+			params.datatype = datatype;
+			params = ccv_nnc_tensor_8i_rowwise_x(params, format);
+			REQUIRE_EQ(ccv_nnc_tensor_data_size_without_padding(params), expected, "format %d %d x %d tensor allocation agrees", format, rows, cols);
+			REQUIRE_EQ(ccv_nnc_8i_rowwise_x_payload_bits(format, rows, cols), (uint64_t)code * 8, "format %d %d x %d payload bits", format, rows, cols);
+			// The group formula of the row-wise codecs, rows x ceil(K / 256) tiles' worth of bits, is what the sizes
+			// were before: byte for byte the same for K % 256, and 1 / 9 too large at K = 1152.
+			const size_t row_wise = _test_tiled_align128(header + ((size_t)rows * ((cols + 255) / 256) * 16 * n + 7) / 8) + (size_t)rows * CCV_GET_DATA_TYPE_SIZE(datatype);
+			if (cols % 256 == 0)
+			{
+				REQUIRE_EQ(size, row_wise, "format %d %d x %d keeps its K %% 256 size", format, rows, cols);
+			} else {
+				REQUIRE(size < row_wise, "format %d %d x %d is smaller than the per-row group count", format, rows, cols);
+			}
+			if (ftq)
+			{
+				const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(format, rows, cols);
+				REQUIRE_EQ(schedule.tile_count, (uint64_t)tiles, "FTQ n%d %d x %d schedule tiles", n, rows, cols);
+				REQUIRE_EQ(schedule.code_bits, (uint64_t)code * 8, "FTQ n%d %d x %d schedule bits", n, rows, cols);
+				REQUIRE_EQ(schedule.scale_offset, (uint64_t)_test_tiled_align128(32 + code), "FTQ n%d %d x %d schedule scale offset", n, rows, cols);
+			}
+		}
+	}
+	// The MoE down projection of 128 experts of 2304 x 1152 stacked along the rows, at TMCQ_N16: 2304 / 16 x 72 tiles
+	// of 32 bytes per expert, no padding between experts.
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_16F, (size_t)128 * 2304 * 1152, 1152), (size_t)128 * 144 * 72 * 32 + 128 * 2304 * 2, "128 stacked 2304 x 1152 experts");
+	// K not a multiple of 16 or rows not a multiple of 16 have no size.
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(CCV_NNC_QX_8I_ROWWISE_FTQ_N20, CCV_16F, 16 * 1160, 1160), 0, "FTQ K = 1160 has no size");
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20, CCV_16F, 24 * 1152, 1152), 0, "FTQ_VR 24 rows have no size");
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(CCV_NNC_QX_8I_ROWWISE_TMCQ_N20, CCV_16F, 16 * 1144, 1144), 0, "TMCQ K = 1144 has no size");
+}
+
+static const int tiled_decode_shapes[][2] = { { 32, 1152 }, { 16, 272 }, { 48, 144 }, { 16, 16 }, { 32, 48 } };
+
+TEST_CASE("TMCQ CPU decode of random payloads matches the definition for K % 16 in every precision")
+{
+	const int datatypes[4] = {CCV_16F, CCV_16BF, CCV_32F, CCV_64F};
+	dsfmt_t dsfmt;
+	dsfmt_init_gen_rand(&dsfmt, 1153);
+	int s, f, d, i;
+	for (s = 0; s < (int)(sizeof(tiled_decode_shapes) / sizeof(tiled_decode_shapes[0])); s++)
+	{
+		const int rows = tiled_decode_shapes[s][0], cols = tiled_decode_shapes[s][1], count = rows * cols;
+		int* const q8 = ccmalloc(sizeof(int) * count);
+		uint8_t* const decoded = ccmalloc(sizeof(double) * count);
+		uint8_t* const expected = ccmalloc(sizeof(double) * count);
+		for (f = 0; f < 9; f++)
+		{
+			const int n = ccv_nnc_8i_rowwise_x_tmcq_rate(tmcq_formats[f]);
+			const size_t scale_offset = _test_tmcq_scale_offset(rows, cols, n);
+			d = (s + f) % 4;
+			const size_t size = ccv_nnc_8i_rowwise_x_data_size(tmcq_formats[f], datatypes[d], count, cols);
+			REQUIRE_EQ(size, scale_offset + rows * CCV_GET_DATA_TYPE_SIZE(datatypes[d]), "%d x %d n = %d size", rows, cols, n);
+			uint8_t* const packed = ccmalloc(size);
+			for (i = 0; i < (int)scale_offset; i++)
+				packed[i] = (uint8_t)(dsfmt_genrand_uint32(&dsfmt) & 0xff);
+			float* const scale_f = ccmalloc(sizeof(float) * rows);
+			for (i = 0; i < rows; i++)
+				scale_f[i] = (float)(dsfmt_genrand_open_close(&dsfmt) - 0.5) / 8;
+			_test_tmcq_from_float(scale_f, datatypes[d], rows, packed + scale_offset);
+			ccfree(scale_f);
+			_test_tmcq_decode(packed, rows, cols, n, q8);
+			for (i = 0; i < count; i++)
+			{
+				const double v = _test_tmcq_load_scale(packed + scale_offset, datatypes[d], i / cols) * q8[i];
+				const float vf = (float)v;
+				if (datatypes[d] == CCV_64F)
+					((double*)expected)[i] = v;
+				else
+					_test_tmcq_from_float(&vf, datatypes[d], 1, expected + i * CCV_GET_DATA_TYPE_SIZE(datatypes[d]));
+			}
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(packed, datatypes[d], CCV_TENSOR_CPU_MEMORY, size, cols, tmcq_formats[f], decoded, count), 0, "%d x %d n = %d decodes", rows, cols, n);
+			REQUIRE_ARRAY_EQ(uint8_t, expected, decoded, count * CCV_GET_DATA_TYPE_SIZE(datatypes[d]), "random payload decodes exactly for %d x %d n = %d, datatype %d", rows, cols, n, d);
+			ccfree(packed);
+		}
+		ccfree(expected);
+		ccfree(decoded);
+		ccfree(q8);
+	}
+}
+
+TEST_CASE("TMCQ quantizes K = 1152 and K = 272 into payloads that decode as the definition, within the rate's error bound")
+{
+	// The bounds of the K = 512 test at n = 16, 24, 32.
+	const int formats[3] = { CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, CCV_NNC_QX_8I_ROWWISE_TMCQ_N24, CCV_NNC_QX_8I_ROWWISE_TMCQ_N32 };
+	const double bounds[3] = { 0.30, 0.185, 0.125 };
+	static const int shapes[][2] = { { 32, 1152 }, { 16, 272 } };
+	dsfmt_t dsfmt;
+	dsfmt_init_gen_rand(&dsfmt, 1152);
+	int s, f, i;
+	for (s = 0; s < 2; s++)
+	{
+		const int rows = shapes[s][0], cols = shapes[s][1], count = rows * cols;
+		float* const values = ccmalloc(sizeof(float) * count);
+		float* const decoded = ccmalloc(sizeof(float) * count);
+		int* const q8 = ccmalloc(sizeof(int) * count);
+		_test_tmcq_values(&dsfmt, values, rows, cols);
+		double energy = 0;
+		for (i = 0; i < count; i++)
+			energy += (double)values[i] * values[i];
+		for (f = 0; f < 3; f++)
+		{
+			const int n = ccv_nnc_8i_rowwise_x_tmcq_rate(formats[f]);
+			const size_t size = ccv_nnc_8i_rowwise_x_data_size(formats[f], CCV_32F, count, cols);
+			uint8_t* const packed = ccmalloc(size + 16);
+			memset(packed, 0xa5, size + 16);
+			REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x(values, CCV_32F, CCV_TENSOR_CPU_MEMORY, count, cols, formats[f], 0, 0, 0, 0, packed, size), size, "%d x %d n = %d quantizer returns the exact size", rows, cols, n);
+			for (i = 0; i < 16; i++)
+				REQUIRE_EQ(packed[size + i], 0xa5, "quantizer preserves output guard bytes");
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(packed, CCV_32F, CCV_TENSOR_CPU_MEMORY, size, cols, formats[f], decoded, count), 0, "decodes");
+			_test_tmcq_decode(packed, rows, cols, n, q8);
+			const size_t scale_offset = _test_tmcq_scale_offset(rows, cols, n);
+			int mismatches = 0;
+			for (i = 0; i < count; i++)
+				mismatches += decoded[i] != (float)((double)((float*)(packed + scale_offset))[i / cols] * q8[i]);
+			REQUIRE_EQ(mismatches, 0, "%d x %d n = %d decode matches the definition", rows, cols, n);
+			const double relative = _test_tmcq_sse(values, decoded, count) / energy;
+			REQUIRE(relative < bounds[f], "%d x %d n = %d relative error %g within %g", rows, cols, n, relative, bounds[f]);
+			ccfree(packed);
+		}
+		ccfree(q8);
+		ccfree(decoded);
+		ccfree(values);
+	}
+}
+
+// FTQ tile reference: T bits from bit `start` of `blob`; pair j reads the 16-bit LSB-first window ending at
+// floor((j + 1) T / 128), wrapping inside the tile, and takes pair (state * 0x83DCD12D) >> 23 of the built-in table.
+static void _test_ftq_ref_tile(const uint8_t* const blob, const uint64_t start, const int T, int8_t* const q8)
+{
+	int j, b;
+	for (j = 0; j < 128; j++)
+	{
+		const int end = (j + 1) * T / 128;
+		uint32_t state = 0;
+		for (b = 0; b < 16; b++)
+			state |= (uint32_t)_test_tmcq_bit(blob, start + (uint64_t)((end + T - 16 + b) % T)) << b;
+		const uint32_t k = (state * 0x83DCD12Du) >> 23;
+		q8[2 * j] = ccv_nnc_trellis_builtin_table[2 * k];
+		q8[2 * j + 1] = ccv_nnc_trellis_builtin_table[2 * k + 1];
+	}
+}
+
+// The FP16 values an FTQ / FTQ_VR blob decodes to: tile row tr has rates[tr] (FTQ: n for all) and starts at bit
+// row_bits[tr] of the blob.
+static void _test_ftq_ref_decode(const uint8_t* const blob, const int rows, const int cols, const int* const rates, const uint64_t* const row_bits, const size_t scale_offset, uint16_t* const out)
+{
+	const int strips = cols / 16;
+	float* const scales = ccmalloc(sizeof(float) * rows);
+	ccv_half_precision_to_float((const uint16_t*)(blob + scale_offset), scales, rows);
+	int tr, tc, t;
+	for (tr = 0; tr < rows / 16; tr++)
+		for (tc = 0; tc < strips; tc++)
+		{
+			int8_t q8[256];
+			_test_ftq_ref_tile(blob, row_bits[tr] + (uint64_t)tc * 16 * rates[tr], 16 * rates[tr], q8);
+			for (t = 0; t < 256; t++)
+			{
+				const int row = tr * 16 + t / 16;
+				const float v = (float)q8[t] * scales[row];
+				ccv_float_to_half_precision(&v, out + (size_t)row * cols + tc * 16 + t % 16, 1);
+			}
+		}
+	ccfree(scales);
+}
+
+TEST_CASE("FTQ CPU decode of random blobs matches the reference for K % 16")
+{
+	static const int rates[] = { 16, 18, 20, 36, 50, 64 };
+	uint32_t seed = 0x1152u;
+	int s, r, i;
+	for (s = 0; s < (int)(sizeof(tiled_decode_shapes) / sizeof(tiled_decode_shapes[0])); s++)
+		for (r = 0; r < (int)(sizeof(rates) / sizeof(rates[0])); r++)
+		{
+			const int rows = tiled_decode_shapes[s][0], cols = tiled_decode_shapes[s][1], n = rates[r];
+			const int format = CCV_NNC_QX_8I_ROWWISE_FTQ_N16 + (n - 16) / 2;
+			const size_t size = ccv_nnc_8i_rowwise_x_data_size(format, CCV_16F, (size_t)rows * cols, cols);
+			const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(format, rows, cols);
+			REQUIRE_EQ(size, (size_t)schedule.scale_offset + 2 * rows, "%d x %d n%d size", rows, cols, n);
+			uint8_t* const blob = ccmalloc(size);
+			memset(blob, 0, size);
+			memcpy(blob, "CCVFTQSR", 8);
+			const uint32_t header[6] = { (uint32_t)rows, (uint32_t)cols, schedule.high_bits, 0, 9u << 8, 0 };
+			memcpy(blob + 8, header, sizeof(header));
+			for (i = 0; i < (int)(schedule.code_bits / 8); i++)
+			{
+				seed ^= seed << 13, seed ^= seed >> 17, seed ^= seed << 5;
+				blob[32 + i] = (uint8_t)(seed >> 24);
+			}
+			float* const scales = ccmalloc(sizeof(float) * rows);
+			for (i = 0; i < rows; i++)
+				scales[i] = 0.001f * (1 + (i * 7) % 13);
+			ccv_float_to_half_precision(scales, (uint16_t*)(blob + schedule.scale_offset), rows);
+			ccfree(scales);
+			int* const row_rates = ccmalloc(sizeof(int) * (rows / 16));
+			uint64_t* const row_bits = ccmalloc(sizeof(uint64_t) * (rows / 16));
+			for (i = 0; i < rows / 16; i++)
+				row_rates[i] = n, row_bits[i] = 256 + (uint64_t)i * (cols / 16) * 16 * n;
+			uint16_t* const expected = ccmalloc(sizeof(uint16_t) * rows * cols);
+			uint16_t* const actual = ccmalloc(sizeof(uint16_t) * rows * cols);
+			_test_ftq_ref_decode(blob, rows, cols, row_rates, row_bits, schedule.scale_offset, expected);
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(blob, CCV_16F, CCV_TENSOR_CPU_MEMORY, size, cols, format, actual, (size_t)rows * cols), 0, "%d x %d n%d decodes", rows, cols, n);
+			REQUIRE_ARRAY_EQ(uint16_t, expected, actual, rows * cols, "FTQ %d x %d n%d decode matches the reference", rows, cols, n);
+			// One byte short of the blob is rejected.
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(blob, CCV_16F, CCV_TENSOR_CPU_MEMORY, size - 1, cols, format, actual, (size_t)rows * cols), -1, "%d x %d n%d short blob", rows, cols, n);
+			ccfree(actual);
+			ccfree(expected);
+			ccfree(row_bits);
+			ccfree(row_rates);
+			ccfree(blob);
+		}
+}
+
+TEST_CASE("FTQ and FTQ_VR quantize K = 1152 and K = 272 into blobs that decode as the reference")
+{
+	static const int shapes[][2] = { { 64, 1152 }, { 48, 272 } };
+	dsfmt_t dsfmt;
+	dsfmt_init_gen_rand(&dsfmt, 272);
+	int s, v, i;
+	for (s = 0; s < 2; s++)
+		for (v = 0; v < 3; v++)
+		{
+			// v = 0: static-rate FTQ_N20; 1: FTQ_VR_N20 at 20 everywhere; 2: FTQ_VR_N20 with tile row rates 12, 28, 20, ...
+			const int rows = shapes[s][0], cols = shapes[s][1], count = rows * cols, R = rows / 16, C = cols / 16;
+			const int format = v ? CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20 : CCV_NNC_QX_8I_ROWWISE_FTQ_N20;
+			float* const values = ccmalloc(sizeof(float) * count);
+			uint16_t* const half = ccmalloc(sizeof(uint16_t) * count);
+			_test_tmcq_values(&dsfmt, values, rows, cols);
+			ccv_float_to_half_precision(values, half, count);
+			int* const rates = ccmalloc(sizeof(int) * R);
+			for (i = 0; i < R; i++)
+				rates[i] = v == 2 ? (i % 3 == 0 ? 12 : i % 3 == 1 ? 28 : 20) : 20;
+			if (v == 2 && R % 3 == 1)
+				rates[R - 1] = 20;
+			else if (v == 2 && R % 3 == 2)
+				rates[R - 2] = rates[R - 1] = 20;
+			const size_t size = ccv_nnc_8i_rowwise_x_data_size(format, CCV_16F, count, cols);
+			uint8_t* const blob = ccmalloc(size);
+			const size_t written = v ? ccv_nnc_quantize_8i_rowwise_x_ftq_vr(half, CCV_16F, CCV_TENSOR_CPU_MEMORY, count, cols, format, rates, blob, size) : ccv_nnc_quantize_8i_rowwise_x(half, CCV_16F, CCV_TENSOR_CPU_MEMORY, count, cols, format, 0, 0, 0, 0, blob, size);
+			REQUIRE_EQ(written, size, "%d x %d variant %d writes the exact size", rows, cols, v);
+			uint64_t* const row_bits = ccmalloc(sizeof(uint64_t) * R);
+			size_t scale_offset;
+			if (v)
+			{
+				REQUIRE(memcmp(blob, "CCVFTQVR", 8) == 0, "variable-rate magic");
+				uint32_t word = 0;
+				for (i = 0; i <= R; i++)
+				{
+					uint32_t off;
+					memcpy(&off, blob + 32 + 4 * i, 4);
+					REQUIRE_EQ(off, word, "%d x %d tile row %d offset is the sum of C n_r / 2", rows, cols, i);
+					if (i < R)
+						row_bits[i] = ((uint64_t)8 + R + 1 + off) * 32, word += (uint32_t)(C * rates[i] / 2);
+				}
+				scale_offset = _test_tiled_align128(32 + 4 * (R + 1) + (size_t)R * C * 2 * 20);
+			} else {
+				REQUIRE(memcmp(blob, "CCVFTQSR", 8) == 0, "static-rate magic");
+				for (i = 0; i < R; i++)
+					row_bits[i] = 256 + (uint64_t)i * C * 16 * 20;
+				scale_offset = _test_tiled_align128(32 + (size_t)R * C * 2 * 20);
+			}
+			REQUIRE_EQ(size, scale_offset + 2 * rows, "%d x %d variant %d scales follow the code", rows, cols, v);
+			uint16_t* const expected = ccmalloc(sizeof(uint16_t) * count);
+			uint16_t* const actual = ccmalloc(sizeof(uint16_t) * count);
+			_test_ftq_ref_decode(blob, rows, cols, rates, row_bits, scale_offset, expected);
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(blob, CCV_16F, CCV_TENSOR_CPU_MEMORY, size, cols, format, actual, count), 0, "%d x %d variant %d decodes", rows, cols, v);
+			REQUIRE_ARRAY_EQ(uint16_t, expected, actual, count, "%d x %d variant %d decode matches the reference", rows, cols, v);
+			// The fit is close: relative error of the FP16 decode under the n = 20 TMCQ bound.
+			double sse = 0, energy = 0;
+			for (i = 0; i < count; i++)
+			{
+				float x;
+				ccv_half_precision_to_float(actual + i, &x, 1);
+				sse += ((double)x - values[i]) * ((double)x - values[i]);
+				energy += (double)values[i] * values[i];
+			}
+			REQUIRE(sse / energy < 0.30, "%d x %d variant %d relative error %g", rows, cols, v, sse / energy);
+			ccfree(actual);
+			ccfree(expected);
+			ccfree(row_bits);
+			ccfree(blob);
+			ccfree(rates);
+			ccfree(half);
+			ccfree(values);
+		}
 }
 
 #include "case_main.h"
