@@ -1355,15 +1355,15 @@ static __device__ __forceinline__ uint2 _ccv_nnc_8i_rowwise_x_tmcq_decode_oct(co
 
 // row_scale x q8 in the datatype, bit for bit what the CPU decode writes: the product is exact in float (at most
 // 11 + 7 significant bits for 16-bit scales), then CPU narrows it to FP16 / BF16 with ccv_float_to_half_precision /
-// ccv_float_to_bfloat, which truncate, thus round towards zero here as well.
+// ccv_float_to_bfloat, which round to nearest even (since 9df009a6), thus round to nearest even here as well.
 static __device__ __forceinline__ __half _ccv_nnc_8i_rowwise_x_tmcq_mul(const __half scale, const int q)
 {
-	return __float2half_rz(__half2float(scale) * (float)q);
+	return __float2half_rn(__half2float(scale) * (float)q);
 }
 
 static __device__ __forceinline__ __nv_bfloat16 _ccv_nnc_8i_rowwise_x_tmcq_mul(const __nv_bfloat16 scale, const int q)
 {
-	return __float2bfloat16_rz(__bfloat162float(scale) * (float)q);
+	return __float2bfloat16_rn(__bfloat162float(scale) * (float)q);
 }
 
 static __device__ __forceinline__ float _ccv_nnc_8i_rowwise_x_tmcq_mul(const float scale, const int q)
