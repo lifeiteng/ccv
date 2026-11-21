@@ -35,10 +35,8 @@ static size_t _ccv_nnc_8i_rowwise_packed_scale_offset(const int format, const si
 	assert(row_length > 0);
 	assert(input_length % row_length == 0);
 	const size_t row_count = input_length / row_length;
-	const size_t group_size = ccv_nnc_8i_rowwise_x_group_size(format);
-	const size_t groups_per_row = (row_length + group_size - 1) / group_size;
-	const size_t group_bits = ccv_nnc_8i_rowwise_x_group_bits(format);
-	const size_t payload_size = (row_count * groups_per_row * group_bits + 7) / 8 + ccv_nnc_8i_rowwise_x_payload_header(format, row_count);
+	// TMCQ / FTQ: whole 16 x 16 tiles, (row_count / 16) (row_length / 16) of them (ccv_nnc_8i_rowwise_x_payload_bits).
+	const size_t payload_size = (size_t)((ccv_nnc_8i_rowwise_x_payload_bits(format, row_count, row_length) + 7) / 8) + ccv_nnc_8i_rowwise_x_payload_header(format, row_count);
 	return (payload_size + 127) & -128;
 }
 
@@ -48,7 +46,7 @@ CCV_WARN_UNUSED(size_t) ccv_nnc_8i_rowwise_x_data_size(const int format, const i
 		((format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) && row_length % 256 != 0))
 		return 0;
 	if (ccv_nnc_8i_rowwise_x_is_tiled(format) &&
-		(row_length % 256 != 0 || (input_length / row_length) % 16 != 0 || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256)))
+		(row_length % 16 != 0 || (input_length / row_length) % 16 != 0 || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256)))
 		return 0;
 	// The FTQ blob carries FP16 scales.
 	if (ccv_nnc_8i_rowwise_x_is_ftq_any(format) && datatype != CCV_16F)
@@ -2936,7 +2934,7 @@ CCV_WARN_UNUSED(size_t) ccv_nnc_quantize_8i_rowwise_x(const void* input, const i
 	if (ccv_nnc_8i_rowwise_x_is_tiled(format))
 	{
 		// TMCQ and FTQ: whole 16 x 16 tiles, unweighted (no imatrix or Hessian); FTQ carries FP16 scales.
-		if (imatrix || imatrix_length || hessian || hessian_length || row_length % 256 != 0 || row_count == 0 || row_count % 16 != 0 ||
+		if (imatrix || imatrix_length || hessian || hessian_length || row_length % 16 != 0 || row_count == 0 || row_count % 16 != 0 ||
 			(format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || (ccv_nnc_8i_rowwise_x_is_ftq_any(format) && datatype != CCV_16F))
 			return 0;
 	}
@@ -2947,7 +2945,7 @@ CCV_WARN_UNUSED(size_t) ccv_nnc_quantize_8i_rowwise_x_ftq_vr(const void* input, 
 {
 	assert(memory_type == CCV_TENSOR_CPU_MEMORY);
 	if (!ccv_nnc_8i_rowwise_x_is_ftq_vr(format) || ccv_nnc_8i_rowwise_x_codebook_slot(format) != 0 || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) ||
-		datatype != CCV_16F || row_length == 0 || row_length % 256 != 0 || input_length % row_length != 0 || input_length == 0 || (input_length / row_length) % 16 != 0)
+		datatype != CCV_16F || row_length == 0 || row_length % 16 != 0 || input_length % row_length != 0 || input_length == 0 || (input_length / row_length) % 16 != 0)
 		return 0;
 	return _ccv_nnc_quantize_8i_rowwise_x_trellis(input, datatype, input_length, row_length, format, rates, output, output_length);
 }
@@ -2985,7 +2983,7 @@ static const int8_t* _ccv_nnc_8i_rowwise_ftq_table(const int slot, const uint32_
 
 int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length, uint32_t* const level_mask_out)
 {
-	if (!ccv_nnc_8i_rowwise_x_is_ftq_vr(format) || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length == 0 || row_length % 256 != 0 || row_count == 0 || row_count % 16 != 0 || row_count > UINT32_MAX || row_length > UINT32_MAX)
+	if (!ccv_nnc_8i_rowwise_x_is_ftq_vr(format) || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length == 0 || row_length % 16 != 0 || row_count == 0 || row_count % 16 != 0 || row_count > UINT32_MAX || row_length > UINT32_MAX)
 		return -1;
 	const uint8_t* const u8 = (const uint8_t*)data;
 	const size_t tile_rows = row_count / 16;
@@ -3074,7 +3072,7 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 	{
 		// Every check of the FTQ container returns -1, also in release builds: a wrong table or schedule would
 		// read past the table or the code.
-		if (datatype != CCV_16F || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length % 256 != 0 || row_count % 16 != 0)
+		if (datatype != CCV_16F || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length % 16 != 0 || row_count % 16 != 0)
 			return -1;
 		const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(format, row_count, row_length);
 		if (schedule.scale_offset != scale_offset || input_length < scale_offset + row_count * 2 || schedule.high_bits > 1024)
@@ -3163,7 +3161,7 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 	{
 		// Each tile writes 16 rows x 16 columns back to row-major output.
 		assert(!(format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256));
-		assert(row_length % 256 == 0 && row_count % 16 == 0);
+		assert(row_length % 16 == 0 && row_count % 16 == 0);
 		const int n = ccv_nnc_8i_rowwise_x_tmcq_rate(format);
 		// Slot 0 is the built-in table, any other the codebook in the slot (registered, checked above).
 		int entries = 0;
