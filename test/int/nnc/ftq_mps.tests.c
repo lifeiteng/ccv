@@ -1811,6 +1811,121 @@ TEST_CASE("an ftq_vr checkpoint loads only when every rule of the format holds")
 	sqlite3_close(db);
 }
 
+// A 48 x 256 static-rate (n20) or variable-rate (nm20, tile rows at 16, 24, 16) CPU tensor, filled with the built-in
+// table, and its blob size.
+static ccv_nnc_tensor_t* ftq_rule_tensor_new(const int vr, const uint32_t seed, size_t* const size)
+{
+	static const int rates[3] = { 16, 24, 16 };
+	const int rows = 48, cols = 256;
+	const int format = vr ? ftq_vr_format(20) : ftq_format(20);
+	ccv_nnc_tensor_t* const t = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), format), 0);
+	*size = ccv_nnc_tensor_data_size_without_padding(t->info);
+	if (vr)
+		ftq_vr_fill(t->data.u8, *size, format, rows, cols, rates, ftq_builtin_table, 0, seed);
+	else
+		ftq_fill(t->data.u8, *size, format, rows, cols, ftq_builtin_table, 0, seed);
+	return t;
+}
+
+static int ftq_rule_check(const int vr, const uint8_t* const data, const size_t length)
+{
+	return vr ? ccv_nnc_8i_rowwise_x_ftq_vr_check(data, length, ftq_vr_format(20), 48, 256, 0) : ccv_nnc_8i_rowwise_x_ftq_load_check(data, length, ftq_format(20), 48, 256);
+}
+
+// Row scales (CCV_NNC_QX_8I_ROWWISE_FTQ_N16, FTQ_VR_N16; QuantStar ftq-spec-20261117, II and VII.5): every FP16 row
+// scale is finite and not negative; -0 passes as 0, so do +0 and the smallest subnormal. A NaN, +Inf or -Inf scale (or
+// a negative one) fails the blob check, the CPU decode and the checkpoint load, for static and variable rate alike.
+TEST_CASE("ftq and ftq_vr reject a non-finite row scale in the check, the cpu decode and the checkpoint load")
+{
+	static const struct { const char* name; uint16_t h; int ok; } scales[] = {
+		{ "the filled scale", 0, 1 }, { "+0", 0x0000, 1 }, { "-0", 0x8000, 1 }, { "the smallest subnormal", 0x0001, 1 },
+		{ "the largest finite", 0x7bff, 1 }, { "NaN", 0x7e00, 0 }, { "a NaN with payload", 0x7c01, 0 }, { "-NaN", 0xfe00, 0 },
+		{ "+Inf", 0x7c00, 0 }, { "-Inf", 0xfc00, 0 }, { "-1", 0xbc00, 0 },
+	};
+	sqlite3* db = 0;
+	REQUIRE_EQ(sqlite3_open(":memory:", &db), SQLITE_OK, "in-memory database opens");
+	int vr, c;
+	for (vr = 0; vr < 2; vr++)
+		for (c = 0; c < (int)(sizeof(scales) / sizeof(scales[0])); c++)
+		{
+			size_t size;
+			ccv_nnc_tensor_t* const t = ftq_rule_tensor_new(vr, 0x5ca1u + c, &size);
+			const char* const kind = vr ? "ftq_vr" : "ftq";
+			// Row 17 (tile row 1, the n24 one for variable rate); its 2 bytes are at scale_offset + 34.
+			if (c > 0)
+				memcpy(t->data.u8 + size - 2 * 48 + 2 * 17, &scales[c].h, 2);
+			REQUIRE_EQ(ftq_rule_check(vr, t->data.u8, size), scales[c].ok ? 0 : -1, "%s %s: check", kind, scales[c].name);
+			uint16_t* const out = (uint16_t*)ccmalloc(sizeof(uint16_t) * 48 * 256);
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(t->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, size, 256, t->info.reserved, out, 48 * 256), scales[c].ok ? 0 : -1, "%s %s: CPU decode", kind, scales[c].name);
+			ccfree(out);
+			char name[32];
+			snprintf(name, sizeof(name), "s%d_%d", vr, c);
+			REQUIRE_EQ(ccv_nnc_tensor_write(t, db, name, 0), CCV_IO_FINAL, "%s %s writes", kind, scales[c].name);
+			ccv_nnc_tensor_free(t);
+			ccv_nnc_tensor_t* restored = 0;
+			const int result = ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored);
+			if (scales[c].ok)
+			{
+				REQUIRE_EQ(result, CCV_IO_FINAL, "%s %s loads", kind, scales[c].name);
+				ccv_nnc_tensor_free(restored);
+			} else
+				REQUIRE(result != CCV_IO_FINAL && !restored, "%s %s fails to load", kind, scales[c].name);
+		}
+	sqlite3_close(db);
+}
+
+// Blob length: the stored blob of an FTQ / FTQ-VR checkpoint must be exactly the size its shape and rate give
+// (QuantStar: the total length matches the header). One byte more or less fails the load and the blob checks. The CPU
+// decode takes a buffer (possibly a padded tensor) and still decodes from one of at least that size.
+TEST_CASE("ftq and ftq_vr checkpoints load only when the stored blob is exactly the size of the format")
+{
+	sqlite3* db = 0;
+	REQUIRE_EQ(sqlite3_open(":memory:", &db), SQLITE_OK, "in-memory database opens");
+	int vr, d;
+	for (vr = 0; vr < 2; vr++)
+	{
+		const char* const kind = vr ? "ftq_vr" : "ftq";
+		size_t size;
+		ccv_nnc_tensor_t* const t = ftq_rule_tensor_new(vr, 0x1e9u + vr, &size);
+		REQUIRE_EQ(size, ccv_nnc_8i_rowwise_x_data_size(t->info.reserved, CCV_16F, 48 * 256, 256), "%s blob size is the writer's", kind);
+		uint8_t* const longer = (uint8_t*)ccmalloc(size + 1);
+		memcpy(longer, t->data.u8, size);
+		longer[size] = 0;
+		REQUIRE_EQ(ftq_rule_check(vr, t->data.u8, size), 0, "%s exact size passes the check", kind);
+		REQUIRE_EQ(ftq_rule_check(vr, longer, size + 1), -1, "%s one byte more fails the check", kind);
+		REQUIRE_EQ(ftq_rule_check(vr, t->data.u8, size - 1), -1, "%s one byte less fails the check", kind);
+		uint16_t* const out = (uint16_t*)ccmalloc(sizeof(uint16_t) * 48 * 256);
+		REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(longer, CCV_16F, CCV_TENSOR_CPU_MEMORY, size + 1, 256, t->info.reserved, out, 48 * 256), 0, "%s CPU decode takes a larger buffer", kind);
+		REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(t->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, size - 1, 256, t->info.reserved, out, 48 * 256), -1, "%s CPU decode rejects a short buffer", kind);
+		ccfree(out);
+		// -1, 0, +1 bytes: write the valid tensor, then replace its stored blob.
+		for (d = -1; d <= 1; d++)
+		{
+			char name[32];
+			snprintf(name, sizeof(name), "l%d_%d", vr, d + 1);
+			REQUIRE_EQ(ccv_nnc_tensor_write(t, db, name, 0), CCV_IO_FINAL, "%s writes", kind);
+			sqlite3_stmt* update = 0;
+			REQUIRE_EQ(sqlite3_prepare_v2(db, "UPDATE tensors SET data=?1 WHERE name=?2", -1, &update, 0), SQLITE_OK, "update prepares");
+			sqlite3_bind_blob(update, 1, longer, (int)(size + d), SQLITE_TRANSIENT);
+			sqlite3_bind_text(update, 2, name, -1, SQLITE_TRANSIENT);
+			REQUIRE_EQ(sqlite3_step(update), SQLITE_DONE, "%s blob of %d bytes more is stored", kind, d);
+			sqlite3_finalize(update);
+			ccv_nnc_tensor_t* restored = 0;
+			const int result = ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored);
+			if (d == 0)
+			{
+				REQUIRE_EQ(result, CCV_IO_FINAL, "%s exact blob loads", kind);
+				REQUIRE(memcmp(restored->data.u8, t->data.u8, size) == 0, "%s exact blob reads back", kind);
+				ccv_nnc_tensor_free(restored);
+			} else
+				REQUIRE(result != CCV_IO_FINAL && !restored, "%s blob of %d bytes more fails to load", kind, d);
+		}
+		ccfree(longer);
+		ccv_nnc_tensor_free(t);
+	}
+	sqlite3_close(db);
+}
+
 // Levels above 64 (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16): n66 ... n70 are bits 29 - 31 of word 3, n72 ... n88 bits 18 - 26
 // of the table word; bits 27 - 31 of the table word are zero. Each blob is checked, decoded on the CPU and written and
 // read back as a checkpoint (the loader reads the table word for the fold bits).

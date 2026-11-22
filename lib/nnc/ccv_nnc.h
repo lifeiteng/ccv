@@ -1190,7 +1190,9 @@ enum {
 	 * The data is one blob: a 32-byte header ("CCVFTQSR", then rows, cols, high_bits = 16 n, drop_count = 0, table,
 	 * table_crc as little-endian uint32), the code (tiles * 2 n bytes, LSB-first, tile t at bit 16 n t, so every tile
 	 * starts on a 32-bit word), zero padding to align128(32 + tiles * 2 n) of the blob and one FP16 scale per row
-	 * (see ccv_nnc_8i_rowwise_x_ftq_schedule). Any other high_bits or a non-zero drop_count is rejected. Table bits
+	 * (see ccv_nnc_8i_rowwise_x_ftq_schedule). Any other high_bits or a non-zero drop_count is rejected, so is a stored
+	 * blob of any other size than align128(32 + tiles * 2 n) + 2 rows, or a row scale that is NaN, infinite or negative
+	 * (-0 passes as 0). Table bits
 	 * 0 - 7 are the file-local codebook id (0 = the built-in table, see ccv_nnc_codebook.h), bits 8 - 15 log2 P
 	 * (9, 10 or 11), bits 16 - 17 the structure (0 plain, 1 quadrant fold: 512 base pairs, base pair (h >> 16) & 511
 	 * of h = state * 0x83DCD12D, the first value negated when bit 15 of h is set and the second when bit 31 is), bits
@@ -1266,7 +1268,8 @@ enum {
 	 *   scales    FP16 row scales, 2 rows bytes. Blob size = scale_offset + 2 rows.
 	 * A reader rejects the blob unless: the magic matches, rows / cols / 16 nm match the tensor and format, every n_r
 	 * is a set bit of level_mask, at most 6 bits are set, off is non-decreasing with off[R] <= R C nm / 2, every
-	 * off[r + 1] - off[r] is a multiple of C (so n_r is even), the padding is zero, and the table checks of
+	 * off[r + 1] - off[r] is a multiple of C (so n_r is even), the padding is zero, the stored blob is exactly
+	 * scale_offset + 2 rows bytes, every row scale is finite and not negative (-0 passes as 0), and the table checks of
 	 * static-rate FTQ pass. */
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 = CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST + (16 - 8) / 2,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N18,

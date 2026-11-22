@@ -3016,6 +3016,29 @@ static inline uint32_t _ccv_nnc_8i_rowwise_ftq_vr_table_field(const uint32_t* co
 	return header[4] & 0x3ffffu;
 }
 
+// FTQ and FTQ-VR row scales are FP16, finite and not negative; -0 passes (as 0), so do +0 and subnormals.
+static int _ccv_nnc_8i_rowwise_ftq_scales_valid(const uint8_t* const scales, const size_t row_count)
+{
+	size_t p;
+	for (p = 0; p < row_count; p++)
+	{
+		const uint16_t h = (uint16_t)(scales[2 * p] | (scales[2 * p + 1] << 8));
+		if (h != 0x8000 && ((h & 0x8000) || (h & 0x7c00) == 0x7c00))
+			return 0;
+	}
+	return 1;
+}
+
+int ccv_nnc_8i_rowwise_x_ftq_load_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length)
+{
+	if (!ccv_nnc_8i_rowwise_x_is_ftq(format) || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length == 0 || row_length % 16 != 0 || row_count == 0 || row_count % 16 != 0)
+		return -1;
+	const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(format, row_count, row_length);
+	if (length != schedule.scale_offset + 2 * row_count)
+		return -1;
+	return _ccv_nnc_8i_rowwise_ftq_scales_valid((const uint8_t*)data + schedule.scale_offset, row_count) ? 0 : -1;
+}
+
 int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length, uint64_t* const level_mask_out)
 {
 	if (!ccv_nnc_8i_rowwise_x_is_ftq_vr(format) || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length == 0 || row_length % 16 != 0 || row_count == 0 || row_count % 16 != 0 || row_count > UINT32_MAX || row_length > UINT32_MAX)
@@ -3026,7 +3049,8 @@ int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t lengt
 	const uint64_t nm = (uint64_t)ccv_nnc_8i_rowwise_x_ftq_vr_rate(format);
 	const size_t code_start = 32 + 4 * (tile_rows + 1);
 	const size_t scale_offset = (code_start + tile_rows * tiles * 2 * nm + 127) & ~(size_t)127;
-	if (length < scale_offset + 2 * row_count || memcmp(u8, "CCVFTQVR", 8) != 0)
+	// The blob is exactly scale_offset + 2 rows bytes.
+	if (length != scale_offset + 2 * row_count || memcmp(u8, "CCVFTQVR", 8) != 0)
 		return -1;
 	uint32_t header[6];
 	memcpy(header, u8 + 8, sizeof(header));
@@ -3062,6 +3086,8 @@ int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t lengt
 	for (p = code_start + (size_t)previous * 4; p < scale_offset; p++)
 		if (u8[p] != 0)
 			return -1;
+	if (!_ccv_nnc_8i_rowwise_ftq_scales_valid(u8 + scale_offset, row_count))
+		return -1;
 	if (level_mask_out)
 		*level_mask_out = level_mask;
 	return 0;
@@ -3132,12 +3158,8 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 		for (p = code_end; p < scale_offset; p++)
 			if (u8[p] != 0)
 				return -1;
-		for (p = 0; p < row_count; p++)
-		{
-			const uint16_t h = (uint16_t)(scales[2 * p] | (scales[2 * p + 1] << 8));
-			if (h != 0x8000 && ((h & 0x8000) || (h & 0x7c00) == 0x7c00))
-				return -1;
-		}
+		if (!_ccv_nnc_8i_rowwise_ftq_scales_valid(scales, row_count))
+			return -1;
 		const size_t tile_rows = row_count / 16;
 		const size_t strips = row_length / 16;
 		parallel_for(tr, (int)tile_rows) {
@@ -3161,7 +3183,9 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 	if (ccv_nnc_8i_rowwise_x_is_ftq_vr(format))
 	{
 		// Every check of the CCVFTQVR container returns -1, also in release builds (ccv_nnc_8i_rowwise_x_ftq_vr_check).
-		if (datatype != CCV_16F || ccv_nnc_8i_rowwise_x_ftq_vr_check(u8, input_length, format, row_count, row_length, 0) != 0)
+		// input_length is the caller's buffer (it may be a padded tensor, checked >= above); the blob is its first
+		// ccv_nnc_8i_rowwise_x_data_size bytes.
+		if (datatype != CCV_16F || ccv_nnc_8i_rowwise_x_ftq_vr_check(u8, ccv_nnc_8i_rowwise_x_data_size(format, datatype, output_length, row_length), format, row_count, row_length, 0) != 0)
 			return -1;
 		uint32_t header[6];
 		memcpy(header, u8 + 8, sizeof(header));

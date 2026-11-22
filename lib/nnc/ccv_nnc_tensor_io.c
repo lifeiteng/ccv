@@ -428,6 +428,8 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 		return CCV_IO_ERROR;
 	}
 	ccv_nnc_tensor_t* tensor = *tensor_out;
+	// Whether the tensor is created here, so a blob that fails the FTQ checks below frees it instead of returning it.
+	const int tensor_created = !tensor;
 	ccv_nnc_tensor_param_t tensor_params;
 	int datatype = 0;
 	unsigned int identifier = 0;
@@ -437,6 +439,9 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 	// A variable-rate FTQ weight (its stored format with the resolved codebook slot): the whole blob is checked once
 	// it is read. -1: not such a weight.
 	int ftq_vr_format = -1;
+	// A static-rate FTQ weight stored raw (its stored format): its blob length and row scales are checked once it is
+	// read. -1: not such a weight (or stored by an identifier codec, whose data is not the blob).
+	int ftq_sr_format = -1;
 	{
 		const sqlite_int64 stored_datatype_mix = sqlite3_column_int64(tensor_select_stmt, 3);
 		const int stored_datatype = (int)(stored_datatype_mix & 0xffffffff);
@@ -479,6 +484,8 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 						return CCV_IO_ERROR;
 					}
 					memcpy(&table_field, head + 24, 4);
+					if (stored_identifier == 0)
+						ftq_sr_format = stored_reserved;
 				} else if (stored_identifier == 0 || codebook_slot != 0) {
 					sqlite3_finalize(tensor_select_stmt);
 					return CCV_IO_ERROR;
@@ -561,17 +568,26 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 	int dim[CCV_NNC_MAX_DIM_ALLOC];
 	memcpy(dim, sqlite3_column_blob(tensor_select_stmt, 4), ccv_min(sizeof(dim), sqlite3_column_bytes(tensor_select_stmt, 4)));
 	const int nd = ccv_nnc_tensor_nd(dim);
-	if (ftq_vr_format >= 0)
+	if (ftq_vr_format >= 0 || ftq_sr_format >= 0)
 	{
-		// Every rule of CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 on the stored blob, against the stored shape and format.
+		// Variable-rate FTQ: every rule of CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 on the stored blob, against the stored shape
+		// and format. Static-rate FTQ: the blob length and its row scales (ccv_nnc_8i_rowwise_x_ftq_load_check). The
+		// stored data (all parts of a split tensor) is the whole blob, so both take its length as exactly the blob's.
 		size_t count = 1;
 		int i;
 		for (i = 0; i < nd; i++)
 			count *= dim[i] > 0 ? (size_t)dim[i] : 0;
 		const size_t row_length = nd > 0 && dim[nd - 1] > 0 ? (size_t)dim[nd - 1] : 0;
-		if (row_length == 0 || count % row_length != 0 || datatype != (((CCV_16F >> 12) & 0xff) | CCV_QX | CCV_NNC_QX_8I_ROWWISE_X) ||
-			ccv_nnc_8i_rowwise_x_ftq_vr_check(data, data_bytes, ftq_vr_format, count / row_length, row_length, 0) != 0)
+		if (row_length == 0 || count % row_length != 0 ||
+			(ftq_vr_format >= 0 && (datatype != (((CCV_16F >> 12) & 0xff) | CCV_QX | CCV_NNC_QX_8I_ROWWISE_X) ||
+				ccv_nnc_8i_rowwise_x_ftq_vr_check(data, data_bytes, ftq_vr_format, count / row_length, row_length, 0) != 0)) ||
+			(ftq_sr_format >= 0 && ccv_nnc_8i_rowwise_x_ftq_load_check(data, data_bytes, ftq_sr_format, count / row_length, row_length) != 0))
 		{
+			if (tensor_created && *tensor_out)
+			{
+				ccv_nnc_tensor_free(*tensor_out);
+				*tensor_out = 0;
+			}
 			if (split_workspace)
 				ccfree(split_workspace);
 			sqlite3_reset(tensor_select_stmt);
