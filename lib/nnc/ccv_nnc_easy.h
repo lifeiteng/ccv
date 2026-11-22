@@ -268,12 +268,12 @@ static inline int ccv_nnc_8i_rowwise_x_is_ftq(const int format)
 	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N88;
 }
 
-/* Variable-rate FTQ (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N64, the open codes of its block): whole CCVFTQVR blobs with
+/* Variable-rate FTQ (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N88, the open codes of its block): whole CCVFTQVR blobs with
  * FP16 scales. */
 static inline int ccv_nnc_8i_rowwise_x_is_ftq_vr(const int format)
 {
 	const int codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
-	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88;
 }
 
 /* Static- or variable-rate FTQ. */

@@ -1442,7 +1442,7 @@ TEST_CASE("mps ftq decode is exact across odd tile-row counts with the built-in 
 }
 
 // Variable-rate FTQ (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16). Tile row rates follow the r6a level set: nm + {-12, -8, -4, 0,
-// +4, +12} by tile row mod 6, clamped to 8 ... 64 (every prefix of the offsets sums to at most nm per tile row).
+// +4, +12} by tile row mod 6, clamped to 8 ... 88 (every prefix of the offsets sums to at most nm per tile row).
 static int ftq_vr_format(const int nm)
 {
 	return CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST + (nm - 8) / 2;
@@ -1455,21 +1455,22 @@ static void ftq_vr_rates(const int tile_rows, const int nm, int* const rates)
 	for (r = 0; r < tile_rows; r++)
 	{
 		const int n = nm + deltas[r % 6];
-		rates[r] = n < 8 ? 8 : n > 64 ? 64 : n;
+		rates[r] = n < 8 ? 8 : n > 88 ? 88 : n;
 	}
 }
 
 // A CCVFTQVR blob at the given tile row rates: header, offsets, random code words, zero padding, random FP16 scales.
+// The level mask's bits 0 - 31 go to header word 3, bits 32 - 40 (n 72 ... 88) to bits 18 - 26 of the table word.
 static void ftq_vr_fill(uint8_t* const data, const size_t size, const int format, const int rows, const int cols, const int* const rates, const uint32_t table, const uint32_t table_crc, uint32_t seed)
 {
 	const int tile_rows = rows / 16, tiles = cols / 16;
 	memset(data, 0, size);
 	memcpy(data, "CCVFTQVR", 8);
-	uint32_t mask = 0;
+	uint64_t mask = 0;
 	int r;
 	for (r = 0; r < tile_rows; r++)
-		mask |= 1u << ((rates[r] - 8) / 2);
-	const uint32_t header[6] = { (uint32_t)rows, (uint32_t)cols, 16u * ccv_nnc_8i_rowwise_x_ftq_vr_rate(format), mask, table, table_crc };
+		mask |= (uint64_t)1 << ((rates[r] - 8) / 2);
+	const uint32_t header[6] = { (uint32_t)rows, (uint32_t)cols, 16u * ccv_nnc_8i_rowwise_x_ftq_vr_rate(format), (uint32_t)mask, table | (uint32_t)((mask >> 32) << 18), table_crc };
 	memcpy(data + 8, header, sizeof(header));
 	uint32_t* const off = (uint32_t*)(data + 32);
 	off[0] = 0;
@@ -1568,8 +1569,18 @@ TEST_CASE("ftq_vr enum block, sizes and the rate formula")
 {
 	REQUIRE_EQ(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16, 100, "FTQ_VR codec ids are 96 + (nm - 8) / 2");
 	REQUIRE_EQ(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64, 124, "FTQ_VR codec ids are 96 + (nm - 8) / 2");
+	// QuantStar's CCV_FTQ_VR_FORMAT_IDS: ftq_vr_n66 ... ftq_vr_n88 = 125 ... 136.
+	REQUIRE_EQ(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N66, 125, "FTQ_VR codec ids are 96 + (nm - 8) / 2");
+	REQUIRE_EQ(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88, 136, "FTQ_VR codec ids are 96 + (nm - 8) / 2");
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_vr_rate(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20), 20, "nm20");
-	REQUIRE(!ccv_nnc_8i_rowwise_x_is_ftq_vr(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST) && !ccv_nnc_8i_rowwise_x_is_ftq_vr(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64 + 1) && !ccv_nnc_8i_rowwise_x_is_ftq(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20), "only the open variable-rate codes");
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_vr_rate(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N66), 66, "nm66");
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_vr_rate(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88), 88, "nm88");
+	int code;
+	for (code = CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST; code <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_LAST; code++)
+		REQUIRE_EQ(ccv_nnc_8i_rowwise_x_is_ftq_vr(code), code >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && code <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88, "code %d is open exactly for nm 16 ... 88", code);
+	REQUIRE(!ccv_nnc_8i_rowwise_x_is_ftq_vr(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST) && !ccv_nnc_8i_rowwise_x_is_ftq_vr(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88 + 1) && !ccv_nnc_8i_rowwise_x_is_ftq(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20) && !ccv_nnc_8i_rowwise_x_is_ftq(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88), "only the open variable-rate codes");
+	// 48 x 512 at nm88: scale_offset = align128(32 + 16 + 3 * 32 * 2 * 88) = 16896 + 128 = 17024.
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88, CCV_16F, 48 * 512, 512), 17024 + 96, "nm88 blob size");
 	// 48 x 512: R = 3, C = 32, scale_offset = align128(32 + 16 + 3 * 32 * 2 * 20) = 3968.
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20, CCV_16F, 48 * 512, 512), 3968 + 96, "blob size");
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_data_size(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20, CCV_32F, 48 * 512, 512), 0, "FP16 only");
@@ -1585,10 +1596,11 @@ TEST_CASE("mps ftq_vr decode matches the reference on CPU, GPU int8 and fused GE
 	ccv_nnc_codebook_get(fold_slot, 0, &fold_crc);
 	// 1, 3, 13 and 17 tile rows; 1024 x 1024 has 2^16 row segments (one block per thread folded), 4096 x 4096 2^20 (two).
 	static const int shapes[][3] = { { 16, 256, 1 }, { 48, 256, 1 }, { 208, 768, 1 }, { 272, 512, 1 }, { 1024, 1024, 0 }, { 4096, 4096, 0 } };
-	static const int means[] = { 20, 32 };
+	// nm72 has the tile row rates 60 ... 84 (across 64), nm88 76 ... 88.
+	static const int means[] = { 20, 32, 72, 88 };
 	int s, m, folded;
 	for (s = 0; s < (int)(sizeof(shapes) / sizeof(shapes[0])); s++)
-		for (m = 0; m < 2; m++)
+		for (m = 0; m < (int)(sizeof(means) / sizeof(means[0])); m++)
 			for (folded = 0; folded < 2; folded++)
 			{
 				const int rows = shapes[s][0], cols = shapes[s][1], nm = means[m];
@@ -1621,12 +1633,13 @@ TEST_CASE("ftq_vr quantize round trip at r6a rates: CPU, GPU int8 and fused GEMV
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	static const int shapes[][2] = { { 16, 256 }, { 48, 512 }, { 208, 256 }, { 272, 256 } };
-	static const int means[] = { 20, 32 };
+	// nm66 has the tile row rates 54 ... 78 (across 64), nm88 76 ... 88.
+	static const int means[] = { 20, 32, 66, 88 };
 	// Upper bounds on sum (x - x_hat)^2 / sum x^2 per shape and mean rate (one tile row of 16 x 256 is all n = 8).
-	static const double bounds[4][2] = { { 0.46, 0.17 }, { 0.35, 0.13 }, { 0.26, 0.095 }, { 0.25, 0.093 } };
+	static const double bounds[4][4] = { { 0.46, 0.17, 0.014, 0.0081 }, { 0.35, 0.13, 0.0115, 0.0088 }, { 0.26, 0.095, 0.0105, 0.0085 }, { 0.25, 0.093, 0.010, 0.0085 } };
 	int s, m;
 	for (s = 0; s < 4; s++)
-		for (m = 0; m < 2; m++)
+		for (m = 0; m < 4; m++)
 		{
 			const int rows = shapes[s][0], cols = shapes[s][1], nm = means[m], count = rows * cols;
 			const int format = ftq_vr_format(nm);
@@ -1698,18 +1711,40 @@ TEST_CASE("ftq_vr quantize rejects rates outside the format")
 	static uint8_t output[count * 4];
 	const int format = ftq_vr_format(20);
 	const size_t size = ccv_nnc_8i_rowwise_x_data_size(format, CCV_16F, count, cols);
-	static const int bad[][3] = { { 20, 20, 21 }, { 6, 20, 20 }, { 66, 8, 8 }, { 24, 24, 20 } }; // odd, below 8, above 64, over budget
+	static const int bad[][3] = { { 20, 20, 21 }, { 6, 20, 20 }, { 66, 8, 8 }, { 24, 24, 20 } }; // odd, below 8, over budget twice
 	int i;
 	memset(output, 0xa5, sizeof(output));
 	for (i = 0; i < 4; i++)
 		REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x_ftq_vr(half, CCV_16F, CCV_TENSOR_CPU_MEMORY, count, cols, format, bad[i], output, size), 0, "rates %d must fail", i);
+	// Above 88 within the budget of nm88 (90 + 86 + 88 = 3 * 88).
+	const int format88 = ftq_vr_format(88);
+	const size_t size88 = ccv_nnc_8i_rowwise_x_data_size(format88, CCV_16F, count, cols);
+	REQUIRE(size88 <= sizeof(output), "the nm88 blob fits");
+	static const int above[3] = { 90, 86, 88 };
+	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x_ftq_vr(half, CCV_16F, CCV_TENSOR_CPU_MEMORY, count, cols, format88, above, output, size88), 0, "90 above 88 must fail");
 	static uint16_t big[112 * 256];
 	static const int levels[7] = { 8, 10, 12, 14, 16, 18, 20 }; // 7 levels
 	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x_ftq_vr(big, CCV_16F, CCV_TENSOR_CPU_MEMORY, 112 * 256, 256, format, levels, output, sizeof(output)), 0, "7 levels must fail");
+	// 7 levels above 64 (sum 504 within 7 * 78): the levels in the table word count too.
+	static const int high_levels[7] = { 66, 68, 70, 72, 74, 76, 78 };
+	REQUIRE(ccv_nnc_8i_rowwise_x_data_size(ftq_vr_format(78), CCV_16F, 112 * 256, 256) <= sizeof(output), "the nm78 blob fits");
+	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x_ftq_vr(big, CCV_16F, CCV_TENSOR_CPU_MEMORY, 112 * 256, 256, ftq_vr_format(78), high_levels, output, sizeof(output)), 0, "7 levels above 64 must fail");
 	for (i = 0; i < (int)sizeof(output); i++)
 		REQUIRE_EQ(output[i], 0xa5, "rejected calls leave the output untouched");
 	static const int ok[3] = { 8, 20, 32 };
 	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x_ftq_vr(half, CCV_16F, CCV_TENSOR_CPU_MEMORY, count, cols, format, ok, output, size), size, "8, 20, 32 quantizes");
+	// 88, 8 and 70 at nm 56 (sum 166 <= 168): n88 is bit 40, in bits 18 - 26 of the table word; n70 bit 31 of word 3.
+	const int format56 = ftq_vr_format(56);
+	const size_t size56 = ccv_nnc_8i_rowwise_x_data_size(format56, CCV_16F, count, cols);
+	static const int high[3] = { 88, 8, 70 };
+	REQUIRE_EQ(ccv_nnc_quantize_8i_rowwise_x_ftq_vr(half, CCV_16F, CCV_TENSOR_CPU_MEMORY, count, cols, format56, high, output, size56), size56, "88, 8, 70 quantizes");
+	uint32_t header[6];
+	memcpy(header, output + 8, sizeof(header));
+	REQUIRE_EQ(header[3], (1u << 0) | (1u << 31), "word 3 has n8 and n70");
+	REQUIRE_EQ(header[4], (9u << 8) | (1u << (18 + 8)), "the table word is the built-in table and n88 (bit 40) at bit 26");
+	uint64_t level_mask = 0;
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_vr_check(output, size56, format56, rows, cols, &level_mask), 0, "88, 8, 70 passes the checks");
+	REQUIRE_EQ(level_mask, ((uint64_t)1 << 0) | ((uint64_t)1 << 31) | ((uint64_t)1 << 40), "the check returns the 41-bit level mask");
 }
 
 // Each rule of CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 broken once: the checkpoint fails to load and the CPU decode returns -1.
@@ -1774,6 +1809,99 @@ TEST_CASE("an ftq_vr checkpoint loads only when every rule of the format holds")
 			REQUIRE(result != CCV_IO_FINAL, "%s fails to load", names[c]);
 	}
 	sqlite3_close(db);
+}
+
+// Levels above 64 (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16): n66 ... n70 are bits 29 - 31 of word 3, n72 ... n88 bits 18 - 26
+// of the table word; bits 27 - 31 of the table word are zero. Each blob is checked, decoded on the CPU and written and
+// read back as a checkpoint (the loader reads the table word for the fold bits).
+TEST_CASE("an ftq_vr checkpoint above 64 keeps its high levels in the table word and loads only when they hold")
+{
+	// nm80, R = 3, C = 16: the budget is 3 * 80.
+	enum { rows = 48, cols = 256, tile_rows = 3, tiles = 16 };
+	const int format = ftq_vr_format(80);
+	static const int high[tile_rows] = { 72, 88, 80 }; // bits 32, 40, 36: all in the table word
+	static const int split[tile_rows] = { 66, 70, 88 }; // bits 29, 31 in word 3, 40 in the table word
+	sqlite3* db = 0;
+	REQUIRE_EQ(sqlite3_open(":memory:", &db), SQLITE_OK, "in-memory database opens");
+	enum {
+		VALID_HIGH, VALID_SPLIT, HIGH_BIT_CLEARED, LOW_BIT_CLEARED, FIELD_BIT_27, FIELD_BIT_31, SEVEN_LEVELS_HIGH, HIGH_AS_LOW, CASES
+	};
+	static const char* const names[CASES] = {
+		"n72, n88, n80", "n66, n70, n88", "n88's bit cleared", "n66's bit cleared", "table word bit 27 (n90)",
+		"table word bit 31", "7 levels with the table word", "n88 as bit 8 of word 3 only",
+	};
+	int c;
+	for (c = 0; c < CASES; c++)
+	{
+		ccv_nnc_tensor_t* const t = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), format), 0);
+		const size_t size = ccv_nnc_tensor_data_size_without_padding(t->info);
+		const int* const rates = (c == VALID_SPLIT || c == LOW_BIT_CLEARED) ? split : high;
+		ftq_vr_fill(t->data.u8, size, format, rows, cols, rates, ftq_builtin_table, 0, 0x88a0u + c);
+		uint8_t* const d = t->data.u8;
+		uint32_t* const header = (uint32_t*)(d + 8);
+		switch (c)
+		{
+			case HIGH_BIT_CLEARED: header[4] &= ~(1u << (18 + 8)); break;
+			case LOW_BIT_CLEARED: header[3] &= ~(1u << 29); break;
+			case FIELD_BIT_27: header[4] |= 1u << 27; break;
+			case FIELD_BIT_31: header[4] |= 1u << 31; break;
+			case SEVEN_LEVELS_HIGH: header[4] |= 0xfu << 19; header[3] |= 1u; break; // n72 ... n80, n88 and n8: 7 levels
+			case HIGH_AS_LOW: header[4] &= ~(1u << (18 + 8)); header[3] |= 1u << 8; break; // the level of n24 instead
+		}
+		uint64_t level_mask = 0;
+		const int valid = c == VALID_HIGH || c == VALID_SPLIT;
+		REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_vr_check(d, size, format, rows, cols, &level_mask), valid ? 0 : -1, "%s: check", names[c]);
+		if (c == VALID_HIGH)
+			REQUIRE_EQ(level_mask, ((uint64_t)1 << 32) | ((uint64_t)1 << 36) | ((uint64_t)1 << 40), "%s: the level mask", names[c]);
+		if (c == VALID_SPLIT)
+			REQUIRE_EQ(level_mask, ((uint64_t)1 << 29) | ((uint64_t)1 << 31) | ((uint64_t)1 << 40), "%s: the level mask", names[c]);
+		int8_t* const q8 = (int8_t*)ccmalloc((size_t)rows * cols);
+		ftq_vr_ref_decode(d, rows, cols, ccv_nnc_trellis_builtin_table, 0, q8);
+		uint16_t* const out = (uint16_t*)ccmalloc(sizeof(uint16_t) * rows * cols);
+		REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(d, CCV_16F, CCV_TENSOR_CPU_MEMORY, size, cols, format, out, (size_t)rows * cols), valid ? 0 : -1, "%s: CPU decode", names[c]);
+		if (valid)
+		{
+			float scales[rows];
+			ccv_half_precision_to_float((uint16_t*)(d + size - 2 * rows), scales, rows);
+			size_t k, mismatches = 0;
+			for (k = 0; k < (size_t)rows * cols; k++)
+			{
+				const float v = (float)q8[k] * scales[k / cols];
+				uint16_t e;
+				ccv_float_to_half_precision(&v, &e, 1);
+				mismatches += out[k] != e;
+			}
+			REQUIRE_EQ((int)mismatches, 0, "%s: CPU decode is the reference", names[c]);
+		}
+		ccfree(out);
+		ccfree(q8);
+		char name[32];
+		snprintf(name, sizeof(name), "h%d", c);
+		REQUIRE_EQ(ccv_nnc_tensor_write(t, db, name, 0), CCV_IO_FINAL, "%s writes", names[c]);
+		ccv_nnc_tensor_t* restored = 0;
+		const int result = ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored);
+		if (valid)
+		{
+			REQUIRE_EQ(result, CCV_IO_FINAL, "%s loads", names[c]);
+			REQUIRE_EQ(restored->info.reserved, format, "%s keeps its format", names[c]);
+			REQUIRE_EQ(memcmp(restored->data.u8, d, size), 0, "%s reads back byte for byte", names[c]);
+			ccv_nnc_tensor_free(restored);
+		} else
+			REQUIRE(result != CCV_IO_FINAL, "%s fails to load", names[c]);
+		ccv_nnc_tensor_free(t);
+	}
+	sqlite3_close(db);
+	// Static-rate FTQ keeps bits 18 - 31 of its table word zero: an n88 CCVFTQSR blob with bit 18 set is rejected.
+	const int sr = ftq_format(88);
+	ccv_nnc_tensor_t* const s = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), sr), 0);
+	const size_t ssize = ccv_nnc_tensor_data_size_without_padding(s->info);
+	ftq_fill(s->data.u8, ssize, sr, rows, cols, ftq_builtin_table, 0, 0x88afu);
+	uint16_t* const out = (uint16_t*)ccmalloc(sizeof(uint16_t) * rows * cols);
+	REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(s->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, ssize, cols, sr, out, (size_t)rows * cols), 0, "the static-rate n88 blob decodes");
+	((uint32_t*)(s->data.u8 + 8))[4] |= 1u << 18;
+	REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(s->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, ssize, cols, sr, out, (size_t)rows * cols), -1, "with table word bit 18 it is rejected");
+	ccfree(out);
+	ccv_nnc_tensor_free(s);
 }
 
 // A folded-table blob (slot with CCV_NNC_CODEBOOK_FOLD, table field 1 | 9 << 8 | 1 << 16) at rate n against the explicit
@@ -2278,6 +2406,96 @@ TEST_CASE("mps ftq_vr is exact at K % 16 on int8 decode, fused gemv and gemm, wi
 	ccfree(base);
 	if (cpu_skipped)
 		printf("[ftq_vr k16] the CPU codec does not take K %% 16 yet: %d CPU decodes and container checks skipped\n", cpu_skipped);
+}
+
+// Tile rows above 64 in variable-rate FTQ: every pattern repeats over the tile rows (prefix sums stay within nm), with
+// the built-in and a folded table, on shapes with 1, 3, 13 and 17 tile rows, an odd and a K % 16 tile count (the generic
+// VR thread map) and 2^16 row segments; CPU decode, GPU int8 codes, the one-hot fused GEMV (M = 1 .. 3) and, with the
+// built-in table, the GEMM from 4 rows (int8 decode then A8) against the GEMM on the reference codes, all bit for bit.
+TEST_CASE("mps ftq_vr is exact with tile rows above 64: n66 - n88 alone and mixed with rates up to 64")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	int8_t* const base = ftq_fold_base_new(0x7a88u);
+	const int fold_slot = ccv_nnc_codebook_register_with_flags(base, 512, CCV_NNC_CODEBOOK_FOLD);
+	REQUIRE(fold_slot >= 1, "folded table registers");
+	uint32_t fold_crc = 0;
+	ccv_nnc_codebook_get(fold_slot, 0, &fold_crc);
+	// nm, pattern length, pattern.
+	static const int patterns[][8] = {
+		{ 66, 1, 66 }, { 72, 1, 72 }, { 80, 1, 80 }, { 88, 1, 88 },
+		{ 68, 2, 48, 88 }, // across 64
+		{ 72, 3, 72, 88, 56 },
+		{ 64, 6, 8, 88, 64, 70, 66, 88 }, // n8, n64 and n66, n70 (word 3) and n88 (table word)
+		{ 78, 6, 66, 70, 72, 80, 84, 88 }, // six levels above 64, under budget
+		{ 20, 2, 8, 32 }, // a low mean rate next to the high ones (same kernels as before)
+	};
+	// (rows, cols, gemv, gemm).
+	static const int shapes[][4] = {
+		{ 16, 256, 1, 1 }, { 48, 512, 1, 1 }, { 208, 768, 1, 0 }, { 272, 272, 1, 1 }, { 48, 784, 1, 0 }, { 1024, 1024, 0, 0 },
+	};
+	int p, s, folded, cpu_skipped = 0, checked = 0;
+	for (p = 0; p < (int)(sizeof(patterns) / sizeof(patterns[0])); p++)
+		for (s = 0; s < (int)(sizeof(shapes) / sizeof(shapes[0])); s++)
+			for (folded = 0; folded < 2; folded++)
+			{
+				const int rows = shapes[s][0], cols = shapes[s][1], nm = patterns[p][0], length = patterns[p][1];
+				const int tile_rows = rows / 16;
+				int* const rates = (int*)ccmalloc(sizeof(int) * tile_rows);
+				int r, sum = 0;
+				for (r = 0; r < tile_rows; r++)
+					sum += rates[r] = patterns[p][2 + r % length];
+				// A partial last period may go over the budget: those rows take nm instead.
+				for (r = tile_rows - 1; r >= 0 && sum > tile_rows * nm; r--)
+					if (rates[r] > nm)
+						sum -= rates[r] - nm, rates[r] = nm;
+				const int format = ftq_vr_format(nm) | ((folded ? fold_slot : 0) << CCV_NNC_CODEBOOK_SLOT_SHIFT);
+				ccv_nnc_tensor_t* const hq = ccv_nnc_tensor_new(0, ftq_x_params(CCV_TENSOR_CPU_MEMORY, rows, cols, format), 0);
+				ccv_nnc_tensor_t* const gq = ccv_nnc_tensor_new(0, ftq_x_params(CCV_TENSOR_GPU_MEMORY, rows, cols, format), 0);
+				const size_t size = ftq_k16_size(format, rows, cols);
+				REQUIRE(ccv_nnc_tensor_data_size_without_padding(hq->info) >= size, "FTQ_VR %dx%d nm%d: the tensor holds the tile grid", rows, cols, nm);
+				ftq_vr_fill(hq->data.u8, size, format, rows, cols, rates, folded ? 1u | (9u << 8) | (1u << 16) : ftq_builtin_table, folded ? fold_crc : 0, 0x7a88u + p * 32 + s * 2 + folded);
+				if (ftq_k16_cpu_takes(format, rows, cols))
+				{
+					REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_vr_check(hq->data.u8, size, format, rows, cols, 0), 0, "pattern %d %dx%d: the filled blob passes the checks", p, rows, cols);
+				}
+				int8_t* const q8 = (int8_t*)ccmalloc((size_t)rows * cols);
+				ftq_vr_ref_decode(hq->data.u8, rows, cols, folded ? base : ccv_nnc_trellis_builtin_table, folded, q8);
+				char what[128];
+				snprintf(what, sizeof(what), "FTQ_VR pattern %d %dx%d nm%d fold %d", p, rows, cols, nm, folded);
+				REQUIRE_EQ(ftq_k16_checks(hq, gq, format, q8, rows, cols, shapes[s][2], shapes[s][3] && !folded, &cpu_skipped, what), 0, "%s decodes bit for bit", what);
+				checked++;
+				ccfree(q8);
+				ccfree(rates);
+				ccv_nnc_tensor_free(gq);
+				ccv_nnc_tensor_free(hq);
+			}
+	// The pipelines are keyed by the whole 41-bit mask: {n48, n88} and then {n48, n72} (the same word 3, a different
+	// table word) at the same format and shape each get their own kernel.
+	{
+		enum { rows = 64, cols = 512 };
+		static const int a[4] = { 48, 88, 48, 88 }, b[4] = { 48, 72, 48, 72 };
+		const int* const sets[3] = { a, b, a };
+		const int format = ftq_vr_format(68);
+		int i;
+		for (i = 0; i < 3; i++)
+		{
+			ccv_nnc_tensor_t* const hq = ccv_nnc_tensor_new(0, ftq_x_params(CCV_TENSOR_CPU_MEMORY, rows, cols, format), 0);
+			ccv_nnc_tensor_t* const gq = ccv_nnc_tensor_new(0, ftq_x_params(CCV_TENSOR_GPU_MEMORY, rows, cols, format), 0);
+			const size_t size = ftq_k16_size(format, rows, cols);
+			ftq_vr_fill(hq->data.u8, size, format, rows, cols, sets[i], ftq_builtin_table, 0, 0x7a8fu + i);
+			REQUIRE_EQ(((uint32_t*)(hq->data.u8 + 8))[3], 1u << 20, "word 3 is n48 only");
+			int8_t* const q8 = (int8_t*)ccmalloc((size_t)rows * cols);
+			ftq_vr_ref_decode(hq->data.u8, rows, cols, ccv_nnc_trellis_builtin_table, 0, q8);
+			char what[128];
+			snprintf(what, sizeof(what), "FTQ_VR n48 + n%d after the other", sets[i][1]);
+			REQUIRE_EQ(ftq_k16_checks(hq, gq, format, q8, rows, cols, 1, 1, &cpu_skipped, what), 0, "%s decodes bit for bit", what);
+			ccfree(q8);
+			ccv_nnc_tensor_free(gq);
+			ccv_nnc_tensor_free(hq);
+		}
+	}
+	printf("\n\t%d high-rate FTQ_VR blobs, %d CPU decodes skipped (K %% 16)", checked, cpu_skipped);
+	ccfree(base);
 }
 
 #endif

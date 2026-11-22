@@ -38,7 +38,7 @@ bool is_ftq(const uint32_t format) noexcept
 bool is_ftq_vr(const uint32_t format) noexcept
 {
   const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
-  return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64;
+  return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88;
 }
 
 }
@@ -92,11 +92,14 @@ void ccv_nnc_mfa_encode_scaled_gemv(ccv_nnc_mfa_context_t* context, ccv_nnc_mfa_
   descriptor.vectorRowStride = vectorRowStride;
   descriptor.outputRowStride = outputRowStride;
   if (is_ftq_vr(params.format)) {
-    // The kernel switches over the blob's level mask (header word 3), read from the shared buffer: the pipeline is keyed
-    // by it.
+    // The kernel switches over the blob's level mask (header words 3 and 4), read from the shared buffer: the pipeline is
+    // keyed by it.
     const uint8_t* const blob = static_cast<const uint8_t*>(tensors[0]->contents());
     CCV_NNC_MFA_PRECONDITION(blob != nullptr && batchDimension == 1);
-    memcpy(&descriptor.levelMask, blob + tensor_offsets[0] + 20, sizeof(uint32_t));
+    // Bits 32 - 40 of the mask (n 72 ... 88) are bits 18 - 26 of the table word (header word 4).
+    uint32_t words[2];
+    memcpy(words, blob + tensor_offsets[0] + 20, sizeof(words));
+    descriptor.levelMask = (uint64_t)words[0] | ((uint64_t)(words[1] >> 18) << 32);
   }
   if (batchDimension > 1) {
     descriptor.batchStrides = simd::uint4 {

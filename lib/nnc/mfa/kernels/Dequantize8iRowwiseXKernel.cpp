@@ -906,7 +906,7 @@ kernel void dequantize_8i_rowwise_x_selected_plan(
 static bool is_ftq_vr(const uint32_t format)
 {
 	const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
-	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88;
 }
 
 // The words of one row segment of a tile at the compile-time rate N: the same reads and windows as the static-rate
@@ -960,7 +960,7 @@ static std::string ftq_segment_decode_source(const uint32_t n)
 // `generic` (ftq_vr_generic_blocks: tiles_per_row % (2 T) != 0) strides G = ceil(floor(tiles_per_row / 2) / T) blocks,
 // skips the block indices past the row, and gives the last tile of an odd row to 16 threads of its own, one row each
 // (ftq_vr_threads_per_tile_row threads per tile row); without it the source is the original one.
-static std::string create_ftq_vr_source(const uint32_t level_mask, const uint32_t index_shift, const bool fold, const bool generic)
+static std::string create_ftq_vr_source(const uint64_t level_mask, const uint32_t index_shift, const bool fold, const bool generic)
 {
 	std::string shader = R"(
 #include <metal_stdlib>
@@ -1030,8 +1030,8 @@ kernel void dequantize_8i_rowwise_x(
 		"          continue;\n" :
 		"        const uint tc = ((group + j * block_stride) << 1) | (lane & 1u);\n";
 	uint32_t i;
-	for (i = 0; i < 29; i++)
-		if (level_mask & (1u << i))
+	for (i = 0; i <= 40; i++) // n = 8 ... 88.
+		if ((level_mask >> i) & 1)
 		{
 			const uint32_t n = 8 + 2 * i;
 			shader += "    case " + std::to_string(n / 2) + "u: {\n" + ftq_segment_source(n) +

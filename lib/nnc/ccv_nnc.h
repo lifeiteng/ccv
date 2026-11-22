@@ -1247,14 +1247,16 @@ enum {
 	CCV_NNC_QX_8I_ROWWISE_FTQ_N88,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_LAST = CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST + 63,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST = CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_LAST + 1,
-	/* Variable-rate FTQ (VR: variable rate), CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N64, mean rate
+	/* Variable-rate FTQ (VR: variable rate), CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N88, mean rate
 	 * nm = 8 + 2 (format - FTQ_VR_BLOCK_FIRST), so FTQ_VR_N<nm>. FP16 tensors only, rows % 16 == 0, cols % 16 == 0.
 	 * R = rows / 16 tile rows of C = cols / 16 tiles. Blob (little endian):
 	 *   [0, 8)    magic "CCVFTQVR"
 	 *   [8, 32)   uint32 rows, cols, 16 * nm, level_mask, table, table_crc
-	 *             level_mask: bit i set when rate n = 8 + 2 i (8 ... 64) occurs; at most 6 bits set.
-	 *             table, table_crc: as in static-rate FTQ (id bits 0 - 7, log2 pairs 8 - 15, structure 16 - 17;
-	 *             crc32, 0 for id 0).
+	 *             The 41-bit level mask: bit i set when rate n = 8 + 2 i (8 ... 88) occurs; at most 6 bits set. Bits
+	 *             0 - 31 (n 8 ... 70) are the level_mask word, bits 32 - 40 (n 72 ... 88) bits 18 - 26 of the table
+	 *             word (QuantStar's split_level_mask); bits 27 - 31 of the table word are zero.
+	 *             table (bits 0 - 17), table_crc: as in static-rate FTQ (id bits 0 - 7, log2 pairs 8 - 15, structure
+	 *             16 - 17; crc32, 0 for id 0).
 	 *   [32, 32 + 4 (R + 1))  uint32 off[R + 1], word offsets from the code start, off[0] = 0, non-decreasing.
 	 *   code      starts at word 8 + R + 1; tile row r is words off[r] .. off[r + 1] and holds C tiles of 16 n_r bits
 	 *             each, n_r = 2 (off[r + 1] - off[r]) / C, so every tile starts on a word; inside a tile it is
@@ -1291,6 +1293,20 @@ enum {
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N60,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N62,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N64,
+	/* Mean rates above 4 bpw (nm = 66 .. 88), the same format; this fork only, not upstream. Any tile row of any mean
+	 * rate may take n_r up to 88 (tiles up to 1408 bits), as static-rate FTQ_N66 .. N88. */
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N66,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N68,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N70,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N72,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N74,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N76,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N78,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N80,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N82,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N84,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N86,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N88,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_LAST = CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST + 63,
 };
 
@@ -1393,9 +1409,9 @@ CCV_WARN_UNUSED(size_t) ccv_nnc_8i_rowwise_x_data_size(const int format, const i
  */
 CCV_WARN_UNUSED(size_t) ccv_nnc_quantize_8i_rowwise_x(const void* input, const int datatype, const int memory_type, const size_t input_length, const size_t row_length, const int format, const float* const imatrix, const size_t imatrix_length, const float* const hessian, const size_t hessian_length, void* output, const size_t output_length);
 /**
- * Quantize FP16 weights into variable-rate FTQ (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N64), fitted as
+ * Quantize FP16 weights into variable-rate FTQ (CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N88), fitted as
  * ccv_nnc_quantize_8i_rowwise_x fits static-rate FTQ, with the built-in table.
- * @param rates The rate n_r of each tile row (rows / 16 of them): even, 8 ... 64, at most 6 distinct values and
+ * @param rates The rate n_r of each tile row (rows / 16 of them): even, 8 ... 88, at most 6 distinct values and
  * sum n_r <= (rows / 16) nm. 0 gives every tile row the mean rate nm of the format.
  * @return The blob size, or 0 without writing output for invalid rates, shape or insufficient output space.
  */

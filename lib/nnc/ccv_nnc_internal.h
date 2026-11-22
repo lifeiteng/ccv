@@ -17,9 +17,10 @@
 void ccv_nnc_drain_autotune_cache(void);
 /**
  * Check a variable-rate FTQ blob of length bytes for a row_count x row_length tensor of format (its codebook slot
- * included) against every rule of CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16. Returns 0 and the level mask, or -1.
+ * included) against every rule of CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16. Returns 0 and the 41-bit level mask (bit i is rate
+ * 8 + 2 i, bits 32 - 40 from the table word), or -1.
  */
-int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length, uint32_t* const level_mask_out);
+int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length, uint64_t* const level_mask_out);
 
 // Define some internal constraints
 

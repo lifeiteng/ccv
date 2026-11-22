@@ -2369,21 +2369,21 @@ static size_t _ccv_nnc_quantize_8i_rowwise_x_trellis(const void* input, const in
 	const size_t tile_rows = row_count / CCV_NNC_8I_ROWWISE_TRELLIS_TILE;
 	const size_t strips = row_length / CCV_NNC_8I_ROWWISE_TRELLIS_TILE;
 	const int n = ftq ? ccv_nnc_8i_rowwise_x_ftq_rate(format) : vr ? ccv_nnc_8i_rowwise_x_ftq_vr_rate(format) : ccv_nnc_8i_rowwise_x_tmcq_rate(format);
-	uint32_t level_mask = 0;
+	uint64_t level_mask = 0;
 	if (vr)
 	{
-		// Every rate even in 8 .. 64, at most 6 of them, and the code within the R C 2 nm byte budget.
+		// Every rate even in 8 .. 88, at most 6 of them, and the code within the R C 2 nm byte budget.
 		uint64_t total = 0;
 		size_t r;
 		for (r = 0; r < tile_rows; r++)
 		{
 			const int nr = rates ? rates[r] : n;
-			if (nr < 8 || nr > 64 || (nr & 1))
+			if (nr < 8 || nr > 88 || (nr & 1))
 				return 0;
-			level_mask |= 1u << ((nr - 8) / 2);
+			level_mask |= (uint64_t)1 << ((nr - 8) / 2);
 			total += (uint64_t)nr;
 		}
-		if (__builtin_popcount(level_mask) > 6 || total > (uint64_t)tile_rows * n)
+		if (__builtin_popcountll(level_mask) > 6 || total > (uint64_t)tile_rows * n)
 			return 0;
 	}
 	const size_t scale_offset = _ccv_nnc_8i_rowwise_packed_scale_offset(format, input_length, row_length);
@@ -2396,7 +2396,9 @@ static size_t _ccv_nnc_quantize_8i_rowwise_x_trellis(const void* input, const in
 	uint32_t* offsets = 0;
 	if (ftq || vr)
 	{
-		const uint32_t header[6] = { (uint32_t)row_count, (uint32_t)row_length, (uint32_t)(16 * n), vr ? level_mask : 0, 9u << 8, 0 };
+		// Bits 32 - 40 of the level mask (n 72 ... 88) go to bits 18 - 26 of the table word, see
+		// CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16.
+		const uint32_t header[6] = { (uint32_t)row_count, (uint32_t)row_length, (uint32_t)(16 * n), (uint32_t)level_mask, (9u << 8) | (uint32_t)((level_mask >> 32) << 18), 0 };
 		memcpy(u8, vr ? "CCVFTQVR" : "CCVFTQSR", 8);
 		memcpy(u8 + 8, header, sizeof(header));
 	}
@@ -3002,7 +3004,19 @@ static const int8_t* _ccv_nnc_8i_rowwise_ftq_table(const int slot, const uint32_
 	return table;
 }
 
-int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length, uint32_t* const level_mask_out)
+// The CCVFTQVR level mask of header words 3 (bits 0 - 31) and 4 (bits 18 - 31 as bits 32 - 45; a valid blob uses up to
+// bit 40, n = 88) and the table field without those bits, see CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16.
+static inline uint64_t _ccv_nnc_8i_rowwise_ftq_vr_level_mask(const uint32_t* const header)
+{
+	return (uint64_t)header[3] | ((uint64_t)(header[4] >> 18) << 32);
+}
+
+static inline uint32_t _ccv_nnc_8i_rowwise_ftq_vr_table_field(const uint32_t* const header)
+{
+	return header[4] & 0x3ffffu;
+}
+
+int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length, uint64_t* const level_mask_out)
 {
 	if (!ccv_nnc_8i_rowwise_x_is_ftq_vr(format) || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length == 0 || row_length % 16 != 0 || row_count == 0 || row_count % 16 != 0 || row_count > UINT32_MAX || row_length > UINT32_MAX)
 		return -1;
@@ -3018,12 +3032,12 @@ int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t lengt
 	memcpy(header, u8 + 8, sizeof(header));
 	if (header[0] != row_count || header[1] != row_length || header[2] != 16 * nm)
 		return -1;
-	const uint32_t level_mask = header[3];
-	// Levels are n = 8 + 2 i for i = 0 .. 28 (n 8 ... 64); at most 6 of them.
-	if ((level_mask >> 29) != 0 || __builtin_popcount(level_mask) > 6)
+	const uint64_t level_mask = _ccv_nnc_8i_rowwise_ftq_vr_level_mask(header);
+	// Levels are n = 8 + 2 i for i = 0 .. 40 (n 8 ... 88); at most 6 of them.
+	if ((level_mask >> 41) != 0 || __builtin_popcountll(level_mask) > 6)
 		return -1;
 	int shift;
-	if (!_ccv_nnc_8i_rowwise_ftq_table(ccv_nnc_codebook_slot_of(format), header[4], header[5], &shift))
+	if (!_ccv_nnc_8i_rowwise_ftq_table(ccv_nnc_codebook_slot_of(format), _ccv_nnc_8i_rowwise_ftq_vr_table_field(header), header[5], &shift))
 		return -1;
 	uint32_t previous;
 	memcpy(&previous, u8 + 32, 4);
@@ -3038,7 +3052,7 @@ int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t lengt
 		if (next < previous || (next - previous) % tiles != 0)
 			return -1;
 		const uint64_t nr = 2 * (uint64_t)(next - previous) / tiles;
-		if (nr < 8 || nr > 64 || !(level_mask & (1u << ((nr - 8) / 2))))
+		if (nr < 8 || nr > 88 || !(level_mask & ((uint64_t)1 << ((nr - 8) / 2))))
 			return -1;
 		previous = next;
 	}
@@ -3152,7 +3166,9 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 		uint32_t header[6];
 		memcpy(header, u8 + 8, sizeof(header));
 		int shift;
-		const int8_t* const table = _ccv_nnc_8i_rowwise_ftq_table(ccv_nnc_codebook_slot_of(format), header[4], header[5], &shift);
+		const int8_t* const table = _ccv_nnc_8i_rowwise_ftq_table(ccv_nnc_codebook_slot_of(format), _ccv_nnc_8i_rowwise_ftq_vr_table_field(header), header[5], &shift);
+		if (!table)
+			return -1;
 		const size_t tile_rows = row_count / 16;
 		const size_t strips = row_length / 16;
 		// Tile tc of tile row r: 16 n_r bits from word off[r] + tc n_r / 2 of the code, which starts at word 8 + R + 1;
