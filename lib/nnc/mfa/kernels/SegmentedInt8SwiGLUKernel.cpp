@@ -1460,13 +1460,14 @@ static uint32_t ftqSwiGLURate(const uint32_t format)
   return 8 + 2 * (codec - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST);
 }
 
-// Static-rate FTQ routes, gate and up of one route in one pass, laid out exactly as the segmented FTQ GEMV
-// (append_ftq_m1_kernel in SegmentedInt8GemvKernel.cpp): one threadgroup of four SIMD groups per 16-row tile row of the
-// routed expert, its 8 half SIMD groups streaming over the tile columns and lane r = tiisg & 15 taking row r of each
-// tile, with the same windows, half2 table copy and lookups. Every lane decodes the gate and the up tile of its stream
-// and both dot products share its activation loads; each sum takes the GEMV's order (per-stream accumulation, the
-// xor-16 pair, then the four SIMD groups' partials in order) and its FP16 row scale, so gate and up are the two GEMVs'
-// float values before their outputs round to the io type. The SwiGLU epilogue is the other formats'. The weights are
+// Static-rate FTQ routes, gate and up of one route in one pass, laid out as the segmented FTQ GEMV
+// (append_ftq_m1_kernel in SegmentedInt8GemvKernel.cpp) with twice its K split: one threadgroup of
+// kSegmentedInt8SwiGLUFTQSIMDGroups SIMD groups per 16-row tile row of the routed expert, its half SIMD groups streaming
+// over the tile columns and lane r = tiisg & 15 taking row r of each tile, with the same windows, half2 table copy and
+// lookups. Every lane decodes the gate and the up tile of its stream
+// and both dot products share its activation loads; each sum accumulates per stream, adds the xor-16 pair, then the
+// SIMD groups' partials in order, and takes its FP16 row scale. The wider split sums in another order than the GEMV,
+// so gate and up match the two GEMVs' float values to rounding, not bit for bit. The SwiGLU epilogue is the other formats'. The weights are
 // CCVFTQSR blobs of expert_count experts: tiles after the 32-byte header, expert e's from e weight_expert_stride bytes,
 // and FP16 row scales (buffers 4 and 5) whatever the activation type. An external table arrives half2 at buffer(15).
 static std::string buildFTQShader(
@@ -1502,7 +1503,7 @@ using namespace metal;
   shader += ccv_nnc_mfa_tmcq_decode_source();
   shader += ccv_nnc_mfa_tmcq_w1_helpers;
   shader += ccv_nnc_mfa_ftq_w1_source(log2 ? log2 : 9, fold);
-  shader += "constant constexpr uint S = 4;\n";
+  shader += "constant constexpr uint S = " + std::to_string(kSegmentedInt8SwiGLUFTQSIMDGroups) + ";\n";
   shader += R"(
 inline float stable_sigmoid(const float value)
 {
@@ -1590,10 +1591,7 @@ kernel void segmented_int8_swiglu(
 )";
   const std::string codes[2] = { "gate_code", "up_code" };
   const std::string q[2] = { "qg", "qu" };
-  // The GEMV's per-tile statement for each weight, word for word as in append_ftq_m1_kernel (SegmentedInt8GemvKernel.cpp):
-  // fast-math lets the compiler shape the dot products and their sum, and with the activations taken into local float4s
-  // first it shaped them differently (up to 1692 ulp apart on M5 Ultra). Keep the two texts the same so that the sums
-  // compile alike; "mps ftq packed segmented swiglu equals two segmented ftq gemvs and the swiglu bit for bit" checks it.
+  // The GEMV's per-tile statement for each weight, as in append_ftq_m1_kernel (SegmentedInt8GemvKernel.cpp).
   shader += ccv_nnc_mfa_ftq_w1_rate_pair_source(rate, codes, q,
     "    gate_acc += dot(qg[0], float4(y4[tc * 4u + 0u])) + dot(qg[1], float4(y4[tc * 4u + 1u])) + dot(qg[2], float4(y4[tc * 4u + 2u])) + dot(qg[3], float4(y4[tc * 4u + 3u]));\n"
     "    up_acc += dot(qu[0], float4(y4[tc * 4u + 0u])) + dot(qu[1], float4(y4[tc * 4u + 1u])) + dot(qu[2], float4(y4[tc * 4u + 2u])) + dot(qu[3], float4(y4[tc * 4u + 3u]));\n");
