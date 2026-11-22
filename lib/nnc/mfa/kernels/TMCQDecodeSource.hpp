@@ -257,6 +257,15 @@ static inline std::string ccv_nnc_mfa_ftq_w3_source(const uint32_t log2Entries, 
   shader += "#define FTQ_W3_ENTRIES " + std::to_string(1u << log2Entries) + "u\n";
   shader += std::string("#define FTQ_W3_FOLD ") + (fold ? "1" : "0") + "\n";
   shader += R"(
+// The 32 bits of the little-endian pair (lo, hi) from bit o (0 <= o < 32) as one 64-bit shift. A row's bit offset mod
+// 32 varies with the row unless 32 divides n. With such a varying offset above rate 32 this form took less time than
+// tmcq_funnel's two 32-bit shifts on M5 Ultra (the fused GEMM, n34 - n56: 2 - 16%), but more at n24 (4%) and, with the
+// constant offset, at n64 (1 - 3%), so ftq_w3_decode_row16_words picks it by that rule.
+inline uint ftq_w3_funnel(uint lo, uint hi, uint o)
+{
+  return uint(as_type<ulong>(uint2(lo, hi)) >> o);
+}
+
 // The packed pair of a 16-bit state. FTQ_W3_FOLD: base pair (h >> 16) & 511, each int8 negated by bit 15 / 31 of h,
 // the expression of the selected-expert decode's ftq_fold_lookup.
 inline uint ftq_w3_pair(threadgroup const ushort* table, uint state)
@@ -271,8 +280,10 @@ inline uint ftq_w3_pair(threadgroup const ushort* table, uint state)
 }
 
 // Row r of a rate N tile whose n / 2 words start at `tile`: its windows start at bit r N + floor(N / 8) - 16, row 0's
-// before the tile, wrapping to its end; the three (N <= 48) or four words from there are taken mod N / 2, as
-// ftq_store_segment reads them. Window i is at offset floor((i + 1) N / 8) - floor(N / 8) of the funnelled bits.
+// before the tile, wrapping to its end, and the words from there are taken mod N / 2, as ftq_store_segment reads them.
+// Window i is at offset floor((i + 1) N / 8) - floor(N / 8) of the funnelled bits, so the windows span
+// N - floor(N / 8) + 16 bits: from bit offset sh <= 31 that is within three words up to N = 56 (ftq_store_segment reads a
+// fourth from N = 50, whose bits no window uses there) and four words from N = 58.
 template <uint N>
 inline uint4 ftq_w3_decode_row16_words(device const uint* tile, uint r, threadgroup const ushort* table)
 {
@@ -283,12 +294,14 @@ inline uint4 ftq_w3_decode_row16_words(device const uint* tile, uint r, threadgr
   const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;
   const uint sh = lane_bit & 31u;
   const uint w0 = tile[o0], w1 = tile[o1], w2 = tile[o2];
+  constexpr bool wide_funnel = N > 32u && (N % 32u) != 0u;
   uint f[3];
-  f[0] = tmcq_funnel(w0, w1, sh);
-  f[1] = tmcq_funnel(w1, w2, sh);
+  f[0] = wide_funnel ? ftq_w3_funnel(w0, w1, sh) : tmcq_funnel(w0, w1, sh);
+  f[1] = wide_funnel ? ftq_w3_funnel(w1, w2, sh) : tmcq_funnel(w1, w2, sh);
   if (N > 48u) {
-    const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;
-    f[2] = tmcq_funnel(w2, tile[o3], sh);
+    // Bits of f[2] past the windows' end are never read, so up to N = 56 the fourth word may as well be 0.
+    const uint w3 = 31u + N - (N >> 3) + 16u > 96u ? tile[o2 + 1u == W ? 0u : o2 + 1u] : 0u;
+    f[2] = wide_funnel ? ftq_w3_funnel(w2, w3, sh) : tmcq_funnel(w2, w3, sh);
   } else
     f[2] = 0;
   uint t[8];
