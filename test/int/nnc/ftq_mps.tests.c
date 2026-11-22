@@ -123,13 +123,17 @@ static const uint32_t ftq_builtin_table = 9u << 8; // id 0 (the built-in table),
 
 // (rows, cols, n): small grids (32 x 256 n16, 272 x 256 n16, a single tile row 16 x 256 n16 and 16 x 4352 n32),
 // odd word counts per tile (n18, n = 2 * 9 words), n24, the real 0.8B / 4B projection sizes at n20, rates 36 - 48,
-// and the rates above 3 bpw (n56, n64; the lane windows span more than 64 bits).
+// the rates above 3 bpw (n56, n64; the lane windows span more than 64 bits) and every rate above 4 bpw (n66 - n88, tiles
+// of 1056 - 1408 bits; n70, n78 and n86 have an odd word count per tile).
 static const int ftq_cases[][3] = {
 	{ 32, 256, 16 }, { 272, 256, 16 }, { 16, 256, 16 }, { 16, 4352, 32 }, { 48, 768, 18 }, { 64, 1024, 24 }, { 528, 1024, 20 }, { 3584, 1024, 20 }, { 9216, 2560, 20 },
 	// Rates above TMCQ's (to 3 bpw, high_bits to 768).
 	{ 528, 1024, 36 }, { 64, 1024, 40 }, { 9216, 2560, 36 }, { 9216, 2560, 40 }, { 9216, 2560, 48 }, { 16, 4352, 48 },
 	// Above 3 bpw (high_bits 800 - 1024).
 	{ 272, 512, 50 }, { 48, 768, 54 }, { 3584, 1024, 56 }, { 9216, 2560, 56 }, { 528, 1024, 62 }, { 3584, 1024, 64 }, { 9216, 2560, 64 }, { 16, 4352, 64 },
+	// Above 4 bpw (high_bits 1056 - 1408).
+	{ 272, 512, 66 }, { 48, 768, 68 }, { 528, 1024, 70 }, { 64, 1024, 72 }, { 9216, 2560, 72 }, { 16, 4352, 74 }, { 48, 768, 76 },
+	{ 272, 512, 78 }, { 528, 1024, 80 }, { 48, 768, 82 }, { 64, 1024, 84 }, { 272, 512, 86 }, { 3584, 1024, 88 }, { 9216, 2560, 88 }, { 16, 4352, 88 },
 };
 
 TEST_CASE("ftq schedule has full word-aligned tiles and a header outside the TMCQ budget")
@@ -174,7 +178,12 @@ TEST_CASE("ftq schedule has full word-aligned tiles and a header outside the TMC
 	REQUIRE_EQ(CCV_NNC_QX_8I_ROWWISE_FTQ_N16, 36, "FTQ codec ids are 32 + (n - 8) / 2");
 	REQUIRE_EQ(CCV_NNC_QX_8I_ROWWISE_FTQ_N64, 60, "FTQ codec ids are 32 + (n - 8) / 2");
 	REQUIRE(!ccv_nnc_8i_rowwise_x_is_ftq(CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST) && !ccv_nnc_8i_rowwise_x_is_ftq(CCV_NNC_QX_8I_ROWWISE_FTQ_N16 - 1), "n8 .. n14 are not open");
-	REQUIRE(!ccv_nnc_8i_rowwise_x_is_ftq(CCV_NNC_QX_8I_ROWWISE_FTQ_N64 + 1) && !ccv_nnc_8i_rowwise_x_is_ftq(CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_LAST), "n66 .. n134 are not open");
+	REQUIRE_EQ(ftq_format(66), 61, "n66 follows n64");
+	REQUIRE_EQ(ftq_format(88), 72, "n88 is 72, as QuantStar's ftq_n88");
+	int open_n;
+	for (open_n = 16; open_n <= 88; open_n += 2)
+		REQUIRE(ccv_nnc_8i_rowwise_x_is_ftq(ftq_format(open_n)) && ccv_nnc_8i_rowwise_x_ftq_rate(ftq_format(open_n)) == open_n, "n%d is open", open_n);
+	REQUIRE(!ccv_nnc_8i_rowwise_x_is_ftq(ftq_format(90)) && !ccv_nnc_8i_rowwise_x_is_ftq(CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_LAST), "n90 .. n134 are not open");
 	REQUIRE(!ccv_nnc_8i_rowwise_x_is_tiled(CCV_NNC_QX_8I_ROWWISE_TMCQ_N32 + 1), "code 31 is empty");
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_rate(CCV_NNC_QX_8I_ROWWISE_FTQ_N50), 50, "n50");
 	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_rate(CCV_NNC_QX_8I_ROWWISE_FTQ_N64), 64, "n64");
@@ -192,7 +201,8 @@ TEST_CASE("cpu ftq decode matches the reference with the built-in and a register
 	REQUIRE(slot >= 1, "the 1024-pair table registers");
 	uint32_t big_crc;
 	ccv_nnc_codebook_get(slot, 0, &big_crc);
-	static const int cases[][3] = { { 32, 256, 16 }, { 272, 256, 16 }, { 48, 768, 18 }, { 64, 1024, 24 }, { 528, 1024, 20 }, { 528, 1024, 40 }, { 9216, 2560, 48 } };
+	static const int cases[][3] = { { 32, 256, 16 }, { 272, 256, 16 }, { 48, 768, 18 }, { 64, 1024, 24 }, { 528, 1024, 20 }, { 528, 1024, 40 }, { 9216, 2560, 48 },
+		{ 48, 768, 66 }, { 528, 1024, 72 }, { 272, 512, 80 }, { 64, 1024, 86 }, { 528, 1024, 88 } };
 	int c, which;
 	for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++)
 		for (which = 0; which < 2; which++)
@@ -436,7 +446,8 @@ TEST_CASE("mps ftq gemm from 4 rows equals the gemm on its decoded 8i rowwise we
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	const uint64_t old_flags = ccv_nnc_flags();
-	static const int cases[][3] = { { 528, 1024, 22 }, { 272, 256, 16 }, { 9216, 2560, 20 }, { 528, 1024, 36 }, { 9216, 2560, 40 }, { 9216, 2560, 48 }, { 3584, 1024, 56 }, { 9216, 2560, 64 } };
+	static const int cases[][3] = { { 528, 1024, 22 }, { 272, 256, 16 }, { 9216, 2560, 20 }, { 528, 1024, 36 }, { 9216, 2560, 40 }, { 9216, 2560, 48 }, { 3584, 1024, 56 }, { 9216, 2560, 64 },
+		{ 528, 1024, 66 }, { 3584, 1024, 72 }, { 528, 1024, 80 }, { 9216, 2560, 88 } };
 	int c;
 	for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++)
 	{
@@ -529,9 +540,10 @@ TEST_CASE("mps ftq fused gemv for 1 to 3 rows matches the reference bit for bit"
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	// One-hot activation rows make every output fp16(fp32(q8 * scale) [+ bias]) whatever the summation
-	// order. Rates from n16 to n64, including an odd word count per tile (n54, 27 words), the
-	// largest tiles (16 x 4352 n64) and the 4B size.
-	static const int cases[][3] = { { 64, 1024, 24 }, { 528, 1024, 20 }, { 272, 256, 16 }, { 32, 256, 16 }, { 16, 4352, 32 }, { 64, 1024, 40 }, { 16, 4352, 48 }, { 9216, 2560, 36 }, { 9216, 2560, 48 }, { 272, 512, 54 }, { 3584, 1024, 56 }, { 16, 4352, 64 }, { 9216, 2560, 64 } };
+	// order. Rates from n16 to n88, including an odd word count per tile (n54, 27 words; n70, 35 words; n86, 43 words),
+	// the largest tiles (16 x 4352 n88) and the 4B size.
+	static const int cases[][3] = { { 64, 1024, 24 }, { 528, 1024, 20 }, { 272, 256, 16 }, { 32, 256, 16 }, { 16, 4352, 32 }, { 64, 1024, 40 }, { 16, 4352, 48 }, { 9216, 2560, 36 }, { 9216, 2560, 48 }, { 272, 512, 54 }, { 3584, 1024, 56 }, { 16, 4352, 64 }, { 9216, 2560, 64 },
+		{ 272, 512, 66 }, { 528, 1024, 70 }, { 64, 1024, 72 }, { 16, 4352, 80 }, { 272, 512, 86 }, { 3584, 1024, 88 }, { 16, 4352, 88 } };
 	int c;
 	for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++)
 	{
@@ -617,9 +629,10 @@ TEST_CASE("ftq quantize round trip: CPU, GPU int8 and fused GEMV decodes agree a
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	// 48 rows (three tile rows) x 512 columns of rough Gaussians with row scales 0.02 .. 0.10 and a few outliers.
 	enum { rows = 48, cols = 512, count = rows * cols };
-	static const int rates[6] = { 16, 20, 32, 48, 56, 64 };
-	// Upper bounds on sum (x - x_hat)^2 / sum x^2 per rate.
-	static const double bounds[6] = { 0.24, 0.18, 0.09, 0.045, 0.038, 0.035 };
+	static const int rates[8] = { 16, 20, 32, 48, 56, 64, 72, 88 };
+	// Upper bounds on sum (x - x_hat)^2 / sum x^2 per rate. Above n64 the built-in 512-pair table, not the rate, bounds the
+	// error (0.0305 at both n72 and n88), so there the error only must not rise.
+	static const double bounds[8] = { 0.24, 0.18, 0.09, 0.045, 0.038, 0.035, 0.033, 0.033 };
 	float* const values = (float*)ccmalloc(sizeof(float) * count);
 	uint16_t* const half = (uint16_t*)ccmalloc(sizeof(uint16_t) * count);
 	uint16_t* const out = (uint16_t*)ccmalloc(sizeof(uint16_t) * count);
@@ -642,7 +655,7 @@ TEST_CASE("ftq quantize round trip: CPU, GPU int8 and fused GEMV decodes agree a
 	for (i = 0; i < count; i++)
 		energy += (double)values[i] * values[i];
 	double previous = DBL_MAX;
-	for (r = 0; r < 6; r++)
+	for (r = 0; r < 8; r++)
 	{
 		const int n = rates[r];
 		const int format = ftq_format(n);
@@ -676,7 +689,7 @@ TEST_CASE("ftq quantize round trip: CPU, GPU int8 and fused GEMV decodes agree a
 		const double relative = err / energy;
 		printf("\n\tFTQ n = %d relative error %.6f", n, relative);
 		REQUIRE(relative < bounds[r], "FTQ n%d relative error %g within %g", n, relative, bounds[r]);
-		REQUIRE(relative < previous, "error falls as the rate rises");
+		REQUIRE(n > 64 ? relative <= previous : relative < previous, "error falls as the rate rises (does not rise above n64)");
 		previous = relative;
 		// GPU int8 decode.
 		const size_t out_scale_offset = ((size_t)count + 127) & ~(size_t)127;
@@ -854,7 +867,8 @@ TEST_CASE("mps ftq with external codebooks matches the reference and the built-i
 	for (ti = 0; ti < 5; ti++)
 		REQUIRE(tables[ti].slot >= 1, "table %d registers", ti);
 	// (rows, cols, n, one-hot GEMV): small grids, the 4B size, and rates above 3 bpw.
-	static const int cases[][4] = { { 64, 1024, 24, 1 }, { 528, 1024, 20, 1 }, { 272, 256, 16, 1 }, { 9216, 2560, 20, 0 }, { 64, 1024, 56, 1 }, { 272, 512, 64, 1 } };
+	static const int cases[][4] = { { 64, 1024, 24, 1 }, { 528, 1024, 20, 1 }, { 272, 256, 16, 1 }, { 9216, 2560, 20, 0 }, { 64, 1024, 56, 1 }, { 272, 512, 64, 1 },
+		{ 64, 1024, 66, 1 }, { 272, 512, 72, 1 }, { 64, 1024, 80, 1 }, { 272, 512, 88, 1 }, { 9216, 2560, 88, 0 } };
 	int c;
 	for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++)
 	{
@@ -1089,8 +1103,9 @@ TEST_CASE("ftq quadrant-folded tables match the explicit 2048-pair reference on 
 	uint32_t crc = 0;
 	ccv_nnc_codebook_get(slot, 0, &crc);
 	const uint32_t table_field = 1u | (9u << 8) | (1u << 16);
-	// (rows, cols, n, one-hot GEMV): small grids, the 4B size at n20, n40 and n64, and n56.
-	static const int cases[][4] = { { 64, 1024, 24, 1 }, { 272, 256, 16, 1 }, { 9216, 2560, 20, 0 }, { 9216, 2560, 40, 0 }, { 64, 1024, 56, 1 }, { 272, 512, 64, 1 }, { 9216, 2560, 64, 0 } };
+	// (rows, cols, n, one-hot GEMV): small grids, the 4B size at n20, n40, n64 and n88, and n56, n66, n72 and n80.
+	static const int cases[][4] = { { 64, 1024, 24, 1 }, { 272, 256, 16, 1 }, { 9216, 2560, 20, 0 }, { 9216, 2560, 40, 0 }, { 64, 1024, 56, 1 }, { 272, 512, 64, 1 }, { 9216, 2560, 64, 0 },
+		{ 64, 1024, 66, 1 }, { 272, 512, 72, 1 }, { 64, 1024, 80, 1 }, { 9216, 2560, 88, 0 } };
 	int c;
 	for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++)
 	{
@@ -1353,7 +1368,7 @@ TEST_CASE("mps ftq decode is exact across odd tile-row counts with the built-in 
 	uint32_t fold_crc = 0;
 	ccv_nnc_codebook_get(fold_slot, 0, &fold_crc);
 	static const int shapes[][2] = { { 16, 256 }, { 48, 256 }, { 208, 768 }, { 272, 512 } };
-	static const int rates[] = { 16, 22, 48, 56, 64 };
+	static const int rates[] = { 16, 22, 48, 56, 64, 66, 72, 86, 88 };
 	int s, r, folded;
 	for (s = 0; s < (int)(sizeof(shapes) / sizeof(shapes[0])); s++)
 		for (r = 0; r < (int)(sizeof(rates) / sizeof(rates[0])); r++)
@@ -1922,8 +1937,8 @@ TEST_CASE("ftq with a folded table is exact at every open static rate, and at th
 	uint32_t crc = 0;
 	ccv_nnc_codebook_get(slot, 0, &crc);
 	int n;
-	// 3 tile rows x 32 tiles, every rate n = 16, 18, .., 64, one-hot GEMV.
-	for (n = 16; n <= 64; n += 2)
+	// 3 tile rows x 32 tiles, every rate n = 16, 18, .., 88, one-hot GEMV.
+	for (n = 16; n <= 88; n += 2)
 		REQUIRE_EQ(ftq_fold_rate_checks(slot, crc, base, 48, 512, n, 1, 0x4100u + n), 0, "fold 48x512 n%d", n);
 	static const int large[] = { 16, 20, 24 };
 	int i;
@@ -1932,7 +1947,7 @@ TEST_CASE("ftq with a folded table is exact at every open static rate, and at th
 	ccfree(base);
 }
 
-TEST_CASE("an ftq checkpoint with the folded table as file id 1 loads and decodes like the reference at n16 and n20")
+TEST_CASE("an ftq checkpoint with the folded table as file id 1 loads and decodes like the reference at n16, n20 and n88")
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	int8_t* const base = ftq_fold_base_new(0x0f51u);
@@ -1944,9 +1959,9 @@ TEST_CASE("an ftq checkpoint with the folded table as file id 1 loads and decode
 	REQUIRE_EQ(sqlite3_open(":memory:", &db), SQLITE_OK, "in-memory database opens");
 	REQUIRE_EQ(ccv_nnc_tensor_write_codebook(db, plain, 1), CCV_IO_FINAL, "the base table writes as id 1");
 	const int rows = 64, cols = 1024;
-	static const int rates[] = { 16, 20 };
+	static const int rates[] = { 16, 20, 88 };
 	int i;
-	for (i = 0; i < 2; i++)
+	for (i = 0; i < 3; i++)
 	{
 		const int n = rates[i];
 		const int file_format = ftq_format(n) | (1 << CCV_NNC_CODEBOOK_SLOT_SHIFT); // file-local id 1
@@ -2174,7 +2189,7 @@ static int ftq_k16_checks(ccv_nnc_tensor_t* const hq, ccv_nnc_tensor_t* const gq
 	return failures;
 }
 
-TEST_CASE("mps ftq static rate is exact at K % 16 on int8 decode, fused gemv and gemm, at n16, n18, n32 and the wide n56 and n64")
+TEST_CASE("mps ftq static rate is exact at K % 16 on int8 decode, fused gemv and gemm, at n16, n18, n32 and the wide n56, n64, n72 and n88")
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	// (rows, cols, n, gemv, gemm).
@@ -2182,6 +2197,7 @@ TEST_CASE("mps ftq static rate is exact at K % 16 on int8 decode, fused gemv and
 		{ 2304, 1152, 16, 0, 1 }, { 2304, 1152, 56, 0, 1 }, { 64, 1152, 18, 1, 0 },
 		{ 48, 272, 16, 1, 1 }, { 48, 272, 18, 1, 0 }, { 48, 272, 56, 1, 1 }, { 48, 272, 64, 1, 0 },
 		{ 32, 16, 16, 1, 1 }, { 16, 48, 32, 1, 0 }, { 32, 96, 64, 1, 0 }, { 32, 288, 56, 1, 1 }, { 16, 784, 18, 1, 0 },
+		{ 48, 272, 72, 1, 1 }, { 32, 16, 88, 1, 1 }, { 2304, 1152, 88, 0, 1 }, { 16, 784, 70, 1, 0 },
 	};
 	int c, cpu_skipped = 0, schedule_skipped = 0;
 	for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++)

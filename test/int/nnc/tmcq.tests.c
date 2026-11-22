@@ -540,8 +540,9 @@ static int _test_trellis_fresh(const int j, const int n)
 }
 
 // Straightforward pair Viterbi over one tile of W-bit states in processing order j' = 0..127,
-// j = (j' + rotation) mod 128. start < 0: free ends. bp is 128 x 2^(W - 2) indexed by j'. Returns the end state.
-static int _test_trellis_pass(const int window, const double* const y, const double* const w, const int n, const int rotation, const int start, uint8_t* const bp, double* const cost_out)
+// j = (j' + rotation) mod 128. start < 0: free ends. bp is 128 x 2^(W - 2) indexed by j', each up to f <= 11 bits (n88).
+// Returns the end state.
+static int _test_trellis_pass(const int window, const double* const y, const double* const w, const int n, const int rotation, const int start, uint16_t* const bp, double* const cost_out)
 {
 	const int states = 1 << window, stride = 1 << (window - 2);
 	double* cost = ccmalloc(sizeof(double) * states);
@@ -585,7 +586,7 @@ static int _test_trellis_pass(const int window, const double* const y, const dou
 	return end;
 }
 
-static int _test_trellis_trace(const int window, const uint8_t* const bp, const int n, const int rotation, const int last, const int first, int s, int* const states)
+static int _test_trellis_trace(const int window, const uint16_t* const bp, const int n, const int rotation, const int last, const int first, int s, int* const states)
 {
 	const int stride = 1 << (window - 2);
 	int step;
@@ -605,7 +606,7 @@ static int _test_trellis_trace(const int window, const uint8_t* const bp, const 
 // anchor (s_63, the window ending at E_63 = 8n).
 static double _test_trellis_fit_tile(const int window, const double* const y, const double* const w, const int n, const int mid, int* const states)
 {
-	uint8_t* const bp = ccmalloc(128 << (window - 2));
+	uint16_t* const bp = ccmalloc(sizeof(uint16_t) * (128 << (window - 2)));
 	double cost;
 	int s_star = _test_trellis_pass(window, y, w, n, 0, -1, bp, &cost);
 	if (mid)
@@ -697,11 +698,15 @@ TEST_CASE("TMCQ and FTQ mid anchor matches an independent encoder and costs no m
 	static const struct {
 		int format;
 		int window;
-	} cases[4] = {
+	} cases[7] = {
 		{CCV_NNC_QX_8I_ROWWISE_TMCQ_N16, 15},
 		{CCV_NNC_QX_8I_ROWWISE_TMCQ_N24, 15},
 		{CCV_NNC_QX_8I_ROWWISE_FTQ_N20, 16},
 		{CCV_NNC_QX_8I_ROWWISE_FTQ_N56, 16},
+		// Above 4 bpw: 9 or 10 fresh bits a pair (n66 / n78), 11 (n88).
+		{CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST + (66 - 8) / 2, 16},
+		{CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST + (78 - 8) / 2, 16},
+		{CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST + (88 - 8) / 2, 16},
 	};
 	dsfmt_t dsfmt;
 	dsfmt_init_gen_rand(&dsfmt, 4242);
@@ -712,7 +717,7 @@ TEST_CASE("TMCQ and FTQ mid anchor matches an independent encoder and costs no m
 	ccv_float_to_half_precision(values, half, count);
 	ccv_half_precision_to_float(half, values, count);
 	int c;
-	for (c = 0; c < 4; c++)
+	for (c = 0; c < 7; c++)
 	{
 		const int format = cases[c].format;
 		const int ftq = cases[c].window == 16;
@@ -1119,11 +1124,11 @@ TEST_CASE("tiled row-wise-x sizes follow the 16 x 16 tile grid for K % 16 and ar
 		const size_t count = (size_t)rows * cols;
 		const size_t tiles = (size_t)rows / 16 * (cols / 16);
 		REQUIRE_EQ(ccv_nnc_8i_rowwise_x_tile_count(rows, cols), (uint64_t)tiles, "%d x %d tile count", rows, cols);
-		// TMCQ_N16 .. N32, FTQ_N16 .. N64, FTQ_VR_N16 .. N64.
-		for (f = 0; f < 9 + 25 + 25; f++)
+		// TMCQ_N16 .. N32, FTQ_N16 .. N88, FTQ_VR_N16 .. N64.
+		for (f = 0; f < 9 + 37 + 25; f++)
 		{
-			const int vr = f >= 34, ftq = f >= 9 && !vr;
-			const int format = f < 9 ? tmcq_formats[f] : ftq ? CCV_NNC_QX_8I_ROWWISE_FTQ_N16 + (f - 9) : CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 + (f - 34);
+			const int vr = f >= 46, ftq = f >= 9 && !vr;
+			const int format = f < 9 ? tmcq_formats[f] : ftq ? CCV_NNC_QX_8I_ROWWISE_FTQ_N16 + (f - 9) : CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 + (f - 46);
 			const int n = f < 9 ? ccv_nnc_8i_rowwise_x_tmcq_rate(format) : ftq ? ccv_nnc_8i_rowwise_x_ftq_rate(format) : ccv_nnc_8i_rowwise_x_ftq_vr_rate(format);
 			const int datatype = f < 9 ? CCV_32F : CCV_16F;
 			const size_t code = tiles * 2 * n;
@@ -1299,7 +1304,7 @@ static void _test_ftq_ref_decode(const uint8_t* const blob, const int rows, cons
 
 TEST_CASE("FTQ CPU decode of random blobs matches the reference for K % 16")
 {
-	static const int rates[] = { 16, 18, 20, 36, 50, 64 };
+	static const int rates[] = { 16, 18, 20, 36, 50, 64, 66, 72, 86, 88 };
 	uint32_t seed = 0x1152u;
 	int s, r, i;
 	for (s = 0; s < (int)(sizeof(tiled_decode_shapes) / sizeof(tiled_decode_shapes[0])); s++)
@@ -1450,7 +1455,7 @@ TEST_CASE("TMCQ, FTQ and FTQ_VR at K = 1152 and K = 272 survive tensor persisten
 {
 	// 2D tensors and a 3D tensor of 2 experts (its rows are the rows of both experts).
 	static const int shapes[][3] = { { 0, 32, 1152 }, { 0, 48, 272 }, { 2, 16, 1152 }, { 2, 32, 272 } };
-	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_TMCQ_N24, CCV_NNC_QX_8I_ROWWISE_FTQ_N20, CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20 };
+	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_TMCQ_N24, CCV_NNC_QX_8I_ROWWISE_FTQ_N20, CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20, CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST + (88 - 8) / 2 };
 	dsfmt_t dsfmt;
 	dsfmt_init_gen_rand(&dsfmt, 1152);
 	sqlite3* db = 0;
@@ -1463,7 +1468,7 @@ TEST_CASE("TMCQ, FTQ and FTQ_VR at K = 1152 and K = 272 survive tensor persisten
 	REQUIRE_EQ(ccv_nnc_tensor_write_codebook(db, slot_alt, 3), CCV_IO_FINAL, "the alternate table writes as id 3");
 	int s, f, external;
 	for (s = 0; s < 4; s++)
-		for (f = 0; f < 3; f++)
+		for (f = 0; f < 4; f++)
 			for (external = 0; external < (f == 2 ? 2 : 1); external++)
 			{
 				const int experts = shapes[s][0], rows = shapes[s][1], cols = shapes[s][2];

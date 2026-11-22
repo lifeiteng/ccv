@@ -251,6 +251,9 @@ static inline const char* tmcq_w3_decode_source()
 // ftq_store_segment (Dequantize8iRowwiseXKernel), so the codes are the selected-expert decode's bit for bit. The table
 // is a threadgroup ushort copy of the pairs (q8[2 j] in the low byte); log2Entries / fold as ccv_nnc_mfa_ftq_w1_source.
 // Append after ccv_nnc_mfa_tmcq_decode_source(), which defines tmcq_funnel.
+// ftq_w3_decode_row16_words holds up to N = 90, so for every open rate (n16 - n88): the last window ends at
+// N - floor(N / 8) + 16 <= 95 bits past the row's start (three funnels, f[0 .. 2]), from sh <= 31 that is four words, and
+// every window from offset 64 has (offset & 31) <= 16, so none reads past f[2].
 static inline std::string ccv_nnc_mfa_ftq_w3_source(const uint32_t log2Entries, const bool fold)
 {
   std::string shader = "constant uint ftq_w3_index_shift = " + std::to_string(32 - log2Entries) + "u;\n";
@@ -402,6 +405,9 @@ static inline const char* ccv_nnc_mfa_tmcq_w2_source()
 // pair lookup from a half2 threadgroup copy of the table and the 8 windows of one lane. log2Entries / fold: the pair
 // table (9 for the built-in one); fold is a quadrant-folded external table (CCV_NNC_MFA_CODEBOOK_FOLD, log2Entries 9).
 // Append after ccv_nnc_mfa_tmcq_decode_source(), whose tmcq_funnel the rate loop uses.
+// ftq_decode_lane holds up to N = 90, so for every open rate (n16 - n88): window offsets up to 48 read lo, the others
+// hi >> (offset - 32) with offset - 32 + 16 <= 64, and the four words of the rate loops (n > 48) cover the last window's
+// end, N - floor(N / 8) + 16 <= 95 bits from sh <= 31.
 static inline std::string ccv_nnc_mfa_ftq_w1_source(const uint32_t log2Entries, const bool fold)
 {
   // 32 - log2 of the pair count.

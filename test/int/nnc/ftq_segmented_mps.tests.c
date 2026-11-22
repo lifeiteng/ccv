@@ -643,12 +643,19 @@ static const char* dtype_name(const int datatype)
 	return datatype == CCV_16F ? "fp16" : "fp32";
 }
 
+// The rates that every table runs at: n34 and n64 as before, and above 4 bpw (n66 - n88, four words a row) n66, n72 (its
+// last window offset 63 is the last below 64), n80 and n88 (the widest tile, 1408 bits).
+static int ftq_all_tables_rate(const int n)
+{
+	return n == 34 || n == 64 || n == 66 || n == 72 || n == 80 || n == 88;
+}
+
 TEST_CASE("ftq container: fp32 base keeps the fp16 blob's size and the scale size is 2")
 {
-	static const int rates[] = { 16, 34, 48, 64 };
+	static const int rates[] = { 16, 34, 48, 64, 66, 72, 88 };
 	static const int shapes[][3] = { { 1, 32, 16 }, { 3, 48, 272 }, { 8, 64, 1152 }, { 128, 3072, 2304 } };
 	int i, s;
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < 7; i++)
 		for (s = 0; s < 4; s++)
 		{
 			const int format = ftq_format(rates[i]);
@@ -756,18 +763,19 @@ TEST_CASE("mps ftq selected expert int8 decode is bit exact with the cpu decode"
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	static const int ks[] = { 16, 272, 1152, 2304 };
-	static const int rates[] = { 16, 18, 34, 48, 56, 64 };
+	// Every rate above 4 bpw (n66 - n88) with the built-in table, every table at ftq_all_tables_rate.
+	static const int rates[] = { 16, 18, 34, 48, 56, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88 };
 	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table();
 	REQUIRE(external.slot > 0 && folded.slot > 0, "the external and folded tables register");
 	int ki, ri, d, t;
 	for (ki = 0; ki < 4; ki++)
-		for (ri = 0; ri < 6; ri++)
+		for (ri = 0; ri < 18; ri++)
 			for (d = 0; d < 2; d++)
 				for (t = 0; t < 3; t++)
 				{
 					const int datatype = d ? CCV_32F : CCV_16F;
 					// Every table at the priority rates, the built-in one at the others.
-					if (t > 0 && rates[ri] != 34 && rates[ri] != 64)
+					if (t > 0 && !ftq_all_tables_rate(rates[ri]))
 						continue;
 					const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
 					const int mismatches = selected_decode_case(datatype, ks[ki], rates[ri], table, 0x5e1ec7u + ki * 131 + ri * 17 + d * 7 + t);
@@ -834,18 +842,19 @@ TEST_CASE("mps ftq segmented gemm gemv and w8a8 paths match the fp32 reference a
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	static const int ks[] = { 16, 272, 1152, 2304 };
-	static const int rates[] = { 16, 18, 34, 48, 56, 64 };
+	// Every rate above 4 bpw (n66 - n88) with the built-in table, every table at ftq_all_tables_rate.
+	static const int rates[] = { 16, 18, 34, 48, 56, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88 };
 	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table();
 	routing_t gemv = routing_of(4, small_gemv_indices, small_gemv_counts);
 	routing_t w8a8 = routing_of(5, small_w8a8_indices, small_w8a8_counts);
 	const int na = ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_default_mfa_context());
 	int ki, ri, d, t;
 	for (ki = 0; ki < 4; ki++)
-		for (ri = 0; ri < 6; ri++)
+		for (ri = 0; ri < 18; ri++)
 			for (d = 0; d < 2; d++)
 				for (t = 0; t < 3; t++)
 				{
-					if (t > 0 && rates[ri] != 34 && rates[ri] != 64)
+					if (t > 0 && !ftq_all_tables_rate(rates[ri]))
 						continue;
 					const int datatype = d ? CCV_32F : CCV_16F;
 					const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
@@ -877,7 +886,8 @@ TEST_CASE("mps ftq segmented swiglu gemv and w8a8 paths match the fp32 reference
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
 	static const int ks[] = { 16, 272, 1152, 2304 };
-	static const int rates[] = { 16, 18, 34, 48, 56, 64 };
+	// Every rate above 4 bpw (n66 - n88) with the built-in table, every table at ftq_all_tables_rate.
+	static const int rates[] = { 16, 18, 34, 48, 56, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88 };
 	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table();
 	routing_t gemv = routing_of(4, small_gemv_indices, small_gemv_counts);
 	// 18 rows over 5 bins: the direct path takes up to 3 rows per bin; 6 experts' worth of rows past it is W8A8.
@@ -887,11 +897,11 @@ TEST_CASE("mps ftq segmented swiglu gemv and w8a8 paths match the fp32 reference
 	const int na = ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_default_mfa_context());
 	int ki, ri, d, t;
 	for (ki = 0; ki < 4; ki++)
-		for (ri = 0; ri < 6; ri++)
+		for (ri = 0; ri < 18; ri++)
 			for (d = 0; d < 2; d++)
 				for (t = 0; t < 3; t++)
 				{
-					if (t > 0 && rates[ri] != 34 && rates[ri] != 64)
+					if (t > 0 && !ftq_all_tables_rate(rates[ri]))
 						continue;
 					const int datatype = d ? CCV_32F : CCV_16F;
 					const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
@@ -1077,7 +1087,7 @@ TEST_CASE("mps ftq packed segmented swiglu matches two segmented ftq gemvs and t
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS) && ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
 	static const int ks[] = { 16, 272, 1152, 2304 };
-	static const int rates[] = { 16, 18, 24, 32, 34, 48, 56, 64 };
+	static const int rates[] = { 16, 18, 24, 32, 34, 48, 56, 64, 66, 72, 80, 88 };
 	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table(), external11 = ftq_external11_table();
 	// One row per bin; the same 4 bins with one broadcast input row; 3 rows per bin over 5 bins, one of them empty.
 	routing_t gemv = routing_of(4, small_gemv_indices, small_gemv_counts);
@@ -1086,7 +1096,7 @@ TEST_CASE("mps ftq packed segmented swiglu matches two segmented ftq gemvs and t
 	float worst_fp[2] = { 0, 0 };
 	float flip_fp[2] = { 0, 0 };
 	for (ki = 0; ki < 4; ki++)
-		for (ri = 0; ri < 8; ri++)
+		for (ri = 0; ri < 12; ri++)
 			for (d = 0; d < 2; d++)
 				for (t = 0; t < 4; t++)
 				{
@@ -1135,10 +1145,10 @@ TEST_CASE("mps ftq segmented gemm and swiglu at inkling mini shapes, top-8 decod
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
 	const int na = ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_default_mfa_context());
-	static const int configs[][2] = { { 34, CCV_32F }, { 34, CCV_16F }, { 48, CCV_32F }, { 64, CCV_16F }, { 64, CCV_32F } };
+	static const int configs[][2] = { { 34, CCV_32F }, { 34, CCV_16F }, { 48, CCV_32F }, { 64, CCV_16F }, { 64, CCV_32F }, { 72, CCV_16F }, { 88, CCV_32F } };
 	static const int tokens[] = { 1, 64, 512 };
 	int c, ti;
-	for (c = 0; c < 5; c++)
+	for (c = 0; c < 7; c++)
 	{
 		const int n = configs[c][0], datatype = configs[c][1];
 		const uint32_t seed = 0x1a4c00u + c * 31;
@@ -1281,7 +1291,7 @@ static int fused_swiglu_mismatches(const int datatype, const routing_t* const r,
 
 // Every static rate on a small bank: 6 experts of 128 rows, K = 320 (20 tiles a row: K % 64 == 0 under 512, so only the
 // K tail loop runs) and K = 1152 (two K512 blocks and a K128 tail), 30 - 41 rows per bin with an empty bin; the external
-// and folded tables at n34 and n64.
+// and folded tables at n34, n64, n66, n72, n80 and n88 (ftq_all_tables_rate).
 TEST_CASE("mps ftq fused segmented gemm and swiglu equal the expand path bit for bit at every rate")
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
@@ -1293,11 +1303,11 @@ TEST_CASE("mps ftq fused segmented gemm and swiglu equal the expand path bit for
 	const int n_rows = 128;
 	int ki, n, d, t, fused = 0;
 	for (ki = 0; ki < 2; ki++)
-		for (n = 16; n <= 64; n += 2)
+		for (n = 16; n <= 88; n += 2)
 			for (d = 0; d < 2; d++)
 				for (t = 0; t < 3; t++)
 				{
-					if (t > 0 && n != 34 && n != 64)
+					if (t > 0 && !ftq_all_tables_rate(n))
 						continue;
 					const int datatype = d ? CCV_32F : CCV_16F;
 					const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
@@ -1339,9 +1349,9 @@ static int ftq_tile_rows(const ccv_nnc_tensor_t* const gq, const routing_t* cons
 //   whole halves and every partial second half), 58 rows per bin, 64-row tiles;
 // - at: 0, 95 and 1 rows, exactly 32 rows per bin, 64-row tiles; below: 0, 94 and 1, one row fewer, 32-row tiles;
 // - skewed: one 130-row bin and five of at most one row, 22 rows per bin, 32-row tiles although one bin is long.
-// Every static rate from 32 with the built-in table at K = 1152 on the wide routing; n34, n48 and n64 with the
-// built-in, external and folded tables on every routing at both K; n16 and n24 stay on 32-row tiles. Both FP16 and
-// FP32. Then the same weights with M loaded at run time (one pipeline per tile size): skewed, wide, skewed, at, below.
+// Every static rate from 32 (to n88) with the built-in table at K = 1152 on the wide routing; n34, n48, n64, n72 and n88
+// with the built-in, external and folded tables on every routing at both K; n16 and n24 stay on 32-row tiles. Both FP16
+// and FP32. Then the same weights with M loaded at run time (one pipeline per tile size): skewed, wide, skewed, at, below.
 TEST_CASE("mps ftq fused segmented gemm and swiglu 64-row tiles equal the expand path bit for bit")
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
@@ -1367,11 +1377,11 @@ TEST_CASE("mps ftq fused segmented gemm and swiglu 64-row tiles equal the expand
 	const int n_rows = 128;
 	int ki, n, d, t, ri, i, runs64 = 0, runs32 = 0;
 	for (ki = 0; ki < 2; ki++)
-		for (n = 16; n <= 64; n += 2)
+		for (n = 16; n <= 88; n += 2)
 			for (d = 0; d < 2; d++)
 				for (t = 0; t < 3; t++)
 				{
-					const int focus = n == 34 || n == 48 || n == 64;
+					const int focus = n == 34 || n == 48 || n == 64 || n == 72 || n == 88;
 					// Every rate from 32 at K = 1152 with the built-in table; n16 and n24 as the low-rate contrast.
 					if (!focus && (t > 0 || (n >= 32 ? ki == 0 : (n != 16 && n != 24))))
 						continue;
@@ -1429,23 +1439,23 @@ TEST_CASE("mps ftq fused segmented gemm and swiglu 64-row tiles equal the expand
 }
 
 // Inkling Mini, down 2304 x 1152 (K % 256 != 0) and gate / up 3072 x 2304 over 128 experts, top-8 routing at T = 64, 512
-// and 2048 (4 - 128 rows per bin, all fused), n16 / n34 / n48 / n64 with the built-in table and n34 / n64 with the
-// external and folded ones, FP16 and FP32. Then the M threshold: 2 bins of 1024 rows each still fuse, 2 bins of 1025
+// and 2048 (4 - 128 rows per bin, all fused), n16 / n34 / n48 / n64 / n88 with the built-in table and n34 / n64 / n88 with
+// the external and folded ones, FP16 and FP32. Then the M threshold: 2 bins of 1024 rows each still fuse, 2 bins of 1025
 // rows expand (both against the expansion, which shows the reference is the expand path itself).
 TEST_CASE("mps ftq fused segmented gemm and swiglu equal the expand path bit for bit at inkling mini shapes")
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
 	GUARD_ELSE_RETURN(ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_default_mfa_context()));
 	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table();
-	static const int rates[] = { 16, 34, 48, 64 };
+	static const int rates[] = { 16, 34, 48, 64, 88 };
 	static const int tokens[] = { 64, 512, 2048 };
 	int ri, d, t, ti, fused = 0, expanded_runs = 0;
-	for (ri = 0; ri < 4; ri++)
+	for (ri = 0; ri < 5; ri++)
 		for (d = 0; d < 2; d++)
 			for (t = 0; t < 3; t++)
 			{
 				const int n = rates[ri];
-				if (t > 0 && n != 34 && n != 64)
+				if (t > 0 && n != 34 && n != 64 && n != 88)
 					continue;
 				const int datatype = d ? CCV_32F : CCV_16F;
 				const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
@@ -1853,7 +1863,8 @@ static int streaming_case(const int datatype, ccv_nnc_tensor_t* const* const sou
 	return status;
 }
 
-static void streaming_ftq_case(const int datatype, const ftq_table_t* const table, int* const __case_result__)
+// rates: of gate, up and down.
+static void streaming_ftq_case(const int datatype, const ftq_table_t* const table, const int* const rates, int* const __case_result__)
 {
 	const int experts = 32, n_rows = 256, k = 512;
 	char paths[3][64] = {
@@ -1861,7 +1872,6 @@ static void streaming_ftq_case(const int datatype, const ftq_table_t* const tabl
 		"/tmp/ccv-moe-ftq-up-XXXXXX",
 		"/tmp/ccv-moe-ftq-down-XXXXXX",
 	};
-	static const int rates[3] = { 34, 34, 48 };
 	ccv_nnc_tensor_t* hosts[3];
 	ccv_nnc_tensor_t* references[3];
 	ccv_nnc_tensor_t* sources[3];
@@ -1915,9 +1925,14 @@ TEST_CASE("mps moe weights streaming stages ftq banks, fp16 and fp32, built-in a
 {
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_MOE_WEIGHTS_STREAMING_FORWARD, CCV_NNC_BACKEND_MPS));
 	const ftq_table_t folded = ftq_folded_table();
-	streaming_ftq_case(CCV_16F, &ftq_builtin, __case_result__);
-	streaming_ftq_case(CCV_32F, &ftq_builtin, __case_result__);
-	streaming_ftq_case(CCV_32F, &folded, __case_result__);
+	static const int rates[3] = { 34, 34, 48 };
+	streaming_ftq_case(CCV_16F, &ftq_builtin, rates, __case_result__);
+	streaming_ftq_case(CCV_32F, &ftq_builtin, rates, __case_result__);
+	streaming_ftq_case(CCV_32F, &folded, rates, __case_result__);
+	// Above 4 bpw: n72 gate / up and an n88 down.
+	static const int high_rates[3] = { 72, 72, 88 };
+	streaming_ftq_case(CCV_16F, &ftq_builtin, high_rates, __case_result__);
+	streaming_ftq_case(CCV_32F, &folded, high_rates, __case_result__);
 }
 
 #include "case_main.h"

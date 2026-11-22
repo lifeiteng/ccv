@@ -741,7 +741,7 @@ inline void decode_group(device const uchar* source, const ulong group_index, th
 static bool is_ftq(const uint32_t format)
 {
 	const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
-	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N88;
 }
 
 // FTQ int8 decode (see CCV_NNC_QX_8I_ROWWISE_FTQ_N16): one thread per row segment, the 8 pairs of one output row

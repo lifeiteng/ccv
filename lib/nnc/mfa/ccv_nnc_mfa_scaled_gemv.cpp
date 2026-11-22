@@ -31,7 +31,7 @@ bool is_tmcq(const uint32_t format) noexcept
 bool is_ftq(const uint32_t format) noexcept
 {
   const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
-  return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
+  return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N88;
 }
 
 // Variable-rate FTQ (CCVFTQVR blobs, see CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16).

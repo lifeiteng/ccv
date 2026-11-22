@@ -30,7 +30,7 @@ static uint32_t tmcq_rate(const uint32_t format) noexcept
 static bool is_ftq(const uint32_t format) noexcept
 {
 	const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
-	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N64;
+	return codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_N16 && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_N88;
 }
 
 static uint32_t ftq_rate(const uint32_t format) noexcept

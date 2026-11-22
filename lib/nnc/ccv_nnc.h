@@ -1200,7 +1200,7 @@ enum {
 	 * of K: expert e's tiles start at byte 32 + e (N / 16) (K / 16) 2 n and its row r's scale is scale e N + r of the
 	 * blob, so N % 16 == 0 keeps every expert on whole tile rows. */
 	/* Static-rate FTQ owns codes FTQ_BLOCK_FIRST .. FTQ_BLOCK_LAST: format FTQ_BLOCK_FIRST + (n - 8) / 2 is rate n
-	 * (even n = 8 .. 134), so n = 8 + 2 (format - FTQ_BLOCK_FIRST). Only n = 16 .. 64 are open; the other codes of
+	 * (even n = 8 .. 134), so n = 8 + 2 (format - FTQ_BLOCK_FIRST). Only n = 16 .. 88 are open; the other codes of
 	 * the block are rejected. Variable-rate FTQ (CCVFTQVR) owns the next block, FTQ_VR_BLOCK_FIRST ..
 	 * FTQ_VR_BLOCK_LAST, by the same rule on the mean rate. Codes from FTQ_VR_BLOCK_LAST + 1 to 255 are left for
 	 * later formats. */
@@ -1231,6 +1231,20 @@ enum {
 	CCV_NNC_QX_8I_ROWWISE_FTQ_N60,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_N62,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_N64,
+	/* FTQ above 4 bpw (n = 66 .. 88, tiles up to 1408 bits), the same format; this fork only, not upstream. The
+	 * windows of a tile row span n - floor(n / 8) + 16 <= 93 bits, which four 32-bit words cover from any bit offset. */
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N66,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N68,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N70,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N72,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N74,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N76,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N78,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N80,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N82,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N84,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N86,
+	CCV_NNC_QX_8I_ROWWISE_FTQ_N88,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_LAST = CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST + 63,
 	CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST = CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_LAST + 1,
 	/* Variable-rate FTQ (VR: variable rate), CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N16 .. N64, mean rate
