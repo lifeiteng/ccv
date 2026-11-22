@@ -14,7 +14,7 @@ static void serializeBinaries(MTL::BinaryArchive* const binaryArchive, const std
   binaryArchive->serializeToURL(NS::URL::fileURLWithPath(NS::String::string(pathToWrite.c_str(), NS::UTF8StringEncoding)), &error);
 }
 
-// IQ2_XXS, Q2_K, IQ3_XXS and TMCQ expand weight fragments in registers for 32-row tiles at every M.
+// IQ2_XXS, Q2_K, IQ3_XXS, TMCQ and static-rate FTQ expand weight fragments in registers for 32-row tiles at every M.
 // A SIMD group's 32 weight rows are two whole TMCQ tile rows, and a lane's 16 consecutive K values
 // one row of a tile. On M5 Ultra (DeepSeek routed shapes) this beat TMCQ's former threadgroup path
 // (16- or 64-row tiles decoding 8 x 8 tiles into a 128 x 128 block) at every measured batch size,
@@ -22,7 +22,7 @@ static void serializeBinaries(MTL::BinaryArchive* const binaryArchive, const std
 static bool usesRegisterTiles(const uint32_t format) noexcept
 {
   return format == CCV_NNC_QX_8I_ROWWISE_IQ2_XXS || format == CCV_NNC_QX_8I_ROWWISE_Q2_K || format == CCV_NNC_QX_8I_ROWWISE_IQ3_XXS ||
-    segmentedTMCQRate(format);
+    segmentedTMCQRate(format) || segmentedFTQRate(format);
 }
 
 // The selected tile's rows. Other packed formats waste most of a 64-row tile on sparse

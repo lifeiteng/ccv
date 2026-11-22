@@ -280,7 +280,8 @@ static int _ccv_nnc_segmented_gemm_routed_forw(const ccv_nnc_cmd_t cmd, const cc
 		const uint32_t w_8i_rowwise_x_format = w_qx_subtype == CCV_NNC_QX_8I_ROWWISE_X ? (uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(w->info.reserved) : 0;
 		// External pair codebooks (ccv_nnc_codebook.h): a TMCQ or FTQ weight may name one in bits 16 - 23 of reserved (0 is
 		// the built-in table). The TMCQ kernels below (fused GEMV, fused tile GEMM, selected-expert decode, fp decode) and
-		// the FTQ ones (fused GEMV, selected-expert decode) take it, FTQ also quadrant folded; no other codec here does.
+		// the FTQ ones (fused GEMV, fused tile GEMM, selected-expert decode) take it, FTQ also quadrant folded; no other codec
+		// here does.
 		const int w_codebook_slot = w_qx_subtype == CCV_NNC_QX_8I_ROWWISE_X ? ccv_nnc_codebook_slot_of(w->info.reserved) : 0;
 		if (w_codebook_slot && !ccv_nnc_8i_rowwise_x_is_tmcq(w->info.reserved) && !ccv_nnc_8i_rowwise_x_is_ftq(w->info.reserved))
 			return CCV_NNC_EXEC_INVALID;
@@ -294,8 +295,9 @@ static int _ccv_nnc_segmented_gemm_routed_forw(const ccv_nnc_cmd_t cmd, const cc
 		const int w_datatype = CCV_GET_DATA_TYPE(w->info.datatype) == CCV_QX ? ((w->info.datatype & 0xff) << 12) : w->info.datatype;
 		// Static-rate FTQ: the [E, N, K] weight is one CCVFTQSR blob of E N rows (expert e's tiles at 32 + e (N / 16)
 		// (K / 16) 2n bytes, its FP16 scales at e N of the blob's scales), on the same 16 x 16 tile grid as TMCQ. One
-		// activation row per bin takes the fused FTQ GEMV; every other batch expands the selected experts to int8 rows
-		// for the W8A8 segmented scaled GEMM. FP16 or FP32 activation, weight base and output alike, no bias, no
+		// activation row per bin takes the fused FTQ GEMV; other batches take the W8A8 segmented scaled GEMM, decoding
+		// the tiles in registers (N % 64 and K % 64, see ccv_nnc_mfa_segmented_scaled_gemm_fuses_packed_format) or
+		// expanding the selected experts to int8 rows first. FP16 or FP32 activation, weight base and output alike, no bias, no
 		// Hadamard rotation; variable-rate FTQ has no fixed expert stride and is rejected.
 		const int w_ftq = ccv_nnc_8i_rowwise_x_is_ftq_any(w_8i_rowwise_x_format);
 		if (w_ftq && (!ccv_nnc_8i_rowwise_x_is_ftq(w_8i_rowwise_x_format) || (w_8i_rowwise_x_format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || bias ||
@@ -503,7 +505,7 @@ static int _ccv_nnc_segmented_gemm_routed_forw(const ccv_nnc_cmd_t cmd, const cc
 			ccv_nnc_mfa_segmented_scaled_gemm_params_t params = {
 				.data_type = mtl_data_type,
 				// Packed weights can be decoded per tile instead of expanding the expert bank into scratch.
-				// The predicate takes the shape: N % 64 and K % 64 for TMCQ, N % 256 and K % 256 for the others.
+				// The predicate takes the shape: N % 64 and K % 64 for TMCQ and FTQ, N % 256 and K % 256 for the others.
 				.format = use_neural_accelerators && !bias &&
 					ccv_nnc_mfa_segmented_scaled_gemm_fuses_packed_format(w_8i_rowwise_x_format, b_rows, bincount, (uint32_t)b_cols, (uint32_t)w_rows) ? w_8i_rowwise_x_codebook_format : 0,
 				.M = (uint32_t)(b_rows + ccv_max(bincount - 2, 0)) / ccv_max(bincount - 1, 1),

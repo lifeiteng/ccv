@@ -249,7 +249,7 @@ static void encode_projection(
   encoder->setBuffer(weight, weight_offset + weight_scale_offset, 4);
   encoder->setBuffer(scratch, p_layout.records_offset, 5);
   if (tmcq_codebook_log2(execution.segmented_desc.format)) {
-    // External codebook (TMCQ with a codebook slot) of the fused tile decode, see ccv_nnc_mfa_segmented_scaled_swiglu_params_t::codebook.
+    // External codebook (TMCQ or FTQ with a codebook slot) of the fused tile decode, see ccv_nnc_mfa_segmented_scaled_swiglu_params_t::codebook.
     CCV_NNC_MFA_PRECONDITION(params.codebook != nullptr);
     encoder->setBuffer(params.codebook, 0, 7);
     encoder->useResource(params.codebook, MTL::ResourceUsageRead);
@@ -285,8 +285,8 @@ void ccv_nnc_mfa_encode_segmented_scaled_swiglu(
     params.M > 0 && params.N > 0 && params.K > 0 &&
     params.expert_count > 0 && params.bincount > 0);
   // TMCQ and FTQ are a 16 x 16 tile grid: the selected-expert decode takes N % 16 and K % 16, and the fused tile path
-  // is taken only for the shapes SegmentedScaledGEMMKernel::fusesPackedFormat accepts (never FTQ). The other codecs
-  // take whole 256-weight blocks.
+  // is taken only for the shapes SegmentedScaledGEMMKernel::fusesPackedFormat accepts (N % 64, K % 64). The other
+  // codecs take whole 256-weight blocks.
   CCV_NNC_MFA_PRECONDITION(
     params.format == 0 || ((segmentedTMCQRate(params.format) || segmentedFTQRate(params.format)) ?
       ((params.N % 16) == 0 && (params.K % 16) == 0) : ((params.N % 256) == 0 && (params.K % 256) == 0)));

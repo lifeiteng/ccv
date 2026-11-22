@@ -246,6 +246,66 @@ static inline const char* tmcq_w3_decode_source()
   return source.c_str();
 }
 
+// FTQ register-fragment helpers for the segmented scaled GEMM prefill kernel only (ftq_w3_*, CCV_NNC_QX_8I_ROWWISE_FTQ_N16):
+// a tile row's 16 int8 codes packed like tmcq_w3_decode_row16_words, with the windows, pairs and fold of
+// ftq_store_segment (Dequantize8iRowwiseXKernel), so the codes are the selected-expert decode's bit for bit. The table
+// is a threadgroup ushort copy of the pairs (q8[2 j] in the low byte); log2Entries / fold as ccv_nnc_mfa_ftq_w1_source.
+// Append after ccv_nnc_mfa_tmcq_decode_source(), which defines tmcq_funnel.
+static inline std::string ccv_nnc_mfa_ftq_w3_source(const uint32_t log2Entries, const bool fold)
+{
+  std::string shader = "constant uint ftq_w3_index_shift = " + std::to_string(32 - log2Entries) + "u;\n";
+  shader += "#define FTQ_W3_ENTRIES " + std::to_string(1u << log2Entries) + "u\n";
+  shader += std::string("#define FTQ_W3_FOLD ") + (fold ? "1" : "0") + "\n";
+  shader += R"(
+// The packed pair of a 16-bit state. FTQ_W3_FOLD: base pair (h >> 16) & 511, each int8 negated by bit 15 / 31 of h,
+// the expression of the selected-expert decode's ftq_fold_lookup.
+inline uint ftq_w3_pair(threadgroup const ushort* table, uint state)
+{
+#if FTQ_W3_FOLD
+  const uint h = state * 0x83DCD12Du;
+  const char2 v = as_type<char2>(table[(h >> 16) & 511u]);
+  return as_type<ushort>(char2((h & 0x8000u) ? -v.x : v.x, (h & 0x80000000u) ? -v.y : v.y));
+#else
+  return table[(state * 0x83DCD12Du) >> ftq_w3_index_shift];
+#endif
+}
+
+// Row r of a rate N tile whose n / 2 words start at `tile`: its windows start at bit r N + floor(N / 8) - 16, row 0's
+// before the tile, wrapping to its end; the three (N <= 48) or four words from there are taken mod N / 2, as
+// ftq_store_segment reads them. Window i is at offset floor((i + 1) N / 8) - floor(N / 8) of the funnelled bits.
+template <uint N>
+inline uint4 ftq_w3_decode_row16_words(device const uint* tile, uint r, threadgroup const ushort* table)
+{
+  constexpr uint W = N / 2u;
+  const uint lane_bit = (r == 0u ? 16u * N : r * N) + (N >> 3) - 16u;
+  const uint o0 = lane_bit >> 5;
+  const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;
+  const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;
+  const uint sh = lane_bit & 31u;
+  const uint w0 = tile[o0], w1 = tile[o1], w2 = tile[o2];
+  uint f[3];
+  f[0] = tmcq_funnel(w0, w1, sh);
+  f[1] = tmcq_funnel(w1, w2, sh);
+  if (N > 48u) {
+    const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;
+    f[2] = tmcq_funnel(w2, tile[o3], sh);
+  } else
+    f[2] = 0;
+  uint t[8];
+  #pragma clang loop unroll(full)
+  for (uint i = 0; i < 8u; ++i)
+  {
+    const uint k = (((i + 1u) * N) >> 3) - (N >> 3);
+    const uint sub = k & 31u;
+    const uint state = (sub <= 16u ? (f[k >> 5] >> sub) : ((f[k >> 5] >> sub) | (f[(k >> 5) + 1u] << (32u - sub)))) & 0xffffu;
+    t[i] = ftq_w3_pair(table, state);
+  }
+  return uint4(t[0] | (t[1] << 16), t[2] | (t[3] << 16), t[4] | (t[5] << 16), t[6] | (t[7] << 16));
+}
+)";
+  return shader;
+}
+
 // Helpers for the segmented SwiGLU decode. They read a half2 copy of the pair table: every int8 code
 // is exact in half, and a half feeds a float FMA without the sign extension and int -> float
 // conversion that a char2 entry needs. The decoded codes are the same as tmcq_decode_row16's.

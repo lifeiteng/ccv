@@ -20,8 +20,10 @@
 // are 1 (so the FP16 outputs are the int8 codes), and takes the FP16 row scales from the blob. Any bit string is a valid
 // code, so codes are random bytes.
 // Paths: the selected-expert int8 decode (bit for bit), segmented GEMM through the fused FTQ GEMV (one row per bin) and
-// through the selected-expert decode into the W8A8 segmented scaled GEMM, segmented SwiGLU through two FTQ GEMVs and
-// through the W8A8 segmented scaled SwiGLU, MoE weights streaming of FTQ banks, and the rejections.
+// through the W8A8 segmented scaled GEMM, segmented SwiGLU through two FTQ GEMVs and through the W8A8 segmented scaled
+// SwiGLU (both W8A8 kernels decoding the tiles in registers, N % 64 and K % 64, bit for bit with the selected-expert
+// decode into int8 rows that they replace, or taking that expansion), MoE weights streaming of FTQ banks, and the
+// rejections.
 
 TEST_SETUP()
 {
@@ -948,6 +950,233 @@ TEST_CASE("mps ftq segmented gemm and swiglu at inkling mini shapes, top-8 decod
 		ccv_nnc_tensor_free(down);
 		ccv_nnc_tensor_free(down_host);
 	}
+}
+
+// The register-fused FTQ prefill (the W8A8 segmented scaled GEMM / SwiGLU decoding the tiles in registers, N % 64 and
+// K % 64) against the expand path it replaces: the same command on the 8I_ROWWISE [e, n, k] weight that the
+// selected-expert decode expands the whole blob to (int8 codes, then the blob's FP16 scales in the io type at the
+// 128-byte aligned offset), which is the W8A8 kernel the expand path runs. Integer products accumulate exactly in int32
+// and both epilogues are (acc a_scale) b_scale, so the outputs must be equal bit for bit.
+static ccv_nnc_tensor_t* ftq_expanded_new(const int datatype, ccv_nnc_tensor_t* const gq, const int experts, const int n_rows, const int k)
+{
+	ccv_nnc_tensor_param_t params = CPU_TENSOR_NHWC(32F, experts, n_rows, k);
+	params.datatype = datatype;
+	params = ccv_nnc_tensor_8i_rowwise(params);
+	params.type = CCV_TENSOR_GPU_MEMORY | 000;
+	ccv_nnc_tensor_t* const out = ccv_nnc_tensor_new(0, params, 0);
+	int* const indices = (int*)ccmalloc(sizeof(int) * experts);
+	int* const counts = (int*)ccmalloc(sizeof(int) * experts);
+	int i;
+	for (i = 0; i < experts; i++)
+	{
+		indices[i] = i;
+		counts[i] = 1;
+	}
+	ccv_nnc_tensor_t* const gindices = gpu_ints(indices, experts);
+	ccv_nnc_tensor_t* const gcounts = gpu_ints(counts, experts);
+	ccv_nnc_mfa_context_t* const context = ccv_nnc_default_mfa_context();
+	uint32_t mfa_format = (uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(gq->info.reserved);
+	mtl_buffer_t* codebook = 0;
+	const int ok = ccv_nnc_mfa_codebook_format(context, ccv_nnc_codebook_slot_of(gq->info.reserved), 1, &mfa_format, &codebook);
+	assert(ok);
+	(void)ok;
+	const ccv_nnc_mfa_dequantize_8i_rowwise_x_selected_params_t decode = {
+		.data_type = datatype == CCV_16F ? 16 : 3, // MTL::DataTypeHalf / MTL::DataTypeFloat
+		.format = mfa_format,
+		.row_length = k,
+		.rows_per_expert = n_rows,
+		.expert_count = experts,
+		.bincount = experts,
+		.codebook = codebook,
+	};
+	mtl_buffer_t* const scratch = ccv_nnc_mfa_request_scratch(context, ccv_nnc_mfa_dequantize_8i_rowwise_x_selected_reserved_scratch_size(decode));
+	mtl_command_batch_t* const command_batch = ccv_nnc_stream_context_start_command_batch(0);
+	mtl_buffer_t* tensors[6] = {
+		(mtl_buffer_t*)gq->data.u8, (mtl_buffer_t*)gindices->data.u8, (mtl_buffer_t*)gcounts->data.u8, (mtl_buffer_t*)out->data.u8, scratch, 0,
+	};
+	size_t offsets[5] = { (size_t)gq->dataof, (size_t)gindices->dataof, (size_t)gcounts->dataof, (size_t)out->dataof, 0 };
+	ccv_nnc_mfa_encode_dequantize_8i_rowwise_x_selected(context, decode, command_batch, tensors, offsets);
+	ccv_nnc_stream_context_finish_command_batch(0, command_batch);
+	ccv_nnc_tensor_free(gcounts);
+	ccv_nnc_tensor_free(gindices);
+	ccfree(counts);
+	ccfree(indices);
+	return out;
+}
+
+// Whether the routed prefill of `r` on an [e, n_rows, k] weight of this format decodes the tiles in registers.
+static int ftq_fuses(const ccv_nnc_tensor_t* const gq, const routing_t* const r, const int n_rows, const int k)
+{
+	return ccv_nnc_mfa_segmented_scaled_gemm_fuses_packed_format((uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(gq->info.reserved), r->rows, r->bins, n_rows, k);
+}
+
+// Elements of two float outputs that differ in any bit.
+static int bit_mismatches(const float* const x, const float* const y, const size_t count)
+{
+	int mismatches = 0;
+	size_t i;
+	for (i = 0; i < count; i++)
+		if (memcmp(x + i, y + i, sizeof(float)) != 0)
+		{
+			if (mismatches < 4)
+				printf("  bit mismatch at %zu: %.9g vs %.9g\n", i, x[i], y[i]);
+			mismatches++;
+		}
+	return mismatches;
+}
+
+// Segmented GEMM of `r` on the FTQ weight and on its expansion: their differing outputs, or -1 if either fails.
+static int fused_gemm_mismatches(const int datatype, const routing_t* const r, const int k, const int n_rows, ccv_nnc_tensor_t* const gq, ccv_nnc_tensor_t* const expanded, const uint32_t seed)
+{
+	float* const a = activations_new(datatype, r->rows, k, seed);
+	float* const out = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	float* const want = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	int mismatches = -1;
+	if (run_segmented_gemm(datatype, r, a, k, n_rows, gq, 0, 0, out) == CCV_NNC_EXEC_SUCCESS &&
+		run_segmented_gemm(datatype, r, a, k, n_rows, expanded, 0, 0, want) == CCV_NNC_EXEC_SUCCESS)
+		mismatches = bit_mismatches(out, want, (size_t)r->rows * n_rows);
+	ccfree(want);
+	ccfree(out);
+	ccfree(a);
+	return mismatches;
+}
+
+static int fused_swiglu_mismatches(const int datatype, const routing_t* const r, const int k, const int n_rows, ccv_nnc_tensor_t* const gate, ccv_nnc_tensor_t* const up, ccv_nnc_tensor_t* const gate_expanded, ccv_nnc_tensor_t* const up_expanded, const uint32_t seed)
+{
+	float* const a = activations_new(datatype, r->rows, k, seed);
+	float* const route = route_weights_new(datatype, r->rows);
+	float* const out = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	float* const want = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	int mismatches = -1;
+	if (run_segmented_swiglu(datatype, r, a, r->rows, route, k, n_rows, gate, up, 0, out) == CCV_NNC_EXEC_SUCCESS &&
+		run_segmented_swiglu(datatype, r, a, r->rows, route, k, n_rows, gate_expanded, up_expanded, 0, want) == CCV_NNC_EXEC_SUCCESS)
+		mismatches = bit_mismatches(out, want, (size_t)r->rows * n_rows);
+	ccfree(want);
+	ccfree(out);
+	ccfree(route);
+	ccfree(a);
+	return mismatches;
+}
+
+// Every static rate on a small bank: 6 experts of 128 rows, K = 320 (20 tiles a row: K % 64 == 0 under 512, so only the
+// K tail loop runs) and K = 1152 (two K512 blocks and a K128 tail), 30 - 41 rows per bin with an empty bin; the external
+// and folded tables at n34 and n64.
+TEST_CASE("mps ftq fused segmented gemm and swiglu equal the expand path bit for bit at every rate")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
+	GUARD_ELSE_RETURN(ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_default_mfa_context()));
+	static const int ks[] = { 320, 1152 };
+	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table();
+	static const int prefill_counts[] = { 30, 41, 0, 25, 33 };
+	routing_t r = routing_of(5, small_w8a8_indices, prefill_counts);
+	const int n_rows = 128;
+	int ki, n, d, t, fused = 0;
+	for (ki = 0; ki < 2; ki++)
+		for (n = 16; n <= 64; n += 2)
+			for (d = 0; d < 2; d++)
+				for (t = 0; t < 3; t++)
+				{
+					if (t > 0 && n != 34 && n != 64)
+						continue;
+					const int datatype = d ? CCV_32F : CCV_16F;
+					const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
+					const uint32_t seed = 0xf05e00u + ki * 977 + n * 13 + d * 5 + t;
+					ccv_nnc_tensor_t* gate_host;
+					ccv_nnc_tensor_t* up_host;
+					ccv_nnc_tensor_t* const gate = ftq_weight_new(datatype, 6, n_rows, ks[ki], n, table, seed, &gate_host);
+					ccv_nnc_tensor_t* const up = ftq_weight_new(datatype, 6, n_rows, ks[ki], n, table, seed + 1000, &up_host);
+					ccv_nnc_tensor_t* const gate_expanded = ftq_expanded_new(datatype, gate, 6, n_rows, ks[ki]);
+					ccv_nnc_tensor_t* const up_expanded = ftq_expanded_new(datatype, up, 6, n_rows, ks[ki]);
+					REQUIRE(ftq_fuses(gate, &r, n_rows, ks[ki]), "FTQ n%d table %d K=%d should take the fused tile path", n, t, ks[ki]);
+					fused++;
+					int m = fused_gemm_mismatches(datatype, &r, ks[ki], n_rows, gate, gate_expanded, seed + 2);
+					REQUIRE_EQ(m, 0, "fused FTQ segmented GEMM %s K=%d n%d table %d should equal the expand path", dtype_name(datatype), ks[ki], n, t);
+					m = fused_swiglu_mismatches(datatype, &r, ks[ki], n_rows, gate, up, gate_expanded, up_expanded, seed + 3);
+					REQUIRE_EQ(m, 0, "fused FTQ segmented SwiGLU %s K=%d n%d table %d should equal the expand path", dtype_name(datatype), ks[ki], n, t);
+					ccv_nnc_tensor_free(up_expanded);
+					ccv_nnc_tensor_free(gate_expanded);
+					ccv_nnc_tensor_free(up);
+					ccv_nnc_tensor_free(up_host);
+					ccv_nnc_tensor_free(gate);
+					ccv_nnc_tensor_free(gate_host);
+				}
+	if (getenv("FTQ_SEGMENTED_VERBOSE"))
+		printf("\n  %d fused configurations bit-identical to the expand path\n", fused);
+	routing_free(&r);
+}
+
+// Inkling Mini, down 2304 x 1152 (K % 256 != 0) and gate / up 3072 x 2304 over 128 experts, top-8 routing at T = 64, 512
+// and 2048 (4 - 128 rows per bin, all fused), n16 / n34 / n48 / n64 with the built-in table and n34 / n64 with the
+// external and folded ones, FP16 and FP32. Then the M threshold: 2 bins of 1024 rows each still fuse, 2 bins of 1025
+// rows expand (both against the expansion, which shows the reference is the expand path itself).
+TEST_CASE("mps ftq fused segmented gemm and swiglu equal the expand path bit for bit at inkling mini shapes")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
+	GUARD_ELSE_RETURN(ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_default_mfa_context()));
+	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table();
+	static const int rates[] = { 16, 34, 48, 64 };
+	static const int tokens[] = { 64, 512, 2048 };
+	int ri, d, t, ti, fused = 0, expanded_runs = 0;
+	for (ri = 0; ri < 4; ri++)
+		for (d = 0; d < 2; d++)
+			for (t = 0; t < 3; t++)
+			{
+				const int n = rates[ri];
+				if (t > 0 && n != 34 && n != 64)
+					continue;
+				const int datatype = d ? CCV_32F : CCV_16F;
+				const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
+				const uint32_t seed = 0x1f0500u + ri * 97 + d * 5 + t;
+				ccv_nnc_tensor_t* down_host;
+				ccv_nnc_tensor_t* gate_host;
+				ccv_nnc_tensor_t* up_host;
+				ccv_nnc_tensor_t* const down = ftq_weight_new(datatype, 128, 2304, 1152, n, table, seed, &down_host);
+				ccv_nnc_tensor_t* const gate = ftq_weight_new(datatype, 128, 3072, 2304, n, table, seed + 1, &gate_host);
+				ccv_nnc_tensor_t* const up = ftq_weight_new(datatype, 128, 3072, 2304, n, table, seed + 2, &up_host);
+				ccv_nnc_tensor_free(down_host);
+				ccv_nnc_tensor_free(gate_host);
+				ccv_nnc_tensor_free(up_host);
+				ccv_nnc_tensor_t* const down_expanded = ftq_expanded_new(datatype, down, 128, 2304, 1152);
+				ccv_nnc_tensor_t* const gate_expanded = ftq_expanded_new(datatype, gate, 128, 3072, 2304);
+				ccv_nnc_tensor_t* const up_expanded = ftq_expanded_new(datatype, up, 128, 3072, 2304);
+				for (ti = 0; ti < 3; ti++)
+				{
+					routing_t r = routing_top_k(tokens[ti], 8, 128, seed + 7 * tokens[ti]);
+					REQUIRE(ftq_fuses(down, &r, 2304, 1152) && ftq_fuses(gate, &r, 3072, 2304), "Inkling FTQ n%d T=%d should take the fused tile path", n, tokens[ti]);
+					fused++;
+					int m = fused_gemm_mismatches(datatype, &r, 1152, 2304, down, down_expanded, seed + 11 * tokens[ti]);
+					REQUIRE_EQ(m, 0, "fused FTQ down n%d %s table %d T=%d should equal the expand path", n, dtype_name(datatype), t, tokens[ti]);
+					m = fused_swiglu_mismatches(datatype, &r, 2304, 3072, gate, up, gate_expanded, up_expanded, seed + 13 * tokens[ti]);
+					REQUIRE_EQ(m, 0, "fused FTQ gate / up n%d %s table %d T=%d should equal the expand path", n, dtype_name(datatype), t, tokens[ti]);
+					routing_free(&r);
+				}
+				if (n == 34 && t == 0)
+				{
+					// rows per bin 1024 (fused, at the threshold) and 1025 (expanded).
+					int rows;
+					for (rows = 1024; rows <= 1025; rows++)
+					{
+						routing_t r = routing_of(2, (const int[]){ 77, 5 }, (const int[]){ rows, rows });
+						const int fuses = ftq_fuses(down, &r, 2304, 1152);
+						REQUIRE_EQ(fuses, rows == 1024, "FTQ with %d rows per bin should %s", rows, rows == 1024 ? "fuse" : "expand");
+						if (!fuses)
+							expanded_runs++;
+						int m = fused_gemm_mismatches(datatype, &r, 1152, 2304, down, down_expanded, seed + rows);
+						REQUIRE_EQ(m, 0, "FTQ down %s %d rows per bin should equal the expansion", dtype_name(datatype), rows);
+						m = fused_swiglu_mismatches(datatype, &r, 2304, 3072, gate, up, gate_expanded, up_expanded, seed + 3 * rows);
+						REQUIRE_EQ(m, 0, "FTQ gate / up %s %d rows per bin should equal the expansion", dtype_name(datatype), rows);
+						routing_free(&r);
+					}
+				}
+				ccv_nnc_tensor_free(up_expanded);
+				ccv_nnc_tensor_free(gate_expanded);
+				ccv_nnc_tensor_free(down_expanded);
+				ccv_nnc_tensor_free(up);
+				ccv_nnc_tensor_free(gate);
+				ccv_nnc_tensor_free(down);
+			}
+	if (getenv("FTQ_SEGMENTED_VERBOSE"))
+		printf("\n  %d fused routings and %d expanded routings bit-identical to the expansion\n", fused, expanded_runs);
 }
 
 TEST_CASE("mps ftq segmented gemm and swiglu reject what they do not take, without asserting")
