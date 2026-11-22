@@ -483,6 +483,46 @@ static inline std::string ccv_nnc_mfa_ftq_w1_rate_source(const uint32_t n, const
   return body;
 }
 
+// ccv_nnc_mfa_ftq_w1_rate_source over two weights of the same shape and rate at once (the segmented SwiGLU's gate and
+// up): the same lane setup, then for every tile the windows of `codes[0]` decoded into `q[0]`[0 .. 3] and those of
+// `codes[1]` into `q[1]`[0 .. 3], with the same words, funnels and lookups as the one-weight loop, so each decodes
+// exactly as there. `accumulate` reads tile column tc and both weights.
+static inline std::string ccv_nnc_mfa_ftq_w1_rate_pair_source(const uint32_t n, const std::string codes[2], const std::string q[2], const std::string& accumulate)
+{
+  std::string body = "  {\n  constexpr uint N = " + std::to_string(n) + "u;\n  constexpr uint W = N / 2u;\n";
+  if (n >= 16)
+    body += "  const uint lane_bit = (r == 0u ? 16u * N : r * N) + (N >> 3) - 16u;\n";
+  else
+    body += "  const uint lane_raw = r * N + (N >> 3) + 16u * N - 16u;\n"
+      "  const uint lane_bit = lane_raw >= 16u * N ? lane_raw - 16u * N : lane_raw;\n";
+  body += "  const uint o0 = lane_bit >> 5;\n"
+    "  const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;\n"
+    "  const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;\n";
+  if (n > 48)
+    body += "  const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;\n";
+  body += "  const uint sh = lane_bit & 31u;\n"
+    "  // One tile per iteration.\n"
+    "  for (uint tc = stream; tc < tiles_per_row; tc += STREAMS) {\n";
+  for (int i = 0; i < 2; i++) {
+    body += "    float4 " + q[i] + "[4];\n    {\n"
+      "    device const uint* t = " + codes[i] + " + tc * W;\n";
+    if (n > 48)
+      body += "    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2], w3 = t[o3];\n"
+        "    const uint f1 = tmcq_funnel(w1, w2, sh);\n"
+        "    const ulong lo = ((ulong)f1 << 32) | tmcq_funnel(w0, w1, sh);\n"
+        "    const ulong hi = ((ulong)tmcq_funnel(w2, w3, sh) << 32) | f1;\n";
+    else
+      body += "    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2];\n"
+        "    const ulong lo = ((ulong)tmcq_funnel(w1, w2, sh) << 32) | tmcq_funnel(w0, w1, sh);\n"
+        "    const ulong hi = 0;\n";
+    body += "    ftq_decode_lane<N>(lo, hi, " + q[i] + ", (threadgroup const half2*)tmcq_tg);\n    }\n";
+  }
+  body += accumulate;
+  body += "  }\n"
+    "  }\n";
+  return body;
+}
+
 
 // External codebooks (ccv_nnc_codebook.h). In the format of an MFA params struct, bits 16 - 23 of a TMCQ / FTQ format
 // hold log2 of the entry count of an external codebook (9, 10 or 11), 0 for the built-in table: the dispatch puts

@@ -368,7 +368,7 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 	const int rowwise_shape_supported = gate_format == 0 ? (K % 4) == 0 : ccv_nnc_8i_rowwise_x_is_tiled(gate_format) ? (K % 16) == 0 && (N % 16) == 0 : (K % 256) == 0 && (N % 256) == 0;
 	// Static-rate FTQ gate and up: each one CCVFTQSR blob of expert_count N x K experts (as SEGMENTED_GEMM_FORWARD), at
 	// the same rate and codebook slot, with an FP16 or FP32 base matching the activation, read as 32-bit words. A few
-	// rows take two segmented FTQ GEMVs (the packed SwiGLU kernel has no FTQ decode); larger batches take the W8A8
+	// rows take the packed SwiGLU kernel, gate and up in one pass; larger batches take the W8A8
 	// segmented scaled SwiGLU, decoding the tiles in registers (N % 64, K % 64) or expanding the selected experts to int8
 	// rows first. Variable-rate FTQ and Hadamard rotations are rejected.
 	const int ftq_weights = gate_subtype == CCV_NNC_QX_8I_ROWWISE_X && ccv_nnc_8i_rowwise_x_is_ftq_any(gate_format);
@@ -389,9 +389,10 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 	// row (token decode or a broadcast input) keeps the vector path. So do up to 36
 	// routed rows, a 6-token speculative verify, provisionally: the vector path decodes an
 	// expert's weights once per row, so it wins at about one row per expert and loses once
-	// rows share experts (on M5 Max, 0.86x at 36 rows when consecutive tokens share half). FTQ's two GEMVs keep up to
-	// 64 rows: on M5 Ultra (Inkling Mini gate / up, FP32, 128 experts, top-8) they took 13 - 23% less time than the fused
-	// tile path at 40 - 64 rows for n34 (2 - 10% for n64), and lost from about 72 (n64) or 80 (n34) rows.
+	// rows share experts (on M5 Max, 0.86x at 36 rows when consecutive tokens share half). FTQ's packed SwiGLU keeps up
+	// to 64 rows: on M5 Ultra (FP32, 128 experts, top-8, n16 - n64) it took 5 - 22% less time than the fused tile path at
+	// 48 and 64 rows for both 1152 x 2304 and 3072 x 2304 gate / up, but at 72 - 80 rows lost up to 3% (n16, n34) on
+	// 3072 x 2304.
 	const int fused_packed_matrix_supported =
 		ccv_nnc_mfa_segmented_scaled_gemm_fuses_packed_format(gate_format, M, bincount, N, K) &&
 		a->info.datatype == CCV_32F && use_neural_accelerators;
@@ -427,7 +428,10 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 		 // TMCQ (no modifier bits): one threadgroup per 16-row tile row (N % 16 and K % 16 above).
 		 (ccv_nnc_8i_rowwise_x_is_tmcq(gate_format) && !(gate_format & ~CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) &&
 		  // The kernel reads tiles as 32-bit words.
-		  (gate_w->dataof % 4) == 0 && (up_w->dataof % 4) == 0));
+		  (gate_w->dataof % 4) == 0 && (up_w->dataof % 4) == 0) ||
+		 // Static-rate FTQ (checked above: word-aligned blobs, no Hadamard rotation): one threadgroup per 16-row tile
+		 // row, gate and up summed in the order of the segmented FTQ GEMV.
+		 ftq_weights);
 	// A one-row shared expert with int8 rowwise (Q8_0, Q5_K or Q6_K) weights over the same FP32
 	// input width joins the packed decode dispatch when the routed weights are resident.
 	const ccv_nnc_tensor_view_t* const shared_a = shared ? (const ccv_nnc_tensor_view_t*)shared[0] : 0;
@@ -447,7 +451,8 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 		 (shared_format == CCV_NNC_QX_8I_ROWWISE_Q5_K || shared_format == CCV_NNC_QX_8I_ROWWISE_Q6_K) &&
 		 (shared_rows % 256) == 0 && (K % 256) == 0));
 	const int routed_waits = (gate_resolved > 0 && gate_weight_view.readiness_value) || (up_resolved > 0 && up_weight_view.readiness_value);
-	const int fuse_shared = shared && packed_small_batch && !routed_waits &&
+	// FTQ routed weights never take the shared expert into their dispatch.
+	const int fuse_shared = shared && packed_small_batch && !ftq_weights && !routed_waits &&
 		a->info.datatype == CCV_32F && shared_a->info.datatype == CCV_32F && shared_output->info.datatype == CCV_32F &&
 		shared_rows > 0 && shared_a->info.dim[ccv_nnc_tensor_nd(shared_a->info.dim) - 1] == (int)K &&
 		ccv_nnc_tensor_count(shared_a->info) == K && ccv_nnc_tensor_count(shared_output->info) == shared_rows &&

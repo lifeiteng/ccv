@@ -20,10 +20,10 @@
 // are 1 (so the FP16 outputs are the int8 codes), and takes the FP16 row scales from the blob. Any bit string is a valid
 // code, so codes are random bytes.
 // Paths: the selected-expert int8 decode (bit for bit), segmented GEMM through the fused FTQ GEMV (one row per bin) and
-// through the W8A8 segmented scaled GEMM, segmented SwiGLU through two FTQ GEMVs and through the W8A8 segmented scaled
-// SwiGLU (both W8A8 kernels decoding the tiles in registers, N % 64 and K % 64, bit for bit with the selected-expert
-// decode into int8 rows that they replace, or taking that expansion), MoE weights streaming of FTQ banks, and the
-// rejections.
+// through the W8A8 segmented scaled GEMM, segmented SwiGLU through the packed SwiGLU kernel (gate and up in one pass,
+// bit for bit with two FTQ GEMVs and the SwiGLU of their outputs) and through the W8A8 segmented scaled SwiGLU (both
+// W8A8 kernels decoding the tiles in registers, N % 64 and K % 64, bit for bit with the selected-expert decode into int8
+// rows that they replace, or taking that expansion), MoE weights streaming of FTQ banks, and the rejections.
 
 TEST_SETUP()
 {
@@ -904,6 +904,174 @@ TEST_CASE("mps ftq segmented swiglu gemv and w8a8 paths match the fp32 reference
 					ccv_nnc_tensor_free(gate_host);
 				}
 	routing_free(&w8a8);
+	routing_free(&direct);
+	routing_free(&gemv);
+}
+
+// The packed segmented SwiGLU on FTQ (small batches: gate and up of every route in one kernel) against its definition,
+// two segmented FTQ GEMVs and the SwiGLU of their outputs. The GEMVs run as SEGMENTED_GEMM_FORWARD with one row per bin
+// (its GEMV path) on every routed row's own expert and activation row, on FP32-base twins of the weights (the blob is
+// the same bytes whatever the base), so that for FP16 too they give gate and up as floats before any rounding to the io
+// type, which is what the fused kernel holds. The SwiGLU follows the kernel's float arithmetic on the CPU (the clamp,
+// sigmoid as tail + (1 - 2 tail) with tail = 1 / (1 + exp |gate|), ((up gate) sigmoid) route) and rounds to the io
+// type once, except exp |gate|: the CPU's expf and Metal's precise::exp differ in the last place for about a quarter of
+// these values, so it comes from EWEXP_FORWARD on the GPU, which is precise::exp in float. Every output must match bit
+// for bit; the worst ulp distance is reported if one does not.
+static int bit_mismatches(const float* const x, const float* const y, const size_t count);
+
+static void gpu_exp(const float* const x, const int count, float* const y)
+{
+	ccv_nnc_tensor_t* const gx = gpu_from_floats(CCV_32F, x, 1, count);
+	ccv_nnc_tensor_t* const gy = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32F, 1, count), 0);
+	ccv_nnc_cmd_t cmd = CMD_EWEXP_FORWARD();
+	cmd.backend = CCV_NNC_BACKEND_MPS;
+	ccv_nnc_cmd_exec(cmd, ccv_nnc_no_hint, 0, TENSOR_LIST(gx), TENSOR_LIST(gy), 0);
+	floats_from_gpu(gy, y);
+	ccv_nnc_tensor_free(gy);
+	ccv_nnc_tensor_free(gx);
+}
+
+static void ftq_swiglu_reference(const float* const g, const float* const u, const float* const route, const int rows, const int n_rows, const int datatype, float* const want)
+{
+	const int count = rows * n_rows;
+	float* const e = (float*)ccmalloc(sizeof(float) * ccv_max(count, 1));
+	int i, j;
+	for (i = 0; i < count; i++)
+		e[i] = fabsf(fminf(g[i], swiglu_clamp));
+	gpu_exp(e, count, e);
+	for (i = 0; i < rows; i++)
+		for (j = 0; j < n_rows; j++)
+		{
+			const size_t x = (size_t)i * n_rows + j;
+			const float gate = fminf(g[x], swiglu_clamp);
+			const float up = fminf(fmaxf(u[x], -swiglu_clamp), swiglu_clamp);
+			const float tail = 1.0f / (1.0f + e[x]);
+			const float rest = 1.0f - 2.0f * tail;
+			const float sigmoid = gate >= 0 ? tail + rest : tail;
+			const float product = up * gate;
+			const float swish = product * sigmoid;
+			want[x] = swish * route[i];
+		}
+	ccfree(e);
+	io_round(datatype, want, count);
+}
+
+// Activation rows with every mantissa bit of the io type in use and magnitudes over 2^-6 .. 1, so that the dot products
+// round and a different summation order shows (activations_new's multiples of 2^-10 keep these sums exact).
+static float* activations_fine_new(const int datatype, const int rows, const int k, uint32_t seed)
+{
+	float* const a = (float*)ccmalloc(sizeof(float) * rows * k);
+	size_t i;
+	for (i = 0; i < (size_t)rows * k; i++)
+	{
+		const int m = (int)(rng_next(&seed) & 0xffffff) - 0x800000;
+		a[i] = ldexpf((float)m, -23 - (int)(rng_next(&seed) % 7));
+	}
+	io_round(datatype, a, (size_t)rows * k);
+	return a;
+}
+
+// The routed rows of r as one row per bin (each row's expert), and their activation rows (a broadcast row repeated).
+static routing_t routing_per_row(const routing_t* const r)
+{
+	int* const counts = (int*)ccmalloc(sizeof(int) * ccv_max(r->rows, 1));
+	int i;
+	for (i = 0; i < r->rows; i++)
+		counts[i] = 1;
+	routing_t one = routing_of(r->rows, r->row_expert, counts);
+	ccfree(counts);
+	return one;
+}
+
+static int ulp_distance(const float x, const float y)
+{
+	int32_t a, b;
+	memcpy(&a, &x, 4);
+	memcpy(&b, &y, 4);
+	a = a < 0 ? (int32_t)0x80000000 - a : a;
+	b = b < 0 ? (int32_t)0x80000000 - b : b;
+	return abs(a - b);
+}
+
+// Outputs of the packed FTQ SwiGLU that differ from the two GEMVs and the SwiGLU in any bit (-1 if a command fails);
+// *ulps is the worst distance in units of the output type's last place, as floats.
+static int ftq_swiglu_gemv_mismatches(const int datatype, const routing_t* const r, const int input_rows, const int k, const int n_rows, ccv_nnc_tensor_t* const gate, ccv_nnc_tensor_t* const up, ccv_nnc_tensor_t* const gate32, ccv_nnc_tensor_t* const up32, const uint32_t seed, int* const ulps)
+{
+	float* const a = activations_fine_new(datatype, input_rows, k, seed);
+	float* const route = route_weights_new(datatype, r->rows);
+	float* const out = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	float* const g = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	float* const u = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	float* const want = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	float* const rows_a = (float*)ccmalloc(sizeof(float) * r->rows * k);
+	int i;
+	for (i = 0; i < r->rows; i++)
+		memcpy(rows_a + (size_t)i * k, a + (size_t)(input_rows == 1 ? 0 : i) * k, sizeof(float) * k);
+	routing_t one = routing_per_row(r);
+	int mismatches = -1;
+	*ulps = 0;
+	if (run_segmented_swiglu(datatype, r, a, input_rows, route, k, n_rows, gate, up, 0, out) == CCV_NNC_EXEC_SUCCESS &&
+		run_segmented_gemm(CCV_32F, &one, rows_a, k, n_rows, gate32, 0, 0, g) == CCV_NNC_EXEC_SUCCESS &&
+		run_segmented_gemm(CCV_32F, &one, rows_a, k, n_rows, up32, 0, 0, u) == CCV_NNC_EXEC_SUCCESS)
+	{
+		ftq_swiglu_reference(g, u, route, r->rows, n_rows, datatype, want);
+		mismatches = bit_mismatches(out, want, (size_t)r->rows * n_rows);
+		for (i = 0; i < r->rows * n_rows; i++)
+			*ulps = ccv_max(*ulps, ulp_distance(out[i], want[i]) >> (datatype == CCV_16F ? 13 : 0));
+	}
+	routing_free(&one);
+	ccfree(rows_a);
+	ccfree(want);
+	ccfree(u);
+	ccfree(g);
+	ccfree(out);
+	ccfree(route);
+	ccfree(a);
+	return mismatches;
+}
+
+TEST_CASE("mps ftq packed segmented swiglu equals two segmented ftq gemvs and the swiglu bit for bit")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS) && ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	static const int ks[] = { 16, 272, 1152, 2304 };
+	static const int rates[] = { 16, 18, 24, 32, 34, 48, 56, 64 };
+	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table();
+	// One row per bin; the same 4 bins with one broadcast input row; 3 rows per bin over 5 bins, one of them empty.
+	routing_t gemv = routing_of(4, small_gemv_indices, small_gemv_counts);
+	routing_t direct = routing_of(5, small_w8a8_indices, (const int[]){ 3, 3, 0, 3, 3 });
+	int ki, ri, d, t;
+	for (ki = 0; ki < 4; ki++)
+		for (ri = 0; ri < 8; ri++)
+			for (d = 0; d < 2; d++)
+				for (t = 0; t < 3; t++)
+				{
+					const int datatype = d ? CCV_32F : CCV_16F;
+					const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
+					const uint32_t seed = 0x5b1a00u + ki * 97 + ri * 13 + d * 5 + t;
+					ccv_nnc_tensor_t* gate_host;
+					ccv_nnc_tensor_t* up_host;
+					ccv_nnc_tensor_t* gate32_host;
+					ccv_nnc_tensor_t* up32_host;
+					ccv_nnc_tensor_t* const gate = ftq_weight_new(datatype, 6, 48, ks[ki], rates[ri], table, seed, &gate_host);
+					ccv_nnc_tensor_t* const up = ftq_weight_new(datatype, 6, 48, ks[ki], rates[ri], table, seed + 1000, &up_host);
+					ccv_nnc_tensor_t* const gate32 = ftq_weight_new(CCV_32F, 6, 48, ks[ki], rates[ri], table, seed, &gate32_host);
+					ccv_nnc_tensor_t* const up32 = ftq_weight_new(CCV_32F, 6, 48, ks[ki], rates[ri], table, seed + 1000, &up32_host);
+					int ulps;
+					int m = ftq_swiglu_gemv_mismatches(datatype, &gemv, gemv.rows, ks[ki], 48, gate, up, gate32, up32, seed, &ulps);
+					REQUIRE_EQ(m, 0, "packed FTQ SwiGLU %s K=%d n%d table %d, one row per bin, should equal the GEMVs (worst %d ulp)", dtype_name(datatype), ks[ki], rates[ri], t, ulps);
+					m = ftq_swiglu_gemv_mismatches(datatype, &gemv, 1, ks[ki], 48, gate, up, gate32, up32, seed + 1, &ulps);
+					REQUIRE_EQ(m, 0, "packed FTQ SwiGLU %s K=%d n%d table %d, broadcast input, should equal the GEMVs (worst %d ulp)", dtype_name(datatype), ks[ki], rates[ri], t, ulps);
+					m = ftq_swiglu_gemv_mismatches(datatype, &direct, direct.rows, ks[ki], 48, gate, up, gate32, up32, seed + 2, &ulps);
+					REQUIRE_EQ(m, 0, "packed FTQ SwiGLU %s K=%d n%d table %d, 3 rows per bin and an empty bin, should equal the GEMVs (worst %d ulp)", dtype_name(datatype), ks[ki], rates[ri], t, ulps);
+					ccv_nnc_tensor_free(up32);
+					ccv_nnc_tensor_free(up32_host);
+					ccv_nnc_tensor_free(gate32);
+					ccv_nnc_tensor_free(gate32_host);
+					ccv_nnc_tensor_free(up);
+					ccv_nnc_tensor_free(up_host);
+					ccv_nnc_tensor_free(gate);
+					ccv_nnc_tensor_free(gate_host);
+				}
 	routing_free(&direct);
 	routing_free(&gemv);
 }
