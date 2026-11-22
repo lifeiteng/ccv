@@ -185,8 +185,8 @@ uint32_t SegmentedScaledGEMMKernel::maxTileRecords(uint32_t originalM, uint32_t 
 bool SegmentedScaledGEMMKernel::fusesPackedFormat(uint32_t format, uint64_t M, uint32_t binCount, uint32_t N, uint32_t K) noexcept
 {
   // Static-rate FTQ (with the built-in, an external or a folded table) decodes in registers on the same 16 x 16 tile grid
-  // and 32 x 64 x 64 register tiles as TMCQ, so it takes N % 64 and K % 64 too. Like TMCQ's, the register decoder decodes
-  // each weight again for every 32-row tile. On M5 Ultra (Inkling Mini routed shapes, FP32, n34 and n64) it beat
+  // and 32 x 64 x 64 register tiles as TMCQ (64 x 64 x 64 from rate 32 at long prefill, registerTileRows), so it takes
+  // N % 64 and K % 64 too. Like TMCQ's, the register decoder decodes each weight again for every row tile. On M5 Ultra (Inkling Mini routed shapes, FP32, n34 and n64) it beat
   // expanding the selected experts from 2 to 512 rows per bin, tied at 1024 rows per bin over 8 to 64 experts, and at
   // 2048 rows per bin expanding was up to 12% faster.
   if (segmentedFTQRate(format))
@@ -215,6 +215,19 @@ bool SegmentedScaledGEMMKernel::fusesPackedFormat(uint32_t format, uint64_t M, u
   // The shared group decoder decodes each weight again for every row tile. It wins up to
   // about 64 rows per bin, but expanding once is faster for longer prefill.
   return M <= (uint64_t)binCount * 64;
+}
+
+uint16_t SegmentedScaledGEMMKernel::registerTileRows(uint32_t format, uint64_t M, uint32_t binCount) noexcept
+{
+  // A 64-row tile decodes each weight fragment once for two 32-row activation tiles. On M5 Ultra (FP32, 128 experts
+  // top-8) it took 2 - 9% less time than 32-row tiles from rate 32 to 64 at 32 to 512 rows per bin on the DeepSeek
+  // shapes (down 2304 x 1152, gate / up 3072 x 2304) and Inkling Mini's down, and 1 - 4% less on Inkling Mini's
+  // gate / up (1152 x 2304) up to 256 rows per bin, but 0 - 3% more there at 512. Decoding the fragments again for the
+  // second half did not make it slower, so the gain is not the saved decode. At n16 it took up to 5% more, at n24 it
+  // was mixed, and at 16 rows per bin it gained nothing.
+  if (segmentedFTQRate(format) >= 32 && M >= (uint64_t)binCount * 32)
+    return 64;
+  return 32;
 }
 
 std::string SegmentedScaledGEMMKernel::createSource() const noexcept
@@ -366,7 +379,8 @@ kernel void segmented_scaled_gemm_plan(
     // threadgroup memory or waits on a threadgroup barrier per K step. Fragment layout and
     // MPP register assembly follow NAInt8MatMulKernel's register path.
     CCV_NNC_MFA_PRECONDITION(format == CCV_NNC_QX_8I_ROWWISE_IQ2_XXS || format == CCV_NNC_QX_8I_ROWWISE_Q2_K || format == CCV_NNC_QX_8I_ROWWISE_IQ3_XXS || tileRate);
-    CCV_NNC_MFA_PRECONDITION(blockDimensions[0] == 32 && blockDimensions[1] == 32 * executionSIMDGroups);
+    // Static-rate FTQ also takes 64-row tiles (SegmentedScaledGEMMDescriptor's tileRows).
+    CCV_NNC_MFA_PRECONDITION((blockDimensions[0] == 32 || (blockDimensions[0] == 64 && ftqRate)) && blockDimensions[1] == 32 * executionSIMDGroups);
     source += R"(
 // A 16x16 fragment has eight values per lane: four adjacent columns in each of
 // two rows eight apart. A SIMD group owns a 2x2 array of fragments, where
@@ -622,7 +636,11 @@ __attribute__((always_inline)) inline void multiply_register_tiles(thread accumu
   }
 }
 
-template<bool full_rows>
+\)";
+    // The 32- or 64-row multiply_register. A trailing backslash keeps CodeWriter from adding a line break, so the
+    // 32-row source is the same text as before the 64-row variant.
+    if (blockDimensions[0] == 32)
+      source += R"(template<bool full_rows>
 inline void multiply_register(const device int8_t* A, const device uchar* B, decode_tables tables,
     device {{IO_TYPE}}* C, const device {{IO_TYPE}}* A_scale, const device {{B_SCALE_TYPE}}* B_scale,
     short rows, ushort lane) {
@@ -674,7 +692,81 @@ inline void multiply_register(const device int8_t* A, const device uchar* B, dec
   }
 }
 
-[[kernel, max_total_threads_per_threadgroup({{SIMDGROUPS}} * 32)]] void segmented_scaled_gemm(
+\)";
+    else
+      source += R"(// A 64-row tile: each SIMD group decodes its 32 weight rows once per K64 step and multiplies them with two 32-row
+// activation tiles (rows 0 - 31 and 32 - 63), so one decode serves 64 rows. Only the accumulators double; the second
+// activation tile loads after the first one's products. two_halves is false when the tile has at most 32 rows (the
+// second half is skipped), and full_rows says whether the last half taken is whole; any earlier half is.
+template<bool full_rows, bool two_halves>
+__attribute__((always_inline)) inline void multiply_register_k64(thread accumulator_tile (&accum)[2],
+    const device int8_t* A, const device uchar* B, decode_tables tables, uint k, short rows, short2 origin) {
+  register_tile b[2];
+  decode_weight_tiles(b, B, tables, k, origin);
+  {
+    register_tile a[2];
+    load_activation_tiles<full_rows || two_halves>(a, A + k, rows, origin);
+    multiply_register_tiles(accum[0], a[0], b[0]);
+    multiply_register_tiles(accum[0], a[1], b[1]);
+  }
+  if (two_halves) {
+    register_tile a[2];
+    load_activation_tiles<full_rows>(a, A + 32u * K + k, rows - 32, origin);
+    multiply_register_tiles(accum[1], a[0], b[0]);
+    multiply_register_tiles(accum[1], a[1], b[1]);
+  }
+}
+
+template<bool full_rows, bool two_halves>
+inline void multiply_register(const device int8_t* A, const device uchar* B, decode_tables tables,
+    device {{IO_TYPE}}* C, const device {{IO_TYPE}}* A_scale, const device {{B_SCALE_TYPE}}* B_scale,
+    short rows, ushort lane) {
+  const short2 origin = register_fragment_coordinate(lane);
+  A += origin.y * K + origin.x * 4;
+{{REGISTER_WEIGHT_ROW_OFFSET}}
+  accumulator_tile accum[2];
+  #pragma clang loop unroll(full)
+  for (short h = 0; h < 2; ++h) {
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 4; ++i)
+      accum[h].fragments[i] = vec<int32_t, 8>(0);
+  }
+  // Keep the SIMD groups in step every K512 so they share activation lines in cache.
+  #pragma clang loop unroll(disable)
+  for (uint block = 0; block < K / 512u; ++block) {
+    threadgroup_barrier(mem_flags::mem_none);
+    for (uint k = block * 512u; k < block * 512u + 512u; k += 64u)
+      multiply_register_k64<full_rows, two_halves>(accum, A, B, tables, k, rows, origin);
+  }
+  // K is a multiple of 64.
+  #pragma clang loop unroll(disable)
+  for (uint k = K / 512u * 512u; k < K; k += 64u)
+    multiply_register_k64<full_rows, two_halves>(accum, A, B, tables, k, rows, origin);
+  C += size_t(origin.y) * N + origin.x;
+  #pragma clang loop unroll(full)
+  for (short h = 0; h < (two_halves ? 2 : 1); ++h) {
+    #pragma clang loop unroll(full)
+    for (short m = 0; m < 2; ++m) {
+      #pragma clang loop unroll(full)
+      for (short n = 0; n < 2; ++n) {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 8; ++i) {
+          const short row = h * 32 + m * 16 + (i / 4) * 8;
+          const short col = n * 16 + i % 4;
+          if ((h == 0 && two_halves) || full_rows || row < rows - origin.y) {
+#pragma METAL fp math_mode(safe)
+            // Fixed (acc * a) * b order: fast-math must not reassociate the dequantization.
+            C[size_t(row) * N + col] = ({{IO_TYPE}})((float(accum[h].fragments[m * 2 + n][i]) *
+              float(A_scale[origin.y + row])) * float(B_scale[origin.x + col]));
+          }
+        }
+      }
+    }
+  }
+}
+
+\)";
+    source += R"([[kernel, max_total_threads_per_threadgroup({{SIMDGROUPS}} * 32)]] void segmented_scaled_gemm(
     device int8_t* A_buf [[buffer(0)]],
     device const uchar* B_buf [[buffer(1)]],
     device {{IO_TYPE}}* C_buf [[buffer(2)]],
@@ -746,10 +838,23 @@ inline void multiply_register(const device int8_t* A, const device uchar* B, dec
     source += R"(
   // The row check uses the whole threadgroup tile, because multiply_register
   // contains threadgroup barriers.
-  if (m_count == M_block)
+\)";
+    if (blockDimensions[0] == 32)
+      source += R"(  if (m_count == M_block)
     multiply_register<true>(A_buf, B_buf, tables, C_buf, A_scale_buf, B_scale_buf, rows, lane);
   else
     multiply_register<false>(A_buf, B_buf, tables, C_buf, A_scale_buf, B_scale_buf, rows, lane);
+}
+)";
+    else
+      source += R"(  if (m_count == 64u)
+    multiply_register<true, true>(A_buf, B_buf, tables, C_buf, A_scale_buf, B_scale_buf, rows, lane);
+  else if (m_count > 32u)
+    multiply_register<false, true>(A_buf, B_buf, tables, C_buf, A_scale_buf, B_scale_buf, rows, lane);
+  else if (m_count == 32u)
+    multiply_register<true, false>(A_buf, B_buf, tables, C_buf, A_scale_buf, B_scale_buf, rows, lane);
+  else
+    multiply_register<false, false>(A_buf, B_buf, tables, C_buf, A_scale_buf, B_scale_buf, rows, lane);
 }
 )";
     std::string shader = source.ToString();

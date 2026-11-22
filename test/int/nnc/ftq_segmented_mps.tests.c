@@ -1105,6 +1105,108 @@ TEST_CASE("mps ftq fused segmented gemm and swiglu equal the expand path bit for
 	routing_free(&r);
 }
 
+// The register tile rows the routed prefill of `r` takes on this FTQ weight (32, or 64 for static rates from 32 at 32
+// or more rows per bin on average, empty bins included).
+static int ftq_tile_rows(const ccv_nnc_tensor_t* const gq, const routing_t* const r)
+{
+	return ccv_nnc_mfa_segmented_scaled_gemm_register_tile_rows((uint32_t)ccv_nnc_8i_rowwise_x_kernel_format(gq->info.reserved), r->rows, r->bins);
+}
+
+// The 64-row register tiles (each SIMD group's decoded weight fragments serve two 32-row activation tiles) against the
+// expand path, on 6 experts of 128 rows at K = 320 (K tail loop only) and K = 1152 (K512 blocks and a tail):
+// - wide: bins of 0, 1, 31, 32, 33, 64, 65, 97, 128 and 129 rows (an empty bin, tiles of one half, a whole half, two
+//   whole halves and every partial second half), 58 rows per bin, 64-row tiles;
+// - at: 0, 95 and 1 rows, exactly 32 rows per bin, 64-row tiles; below: 0, 94 and 1, one row fewer, 32-row tiles;
+// - skewed: one 130-row bin and five of at most one row, 22 rows per bin, 32-row tiles although one bin is long.
+// Every static rate from 32 with the built-in table at K = 1152 on the wide routing; n34, n48 and n64 with the
+// built-in, external and folded tables on every routing at both K; n16 and n24 stay on 32-row tiles. Both FP16 and
+// FP32. Then the same weights with M loaded at run time (one pipeline per tile size): skewed, wide, skewed, at, below.
+TEST_CASE("mps ftq fused segmented gemm and swiglu 64-row tiles equal the expand path bit for bit")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
+	GUARD_ELSE_RETURN(ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_default_mfa_context()));
+	static const int ks[] = { 320, 1152 };
+	const ftq_table_t external = ftq_external_table(), folded = ftq_folded_table();
+	static const int wide_indices[] = { 5, 0, 3, 2, 4, 1, 5, 0, 3, 2 };
+	static const int wide_counts[] = { 0, 1, 31, 32, 33, 64, 65, 97, 128, 129 };
+	static const int three_indices[] = { 4, 1, 3 };
+	static const int at_counts[] = { 0, 95, 1 };
+	static const int below_counts[] = { 0, 94, 1 };
+	static const int skewed_indices[] = { 2, 0, 5, 1, 4, 3 };
+	static const int skewed_counts[] = { 130, 1, 1, 0, 1, 1 };
+	routing_t routings[4] = {
+		routing_of(10, wide_indices, wide_counts),
+		routing_of(3, three_indices, at_counts),
+		routing_of(3, three_indices, below_counts),
+		routing_of(6, skewed_indices, skewed_counts),
+	};
+	static const int want_rows[4] = { 64, 64, 32, 32 };
+	static const char* const routing_names[4] = { "wide", "at", "below", "skewed" };
+	static const int runtime_m_order[] = { 3, 0, 3, 1, 2 };
+	const int n_rows = 128;
+	int ki, n, d, t, ri, i, runs64 = 0, runs32 = 0;
+	for (ki = 0; ki < 2; ki++)
+		for (n = 16; n <= 64; n += 2)
+			for (d = 0; d < 2; d++)
+				for (t = 0; t < 3; t++)
+				{
+					const int focus = n == 34 || n == 48 || n == 64;
+					// Every rate from 32 at K = 1152 with the built-in table; n16 and n24 as the low-rate contrast.
+					if (!focus && (t > 0 || (n >= 32 ? ki == 0 : (n != 16 && n != 24))))
+						continue;
+					const int datatype = d ? CCV_32F : CCV_16F;
+					const ftq_table_t* const table = t == 0 ? &ftq_builtin : t == 1 ? &external : &folded;
+					const uint32_t seed = 0x64f0e0u + ki * 977 + n * 13 + d * 5 + t;
+					ccv_nnc_tensor_t* gate_host;
+					ccv_nnc_tensor_t* up_host;
+					ccv_nnc_tensor_t* const gate = ftq_weight_new(datatype, 6, n_rows, ks[ki], n, table, seed, &gate_host);
+					ccv_nnc_tensor_t* const up = ftq_weight_new(datatype, 6, n_rows, ks[ki], n, table, seed + 1000, &up_host);
+					ccv_nnc_tensor_t* const gate_expanded = ftq_expanded_new(datatype, gate, 6, n_rows, ks[ki]);
+					ccv_nnc_tensor_t* const up_expanded = ftq_expanded_new(datatype, up, 6, n_rows, ks[ki]);
+					for (ri = 0; ri < (focus || n < 32 ? 4 : 1); ri++)
+					{
+						const routing_t* const r = routings + ri;
+						REQUIRE(ftq_fuses(gate, r, n_rows, ks[ki]), "FTQ n%d %s routing should take the fused tile path", n, routing_names[ri]);
+						const int rows = ftq_tile_rows(gate, r);
+						REQUIRE_EQ(rows, n >= 32 ? want_rows[ri] : 32, "FTQ n%d %s routing (%d rows, %d bins) should take %d-row tiles", n, routing_names[ri], r->rows, r->bins, n >= 32 ? want_rows[ri] : 32);
+						if (rows == 64)
+							runs64++;
+						else
+							runs32++;
+						int m = fused_gemm_mismatches(datatype, r, ks[ki], n_rows, gate, gate_expanded, seed + 2 + ri);
+						REQUIRE_EQ(m, 0, "fused FTQ segmented GEMM %s K=%d n%d table %d %s routing (%d-row tiles) should equal the expand path", dtype_name(datatype), ks[ki], n, t, routing_names[ri], rows);
+						m = fused_swiglu_mismatches(datatype, r, ks[ki], n_rows, gate, up, gate_expanded, up_expanded, seed + 7 + ri);
+						REQUIRE_EQ(m, 0, "fused FTQ segmented SwiGLU %s K=%d n%d table %d %s routing (%d-row tiles) should equal the expand path", dtype_name(datatype), ks[ki], n, t, routing_names[ri], rows);
+					}
+					if (focus && ki == 1 && t != 1)
+					{
+						// Runtime M: the pipelines are keyed by tile size, not M, so a 64-row and a 32-row routing alternate.
+						const uint64_t old_flags = ccv_nnc_flags();
+						ccv_nnc_enable_flag(CCV_NNC_DISABLE_MFA_GEMM_SPECIALIZING_M);
+						for (i = 0; i < (int)(sizeof(runtime_m_order) / sizeof(runtime_m_order[0])); i++)
+						{
+							const routing_t* const r = routings + runtime_m_order[i];
+							int m = fused_gemm_mismatches(datatype, r, ks[ki], n_rows, gate, gate_expanded, seed + 31 + i);
+							REQUIRE_EQ(m, 0, "runtime-M fused FTQ segmented GEMM %s n%d table %d %s routing should equal the expand path", dtype_name(datatype), n, t, routing_names[runtime_m_order[i]]);
+							m = fused_swiglu_mismatches(datatype, r, ks[ki], n_rows, gate, up, gate_expanded, up_expanded, seed + 37 + i);
+							REQUIRE_EQ(m, 0, "runtime-M fused FTQ segmented SwiGLU %s n%d table %d %s routing should equal the expand path", dtype_name(datatype), n, t, routing_names[runtime_m_order[i]]);
+						}
+						if (!(old_flags & CCV_NNC_DISABLE_MFA_GEMM_SPECIALIZING_M))
+							ccv_nnc_disable_flag(CCV_NNC_DISABLE_MFA_GEMM_SPECIALIZING_M);
+					}
+					ccv_nnc_tensor_free(up_expanded);
+					ccv_nnc_tensor_free(gate_expanded);
+					ccv_nnc_tensor_free(up);
+					ccv_nnc_tensor_free(up_host);
+					ccv_nnc_tensor_free(gate);
+					ccv_nnc_tensor_free(gate_host);
+				}
+	if (getenv("FTQ_SEGMENTED_VERBOSE"))
+		printf("\n  %d routings on 64-row tiles and %d on 32-row tiles bit-identical to the expand path\n", runs64, runs32);
+	for (ri = 0; ri < 4; ri++)
+		routing_free(routings + ri);
+}
+
 // Inkling Mini, down 2304 x 1152 (K % 256 != 0) and gate / up 3072 x 2304 over 128 experts, top-8 routing at T = 64, 512
 // and 2048 (4 - 128 rows per bin, all fused), n16 / n34 / n48 / n64 with the built-in table and n34 / n64 with the
 // external and folded ones, FP16 and FP32. Then the M threshold: 2 bins of 1024 rows each still fuse, 2 bins of 1025

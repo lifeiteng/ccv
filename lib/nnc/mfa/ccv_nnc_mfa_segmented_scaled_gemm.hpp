@@ -28,6 +28,8 @@ void ccv_nnc_mfa_encode_segmented_scaled_gemm(ccv_nnc_mfa_context_t* context, cc
 // Whether packed weights in this format should be decoded per tile rather than expanded into scratch, for N x K
 // weights per expert (the tile decoders need whole column and K blocks, see SegmentedScaledGEMMKernel).
 int ccv_nnc_mfa_segmented_scaled_gemm_fuses_packed_format(uint32_t format, uint64_t M, uint32_t bincount, uint32_t N, uint32_t K);
+// The rows of the register tile a fused packed format takes at this M (SegmentedScaledGEMMKernel::registerTileRows).
+int ccv_nnc_mfa_segmented_scaled_gemm_register_tile_rows(uint32_t format, uint64_t M, uint32_t bincount);
 
 #ifdef __cplusplus
 } // extern "C"

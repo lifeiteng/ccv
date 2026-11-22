@@ -137,6 +137,11 @@ int ccv_nnc_mfa_segmented_scaled_gemm_fuses_packed_format(uint32_t format, uint6
   return SegmentedScaledGEMMKernel::fusesPackedFormat(format, M, bincount, N, K) ? 1 : 0;
 }
 
+int ccv_nnc_mfa_segmented_scaled_gemm_register_tile_rows(uint32_t format, uint64_t M, uint32_t bincount)
+{
+  return SegmentedScaledGEMMKernel::registerTileRows(format, M, bincount);
+}
+
 void ccv_nnc_mfa_encode_segmented_scaled_gemm(
     mfa::context* context,
     ccv_nnc_mfa_segmented_scaled_gemm_params_t params,

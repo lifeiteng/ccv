@@ -29,6 +29,10 @@ struct SegmentedScaledGEMMKernel {
   // N % 256 and K % 256. Other shapes expand the selected experts to int8 rows instead.
   static bool fusesPackedFormat(uint32_t format, uint64_t M, uint32_t binCount, uint32_t N, uint32_t K) noexcept;
 
+  // The rows of a register tile (formats whose tiles decode in registers, see fusesPackedFormat): 64 for static-rate
+  // FTQ from rate 32 at 32 or more rows per bin on average (empty bins count), otherwise 32.
+  static uint16_t registerTileRows(uint32_t format, uint64_t M, uint32_t binCount) noexcept;
+
   std::string createSource() const noexcept;
 };
 
