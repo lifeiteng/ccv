@@ -20,9 +20,10 @@ static uint64_t _ccv_nnc_segmented_swiglu_mtl_datatype(const int datatype)
 	}
 }
 
-// The MFA format and codebook of a TMCQ gate / up pair reading an external pair codebook (ccv_nnc_codebook.h): format
-// is the kernel format, with log2 of the entry count of the codebook in bits 16 - 23 for a nonzero slot. Both weights
-// must name the same slot, and only TMCQ takes a nonzero one. Returns 0 if they cannot run together.
+// The MFA format and codebook of a TMCQ / FTQ gate / up pair reading an external pair codebook (ccv_nnc_codebook.h):
+// format is the kernel format, with log2 of the entry count of the codebook in bits 16 - 23 for a nonzero slot (and,
+// for FTQ, bit 24 for a quadrant-folded table). Both weights must name the same slot, and only TMCQ and static-rate
+// FTQ take a nonzero one. Returns 0 if they cannot run together.
 static int _ccv_nnc_segmented_swiglu_codebook(const ccv_nnc_tensor_view_t* const gate_w, const ccv_nnc_tensor_view_t* const up_w, uint32_t* const format, mtl_buffer_t** const codebook)
 {
 	*codebook = NULL;
@@ -33,12 +34,12 @@ static int _ccv_nnc_segmented_swiglu_codebook(const ccv_nnc_tensor_view_t* const
 		if ((weights[i]->info.datatype & 0xf00) == CCV_NNC_QX_8I_ROWWISE_X)
 		{
 			slots[i] = ccv_nnc_codebook_slot_of(weights[i]->info.reserved);
-			if (slots[i] && !ccv_nnc_8i_rowwise_x_is_tmcq(weights[i]->info.reserved))
+			if (slots[i] && !ccv_nnc_8i_rowwise_x_is_tmcq(weights[i]->info.reserved) && !ccv_nnc_8i_rowwise_x_is_ftq(weights[i]->info.reserved))
 				return 0;
 		}
 	if (slots[0] != slots[1])
 		return 0;
-	return ccv_nnc_mfa_codebook_format(ccv_nnc_default_mfa_context(), slots[0], 0, format, codebook);
+	return ccv_nnc_mfa_codebook_format(ccv_nnc_default_mfa_context(), slots[0], ccv_nnc_8i_rowwise_x_is_ftq((int)*format), format, codebook);
 }
 
 static size_t _ccv_nnc_segmented_swiglu_align_up(const size_t value, const size_t alignment)
@@ -108,7 +109,8 @@ static int _ccv_nnc_segmented_swiglu_shared_forw(const float clamp, const ccv_nn
 		(K % 4) == 0 : ccv_nnc_8i_rowwise_x_is_tmcq(gate_format) ? (K % 16) == 0 && (N % 16) == 0 : (K % 256) == 0 && (N % 256) == 0;
 	if (rowwise_weights && !rowwise_shape_supported)
 		return CCV_NNC_EXEC_INVALID;
-	// FTQ only decodes through GEMM_FORWARD.
+	// An FTQ shared expert only decodes through GEMM_FORWARD (routed FTQ experts take the FTQ paths of
+	// _ccv_nnc_segmented_swiglu_routed_forw).
 	if (rowwise_weights && ccv_nnc_8i_rowwise_x_is_ftq_any(gate_format))
 		return CCV_NNC_EXEC_INVALID;
 	// TMCQ shared weights take the matrix paths below, as in SWIGLU_FORWARD.
@@ -362,8 +364,19 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 	mtl_buffer_t* codebook;
 	if (!_ccv_nnc_segmented_swiglu_codebook(gate_w, up_w, &gate_codebook_format, &codebook))
 		return CCV_NNC_EXEC_INVALID;
-	// TMCQ is a 16 x 16 tile grid (K % 16, N % 16); the other packed codecs take whole 256-weight blocks.
-	const int rowwise_shape_supported = gate_format == 0 ? (K % 4) == 0 : ccv_nnc_8i_rowwise_x_is_tmcq(gate_format) ? (K % 16) == 0 && (N % 16) == 0 : (K % 256) == 0 && (N % 256) == 0;
+	// TMCQ and FTQ are a 16 x 16 tile grid (K % 16, N % 16); the other packed codecs take whole 256-weight blocks.
+	const int rowwise_shape_supported = gate_format == 0 ? (K % 4) == 0 : ccv_nnc_8i_rowwise_x_is_tiled(gate_format) ? (K % 16) == 0 && (N % 16) == 0 : (K % 256) == 0 && (N % 256) == 0;
+	// Static-rate FTQ gate and up: each one CCVFTQSR blob of expert_count N x K experts (as SEGMENTED_GEMM_FORWARD), at
+	// the same rate and codebook slot, with an FP16 or FP32 base matching the activation, read as 32-bit words. A few
+	// rows take two segmented FTQ GEMVs (the packed SwiGLU kernel has no FTQ decode); larger batches expand the selected
+	// experts to int8 rows for the W8A8 segmented scaled SwiGLU. Variable-rate FTQ and Hadamard rotations are rejected.
+	const int ftq_weights = gate_subtype == CCV_NNC_QX_8I_ROWWISE_X && ccv_nnc_8i_rowwise_x_is_ftq_any(gate_format);
+	if ((ftq_weights || (up_subtype == CCV_NNC_QX_8I_ROWWISE_X && ccv_nnc_8i_rowwise_x_is_ftq_any(up_format))) &&
+		(!ftq_weights || !ccv_nnc_8i_rowwise_x_is_ftq(gate_format) || (gate_format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) ||
+		 gate_format != up_format || gate_w->info.datatype != up_w->info.datatype ||
+		 (a->info.datatype != CCV_16F && a->info.datatype != CCV_32F) || ((gate_w->info.datatype & 0xff) << 12) != a->info.datatype ||
+		 !rowwise_shape_supported || (gate_w->dataof % 4) != 0 || (up_w->dataof % 4) != 0))
+		return CCV_NNC_EXEC_INVALID;
 	const uint64_t mtl_datatype = _ccv_nnc_segmented_swiglu_mtl_datatype(a->info.datatype);
 	ccv_nnc_mfa_context_t* const context = ccv_nnc_default_mfa_context();
 	const int use_neural_accelerators =
@@ -590,6 +603,9 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 		ccv_nnc_tensor_count(a->info) <= UINT32_MAX &&
 		ccv_nnc_tensor_count(gate_w->info) <= UINT32_MAX &&
 		ccv_nnc_tensor_count(output->info) <= UINT32_MAX;
+	// The segmented GEMM fallback below decodes weights to floating point, which FTQ does not have.
+	if (ftq_weights && !use_neural_accelerators && !use_segmented_scaled_swiglu_without_neural_accelerators)
+		return CCV_NNC_EXEC_INVALID;
 	if (rowwise_weights && (use_neural_accelerators || use_segmented_scaled_swiglu_without_neural_accelerators))
 	{
 		const ccv_nnc_mfa_segmented_scaled_swiglu_params_t params = {

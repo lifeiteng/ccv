@@ -1180,7 +1180,9 @@ enum {
 	CCV_NNC_QX_8I_ROWWISE_TMCQ_N30,
 	CCV_NNC_QX_8I_ROWWISE_TMCQ_N32,
 	CCV_NNC_QX_8I_ROWWISE_RESERVED_31,
-	/* FTQ (fused trellis quantization), static rate: FP16 tensors only, requires row_count % 16 == 0 and row_length % 16 == 0. The
+	/* FTQ (fused trellis quantization), static rate: FP16 tensors, or FP32 tensors (the same blob with the same FP16
+	 * scales, see ccv_nnc_8i_rowwise_x_scale_size) where a backend takes them (the Metal segmented GEMM / SwiGLU and MoE
+	 * weights streaming), requires row_count % 16 == 0 and row_length % 16 == 0. The
 	 * weight is cut into the same 16 x 16 tiles as TMCQ (tiles row-major over the tile grid, weights row-major inside a
 	 * tile); each tile is a tail-biting trellis of exactly 16 n bits (n even), whose pair j (weights 2j, 2j + 1, j =
 	 * 0 .. 127) reads the 16-bit LSB-first state window ending at bit floor((j + 1) n / 8), wrapping inside the tile, and
@@ -1194,7 +1196,9 @@ enum {
 	 * of h = state * 0x83DCD12D, the first value negated when bit 15 of h is set and the second when bit 31 is), bits
 	 * 18 - 31 zero; table_crc is the zlib crc32 of the table (0 for the built-in one). The tensor's codebook slot
 	 * (reserved bits 16 - 23) must name the same table. SR in the magic stands for static rate (one rate for every
-	 * tile row); variable-rate FTQ blobs start with "CCVFTQVR". */
+	 * tile row); variable-rate FTQ blobs start with "CCVFTQVR". An [E, N, K] tensor (MoE experts) is one blob of E N rows
+	 * of K: expert e's tiles start at byte 32 + e (N / 16) (K / 16) 2 n and its row r's scale is scale e N + r of the
+	 * blob, so N % 16 == 0 keeps every expert on whole tile rows. */
 	/* Static-rate FTQ owns codes FTQ_BLOCK_FIRST .. FTQ_BLOCK_LAST: format FTQ_BLOCK_FIRST + (n - 8) / 2 is rate n
 	 * (even n = 8 .. 134), so n = 8 + 2 (format - FTQ_BLOCK_FIRST). Only n = 16 .. 64 are open; the other codes of
 	 * the block are rejected. Variable-rate FTQ (CCVFTQVR) owns the next block, FTQ_VR_BLOCK_FIRST ..

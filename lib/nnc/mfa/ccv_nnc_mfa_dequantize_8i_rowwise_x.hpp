@@ -18,7 +18,7 @@ typedef struct {
 	uint64_t rows_per_expert;
 	uint64_t expert_count; // Number of expert weight matrices.
 	uint64_t bincount; // Number of entries in indices and counts.
-	mtl_buffer_t* codebook; // As in ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t (TMCQ only).
+	mtl_buffer_t* codebook; // As in ccv_nnc_mfa_dequantize_8i_rowwise_x_params_t (TMCQ and static-rate FTQ).
 } ccv_nnc_mfa_dequantize_8i_rowwise_x_selected_params_t;
 
 #ifdef __cplusplus

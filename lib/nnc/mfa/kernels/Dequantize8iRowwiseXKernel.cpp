@@ -753,6 +753,11 @@ static bool is_ftq(const uint32_t format)
 // every read stays inside the tile. The window offsets are compile-time. `ftq_n` is n; `index_shift` is 32 - log2 of
 // the table's pair count (23 for the built-in 512-pair table). `tail` is TMCQ's (tile_pair_tail_source): an odd
 // tiles_per_row.
+// The selected kernels decode the experts that indices / counts route to out of a blob of expert_count experts of
+// rows_per_expert rows each: one (expert_count rows_per_expert) x row_length blob, so expert e's tiles start
+// groups_per_expert tiles of n / 2 words after the code start and its FP16 scales rows_per_expert after the blob's
+// scale start. The output scales are FP16 or, for an FP32 base, FP32 (scale_bytes_per_expert = 4 rows_per_expert).
+// The plain, selected and plan kernels share one library (Dequantize8iRowwiseXKernelDescriptor has no kernel kind).
 static std::string create_ftq_source(const uint32_t n, const uint32_t index_shift, const bool tail)
 {
 	std::string shader = R"(
@@ -772,6 +777,48 @@ inline uint2 tile_pair_row_column(const uint x, const uint tiles_per_row)
   return uint2(tile_row * 16u + ((in_tile_row & 31u) >> 1), (in_tile_row >> 5) * 2u + (in_tile_row & 1u));
 }
 
+// Writes the 16 int8 weights of `row` (local to the tile grid whose code starts at `code`) in tile column `tc` to
+// destination[row * row_length + 16 * tc ...]. An external table arrives as `tmcq_ext` (rewrite_decode_codebook); the
+// built-in table is the constant tmcq_table.
+inline void ftq_store_segment(device const uchar* code, device uchar* destination, const uint row, const uint tc, constant char2* tmcq_ext)
+{
+  const uint tiles_per_row = row_length >> 4;
+  char q[16];
+  auto ftq_pair = [&](const uint state) -> char2 { return tmcq_table[(state * 0x83DCD12Du) >> ftq_index_shift]; };
+  const uint W = ftq_n / 2u;
+  const uint r = row & 15u;
+  device const uint* t = reinterpret_cast<device const uint*>(code) + (ulong)((row >> 4) * tiles_per_row + tc) * W;
+  const uint lane_bit = (r == 0u ? 16u * ftq_n : r * ftq_n) + (ftq_n >> 3) - 16u;
+  const uint o0 = lane_bit >> 5;
+  const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;
+  const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;
+  const uint shift = lane_bit & 31u;
+#if FTQ_WIDE
+  const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;
+  const uint w0 = t[o0], w1 = t[o1], w2 = t[o2], w3 = t[o3];
+  const uint f1 = tmcq_funnel(w1, w2, shift);
+  const ulong lo = ((ulong)f1 << 32) | tmcq_funnel(w0, w1, shift);
+  const ulong hi = ((ulong)tmcq_funnel(w2, w3, shift) << 32) | f1;
+#else
+  const uint w0 = t[o0], w1 = t[o1], w2 = t[o2];
+  const ulong lo = ((ulong)tmcq_funnel(w1, w2, shift) << 32) | tmcq_funnel(w0, w1, shift);
+  const ulong hi = 0;
+#endif
+  #pragma clang loop unroll(full)
+  for (uint i = 0; i < 8u; i++) {
+    // Window i at offset floor((i + 1) n / 8) - floor(n / 8), from the low 64 bits or (n > 48) bits 32 .. 95.
+    const uint k = (((i + 1u) * ftq_n) >> 3) - (ftq_n >> 3);
+    const char2 v = ftq_pair((k <= 48u ? uint(lo >> k) : uint(hi >> (k - 32u))) & 0xffffu);
+    q[2 * i] = v.x;
+    q[2 * i + 1] = v.y;
+  }
+  device char4* destination4 = reinterpret_cast<device char4*>(destination + (ulong)row * row_length + (tc << 4));
+  destination4[0] = char4(q[0], q[1], q[2], q[3]);
+  destination4[1] = char4(q[4], q[5], q[6], q[7]);
+  destination4[2] = char4(q[8], q[9], q[10], q[11]);
+  destination4[3] = char4(q[12], q[13], q[14], q[15]);
+}
+
 kernel void dequantize_8i_rowwise_x(
   device const uchar* source [[buffer(0)]],
   device uchar* destination [[buffer(1)]],
@@ -785,47 +832,69 @@ kernel void dequantize_8i_rowwise_x(
   if (x >= dispatch_items)
     return;
   if (x < total_groups * 16u) {
-    const uint tiles_per_row = row_length >> 4;
-    const uint2 rc = tile_pair_row_column(x, tiles_per_row);
-    const uint row = rc.x;
-    const uint tc = rc.y;
-    char q[16];
-    auto ftq_pair = [&](const uint state) -> char2 { return tmcq_table[(state * 0x83DCD12Du) >> ftq_index_shift]; };
-    const uint W = ftq_n / 2u;
-    const uint r = row & 15u;
-    device const uint* t = reinterpret_cast<device const uint*>(source + 32) + (ulong)((row >> 4) * tiles_per_row + tc) * W;
-    const uint lane_bit = (r == 0u ? 16u * ftq_n : r * ftq_n) + (ftq_n >> 3) - 16u;
-    const uint o0 = lane_bit >> 5;
-    const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;
-    const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;
-    const uint shift = lane_bit & 31u;
-#if FTQ_WIDE
-    const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;
-    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2], w3 = t[o3];
-    const uint f1 = tmcq_funnel(w1, w2, shift);
-    const ulong lo = ((ulong)f1 << 32) | tmcq_funnel(w0, w1, shift);
-    const ulong hi = ((ulong)tmcq_funnel(w2, w3, shift) << 32) | f1;
-#else
-    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2];
-    const ulong lo = ((ulong)tmcq_funnel(w1, w2, shift) << 32) | tmcq_funnel(w0, w1, shift);
-    const ulong hi = 0;
-#endif
-    #pragma clang loop unroll(full)
-    for (uint i = 0; i < 8u; i++) {
-      // Window i at offset floor((i + 1) n / 8) - floor(n / 8), from the low 64 bits or (n > 48) bits 32 .. 95.
-      const uint k = (((i + 1u) * ftq_n) >> 3) - (ftq_n >> 3);
-      const char2 v = ftq_pair((k <= 48u ? uint(lo >> k) : uint(hi >> (k - 32u))) & 0xffffu);
-      q[2 * i] = v.x;
-      q[2 * i + 1] = v.y;
-    }
-    device char4* destination4 = reinterpret_cast<device char4*>(destination + (ulong)row * row_length + (tc << 4));
-    destination4[0] = char4(q[0], q[1], q[2], q[3]);
-    destination4[1] = char4(q[4], q[5], q[6], q[7]);
-    destination4[2] = char4(q[8], q[9], q[10], q[11]);
-    destination4[3] = char4(q[12], q[13], q[14], q[15]);
+    const uint2 rc = tile_pair_row_column(x, row_length >> 4);
+    ftq_store_segment(source + 32, destination, rc.x, rc.y, tmcq_table);
   }
   if (x < scale_bytes)
     output_scales[x] = input_scales[x];
+}
+
+kernel void dequantize_8i_rowwise_x_selected(
+  device const uchar* source [[buffer(0)]],
+  device const uint* active_experts [[buffer(1)]],
+  device uchar* destination [[buffer(2)]],
+  device const uchar* input_scales [[buffer(3)]],
+  device uchar* output_scales [[buffer(4)]],
+
+  uint3 tgid [[threadgroup_position_in_grid]],
+  ushort lid [[thread_index_in_threadgroup]]
+) {
+  const uint x = tgid.x * threadgroup_size + lid;
+  const uint active_expert = tgid.y;
+  if (x >= selected_dispatch_items_per_expert)
+    return;
+  const uint expert = active_experts[active_expert];
+  if (expert >= expert_count)
+    return;
+  // groups_per_expert tiles of 16 segments each; rows_per_expert % 16 == 0, so experts start on tile rows and every
+  // tile on a word.
+  if (x < groups_per_expert * 16u) {
+    const uint2 rc = tile_pair_row_column(x, row_length >> 4);
+    device const uchar* expert_code = source + 32 + (ulong)expert * groups_per_expert * (ftq_n * 2u);
+    device uchar* expert_destination = destination + (ulong)expert * rows_per_expert * row_length;
+    ftq_store_segment(expert_code, expert_destination, rc.x, rc.y, tmcq_table);
+  }
+  if (x < rows_per_expert) {
+    const ulong row = (ulong)expert * rows_per_expert + x;
+    const half scale = reinterpret_cast<device const half*>(input_scales)[row];
+    if (scale_bytes_per_expert == rows_per_expert * 4u)
+      reinterpret_cast<device float*>(output_scales)[row] = float(scale);
+    else
+      reinterpret_cast<device half*>(output_scales)[row] = scale;
+  }
+}
+
+kernel void dequantize_8i_rowwise_x_selected_plan(
+  device const int* indices [[buffer(0)]],
+  device const int* counts [[buffer(1)]],
+  device uint* active_experts [[buffer(2)]],
+  device uint* dispatch_args [[buffer(3)]],
+  ushort lid [[thread_index_in_threadgroup]]
+) {
+  if (lid != 0)
+    return;
+  uint active_count = 0;
+  for (uint bin = 0; bin < bincount; ++bin) {
+    const int count = counts[bin];
+    const int expert_i = indices[bin];
+    if (count > 0 && expert_i >= 0 && expert_i < (int)expert_count)
+      active_experts[active_count++] = (uint)expert_i;
+  }
+  if (active_count == 0)
+    active_experts[0] = expert_count;
+  dispatch_args[0] = (selected_dispatch_items_per_expert + threadgroup_size - 1) / threadgroup_size;
+  dispatch_args[1] = max(active_count, 1u);
+  dispatch_args[2] = 1;
 }
 )";
 	if (tail)
@@ -1058,8 +1127,12 @@ std::string Dequantize8iRowwiseXKernel::createSource() const noexcept
 		std::string shader = createConstants() + "\n" + (is_ftq_vr(format) ?
 			create_ftq_vr_source(levelMask, log2 ? 32 - log2 : 23, tmcq_codebook_fold(format), (tileTail & 2) != 0) :
 			create_ftq_source(8 + 2 * ((format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) - CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST), log2 ? 32 - log2 : 23, (tileTail & 1) != 0));
-		if (log2)
+		if (log2) {
 			rewrite_decode_codebook(shader, log2, true);
+			// Static-rate FTQ decodes in ftq_store_segment, which takes the table from both decoding kernels.
+			if (is_ftq(format))
+				CCV_NNC_MFA_PRECONDITION(tmcq_codebook_replace(shader, "rc.y, tmcq_table);", "rc.y, tmcq_ext);") == 2);
+		}
 		if (tmcq_codebook_fold(format)) {
 			// Quadrant fold (512 base pairs): base pair (h >> 16) & 511 of h = state * 0x83DCD12D, the values
 			// negated in the int8 domain by bits 15 / 31 of h, as the fused GEMV does on the half2 bits.

@@ -325,6 +325,92 @@ static inline const char* ccv_nnc_mfa_tmcq_w2_source()
   return source.c_str();
 }
 
+// FTQ GEMV helpers (CCV_NNC_QX_8I_ROWWISE_FTQ_N16), shared by the dense Int8GemvKernel and SegmentedInt8GemvKernel: the
+// pair lookup from a half2 threadgroup copy of the table and the 8 windows of one lane. log2Entries / fold: the pair
+// table (9 for the built-in one); fold is a quadrant-folded external table (CCV_NNC_MFA_CODEBOOK_FOLD, log2Entries 9).
+// Append after ccv_nnc_mfa_tmcq_decode_source(), whose tmcq_funnel the rate loop uses.
+static inline std::string ccv_nnc_mfa_ftq_w1_source(const uint32_t log2Entries, const bool fold)
+{
+  // 32 - log2 of the pair count.
+  std::string shader = "constant uint ftq_index_shift = " + std::to_string(32 - log2Entries) + ";\n";
+  shader += "constant uint ftq_entries = " + std::to_string(1u << log2Entries) + ";\n";
+  shader += std::string("#define FTQ_FOLD ") + (fold ? "1" : "0") + "\n";
+  shader += R"(
+// The pair of a 16-bit state. FTQ_FOLD: quadrant fold, one and + one xor on the half2 bits (the fused GEMV is ALU
+// bound, so the folded lookup must stay this short).
+inline float2 ftq_lookup(threadgroup const half2* table, uint state)
+{
+#if FTQ_FOLD
+  const uint h = state * 0x83DCD12Du;
+  uint v = as_type<uint>(table[(h >> 16) & 511u]);
+  v ^= h & 0x80008000u;
+  return float2(as_type<half2>(v));
+#else
+  return float2(table[(state * 0x83DCD12Du) >> ftq_index_shift]);
+#endif
+}
+
+// The 8 windows of a lane from its funnelled bits at rate N: window i at offset floor((i + 1) N / 8) - floor(N / 8) of the
+// lane's first window start, from the low 64 bits or (N > 48 only, offsets past 48) from bits 32 .. 95.
+template <uint N>
+inline void ftq_decode_lane(ulong lo, ulong hi, thread float4* q, threadgroup const half2* table)
+{
+  float2 c[8];
+  #pragma clang loop unroll(full)
+  for (uint i = 0; i < 8u; i++) {
+    const uint k = (((i + 1u) * N) >> 3) - (N >> 3);
+    const uint state = (k <= 48u ? uint(lo >> k) : uint(hi >> (k - 32u))) & 0xffffu;
+    c[i] = ftq_lookup(table, state);
+  }
+  q[0] = float4(c[0], c[1]);
+  q[1] = float4(c[2], c[3]);
+  q[2] = float4(c[4], c[5]);
+  q[3] = float4(c[6], c[7]);
+}
+)";
+  return shader;
+}
+
+// The tile loop of one threadgroup's 16 rows at the compile-time rate n, over row_code (the tile row's first word):
+// the lane's three (n <= 48) or four words from its first window's start and its 8 windows at compile-time offsets.
+// Below n = 16 the first windows of rows 0 and 1 start before the tile and wrap to its end. In scope it needs r, stream,
+// STREAMS, tiles_per_row, row_code, tmcq_tg (the half2 table); `accumulate` is the per-tile statement, which reads
+// tile column tc and its weights qa[0 .. 3].
+static inline std::string ccv_nnc_mfa_ftq_w1_rate_source(const uint32_t n, const std::string& accumulate)
+{
+  std::string body = "  {\n  constexpr uint N = " + std::to_string(n) + "u;\n  constexpr uint W = N / 2u;\n";
+  if (n >= 16)
+    body += "  const uint lane_bit = (r == 0u ? 16u * N : r * N) + (N >> 3) - 16u;\n";
+  else
+    body += "  const uint lane_raw = r * N + (N >> 3) + 16u * N - 16u;\n"
+      "  const uint lane_bit = lane_raw >= 16u * N ? lane_raw - 16u * N : lane_raw;\n";
+  body += "  const uint o0 = lane_bit >> 5;\n"
+    "  const uint o1 = o0 + 1u == W ? 0u : o0 + 1u;\n"
+    "  const uint o2 = o1 + 1u == W ? 0u : o1 + 1u;\n";
+  if (n > 48)
+    body += "  const uint o3 = o2 + 1u == W ? 0u : o2 + 1u;\n";
+  body += "  const uint sh = lane_bit & 31u;\n"
+    "  // One tile per iteration.\n"
+    "  for (uint tc = stream; tc < tiles_per_row; tc += STREAMS) {\n"
+    "    device const uint* t = row_code + tc * W;\n";
+  if (n > 48)
+    body += "    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2], w3 = t[o3];\n"
+      "    const uint f1 = tmcq_funnel(w1, w2, sh);\n"
+      "    const ulong lo = ((ulong)f1 << 32) | tmcq_funnel(w0, w1, sh);\n"
+      "    const ulong hi = ((ulong)tmcq_funnel(w2, w3, sh) << 32) | f1;\n";
+  else
+    body += "    const uint w0 = t[o0], w1 = t[o1], w2 = t[o2];\n"
+      "    const ulong lo = ((ulong)tmcq_funnel(w1, w2, sh) << 32) | tmcq_funnel(w0, w1, sh);\n"
+      "    const ulong hi = 0;\n";
+  body += "    float4 qa[4];\n"
+    "    ftq_decode_lane<N>(lo, hi, qa, (threadgroup const half2*)tmcq_tg);\n";
+  body += accumulate;
+  body += "  }\n"
+    "  }\n";
+  return body;
+}
+
+
 // External codebooks (ccv_nnc_codebook.h). In the format of an MFA params struct, bits 16 - 23 of a TMCQ / FTQ format
 // hold log2 of the entry count of an external codebook (9, 10 or 11), 0 for the built-in table: the dispatch puts
 // it there in place of the tensor's slot, so the pipeline key carries the table size and the table itself is a

@@ -304,13 +304,14 @@ uint32_t Dequantize8iRowwiseXSelectedDescriptor::groupBits() const noexcept {
 }
 
 uint32_t Dequantize8iRowwiseXSelectedDescriptor::groupsPerExpert() const noexcept {
-	// TMCQ: the expert's tiles (rowsPerExpert % 16 == 0), see Dequantize8iRowwiseXDescriptor::totalGroups.
-	if (is_tmcq(format))
+	// TMCQ / FTQ: the expert's tiles (rowsPerExpert % 16 == 0), see Dequantize8iRowwiseXDescriptor::totalGroups.
+	if (is_tmcq(format) || is_ftq(format))
 		return (uint32_t)tmcq_tile_count(rowsPerExpert, rowLength);
 	return rowsPerExpert * groupsPerRow();
 }
 
 uint64_t Dequantize8iRowwiseXSelectedDescriptor::inputScaleOffset() const noexcept {
+	// FTQ: the experts are one (expertCount rowsPerExpert) x rowLength blob, so this is its schedule's scale_offset.
 	const uint64_t payloadBits = (uint64_t)expertCount * groupsPerExpert() * groupBits();
 	const uint64_t payloadBytes = (payloadBits + 7) / 8 + (is_ftq(format) ? 32 : 0);
 	return align_up_64(payloadBytes, 128);
@@ -327,6 +328,9 @@ uint32_t Dequantize8iRowwiseXSelectedDescriptor::scaleBytesPerExpert() const noe
 uint32_t Dequantize8iRowwiseXSelectedDescriptor::dispatchItemsPerExpert() const noexcept {
 	if (is_tmcq(format))
 		return std::max(rowsPerExpert * (rowLength / 16), scaleBytesPerExpert());
+	// FTQ converts one FP16 scale per row (not per byte) to the output's scale type.
+	if (is_ftq(format))
+		return std::max(rowsPerExpert * (rowLength / 16), rowsPerExpert);
 	return std::max(groupsPerExpert(), scaleBytesPerExpert());
 }
 
@@ -344,8 +348,18 @@ std::pair<Dequantize8iRowwiseXKernelDescriptor, PipelineValue<Dequantize8iRowwis
 	(void)binaryArchivesToRead;
 	(void)binaryArchiveToWrite;
 	(void)pathToWrite;
-	// An FTQ blob is one 2-D tensor with its own header, so experts cannot be indexed by count.
-	CCV_NNC_MFA_PRECONDITION(!is_ftq_any(format));
+	// A static-rate FTQ blob of expertCount experts is one (expertCount rowsPerExpert) x rowLength blob: one header, the
+	// experts' tiles in order (every expert is whole tile rows of 16 n bit tiles) and one FP16 scale per row. A
+	// variable-rate blob has no fixed expert stride.
+	CCV_NNC_MFA_PRECONDITION(!is_ftq_vr(format));
+	if (is_ftq(format)) {
+		CCV_NNC_MFA_PRECONDITION(tmcq_codebook_format_ok(format, true));
+		CCV_NNC_MFA_PRECONDITION(rowLength > 0 && (rowLength % 16) == 0 && (rowsPerExpert % 16) == 0);
+		// FP16 scales in, FP16 or FP32 out (the 8I_ROWWISE scales of the FTQ tensor's base datatype).
+		CCV_NNC_MFA_PRECONDITION(scaleSize == 2 || scaleSize == 4);
+		const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule_of_rate(ftq_rate(format), (uint64_t)expertCount * rowsPerExpert, rowLength);
+		CCV_NNC_MFA_PRECONDITION(schedule.tile_count == (uint64_t)expertCount * groupsPerExpert() && schedule.scale_offset == this->inputScaleOffset());
+	}
 	if (is_tmcq(format)) {
 		// Tiles span 16 rows, so every expert must start on a tile row.
 		// Bits 16 - 23: log2 of an external codebook's entry count, 0 for the built-in table (TMCQDecodeSource.hpp).
@@ -368,7 +382,7 @@ std::pair<Dequantize8iRowwiseXKernelDescriptor, PipelineValue<Dequantize8iRowwis
 	Dequantize8iRowwiseXKernelDescriptor kernelDesc;
 	kernelDesc.format = format;
 	// An odd number of tiles per row takes the tail mapping (see Dequantize8iRowwiseXKernelDescriptor::tileTail).
-	kernelDesc.tileTail = is_tmcq(format) ? ((rowLength / 16) & 1) : 0;
+	kernelDesc.tileTail = (is_tmcq(format) || is_ftq(format)) ? ((rowLength / 16) & 1) : 0;
 
 	auto createPipeline =
 	[=](MTL::Library* library, const char* const functionName) -> MTL::ComputePipelineState* {

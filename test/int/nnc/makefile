@@ -13,7 +13,7 @@ TARGETS += rmsnorm_gated.tests signed_sqrt.tests scaled_dot_product_arg_partitio
 
 TARGETS += sol_attention.tests
 
-TARGETS += tmcq_mps.tests tmcq_cuda.tests ftq_mps.tests tmcq_codebook_mps.tests tmcq_codebook_paths_mps.tests
+TARGETS += tmcq_mps.tests tmcq_cuda.tests ftq_mps.tests tmcq_codebook_mps.tests tmcq_codebook_paths_mps.tests ftq_segmented_mps.tests
 
 TARGET_SRCS := $(patsubst %,%.c,$(TARGETS))
 

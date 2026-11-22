@@ -291,6 +291,13 @@ static inline int ccv_nnc_8i_rowwise_x_codebook_is_valid(const int format)
 	return ccv_nnc_8i_rowwise_x_codebook_slot(format) == 0;
 }
 
+/* Bytes of one row scale of an 8I_ROWWISE_X tensor of base datatype `datatype`: the FTQ and FTQ-VR blobs carry FP16
+ * scales whatever the base (static-rate FTQ may be FP16 or FP32), every other codec scales in its base datatype. */
+static inline int ccv_nnc_8i_rowwise_x_scale_size(const int format, const int datatype)
+{
+	return ccv_nnc_8i_rowwise_x_is_ftq_any(format) ? 2 : CCV_GET_DATA_TYPE_SIZE(datatype);
+}
+
 /* The FTQ rate n: every tile has 16 n bits, see CCV_NNC_QX_8I_ROWWISE_FTQ_N16. */
 static inline int ccv_nnc_8i_rowwise_x_ftq_rate(const int format)
 {
@@ -422,8 +429,9 @@ static inline ccv_nnc_tensor_param_t ccv_nnc_tensor_8i_rowwise_x(const ccv_nnc_t
 	}
 	if (ccv_nnc_8i_rowwise_x_is_ftq_any(format))
 	{
-		// FP16 scales are part of the FTQ and FTQ-VR blobs, so only FP16 tensors match their size.
-		assert(params.datatype == CCV_16F);
+		// FP16 scales are part of the FTQ and FTQ-VR blobs whatever the base (ccv_nnc_8i_rowwise_x_scale_size): static-rate
+		// FTQ takes an FP16 or FP32 base, variable-rate FTQ FP16 only.
+		assert(params.datatype == CCV_16F || (params.datatype == CCV_32F && ccv_nnc_8i_rowwise_x_is_ftq(format)));
 		assert(nd > 0 && params.dim[nd - 1] > 0 && params.dim[nd - 1] % 16 == 0);
 		assert((ccv_nnc_tensor_count(params) / params.dim[nd - 1]) % 16 == 0);
 		assert(!(format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256));
@@ -478,7 +486,7 @@ static inline size_t ccv_nnc_tensor_data_size_without_padding(const ccv_nnc_tens
 			}
 			const ssize_t payload_size = (ssize_t)((ccv_nnc_8i_rowwise_x_payload_bits(params.reserved, row_count, row_length) + 7) / 8) + ccv_nnc_8i_rowwise_x_payload_header(params.reserved, row_count);
 			const ssize_t scale_offset = (payload_size + 127) & -128;
-			data_size = scale_offset + row_count * CCV_GET_DATA_TYPE_SIZE(qx_datatype);
+			data_size = scale_offset + row_count * ccv_nnc_8i_rowwise_x_scale_size(params.reserved, qx_datatype);
 		} else {
 			assert(0);
 			data_size = 0;

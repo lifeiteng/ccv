@@ -183,6 +183,10 @@ uint32_t SegmentedScaledGEMMKernel::maxTileRecords(uint32_t originalM, uint32_t 
 
 bool SegmentedScaledGEMMKernel::fusesPackedFormat(uint32_t format, uint64_t M, uint32_t binCount, uint32_t N, uint32_t K) noexcept
 {
+  // FTQ has no register tile decoder: its selected experts are expanded to int8 first.
+  const uint32_t codec = format & CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK;
+  if (codec >= CCV_NNC_QX_8I_ROWWISE_FTQ_BLOCK_FIRST && codec <= CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_LAST)
+    return false;
   // A TMCQ format may carry an external codebook's log2 entry count in bits 16 - 23; nothing else takes modifier bits.
   if (format == 0 || ((format & ~CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) != 0 && !(segmentedTMCQRate(format) && tmcq_codebook_log2(format))))
     return false;
