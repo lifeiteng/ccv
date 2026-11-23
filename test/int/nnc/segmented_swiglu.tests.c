@@ -578,7 +578,7 @@ static void _segmented_swiglu_packed_weights(dsfmt_t* const dsfmt, const int for
 
 // rows_override > 0 replaces the default 97 / 389 rows: two rows on one expert and the rest split
 // over four more.
-static void _segmented_swiglu_mps_float_rowwise_rows_case(const int format, const int n, const int k, const int large_groups, const int use_neural_accelerators, const int rows_override, int* const __case_result__)
+static void _segmented_swiglu_mps_float_rowwise_rows_case(const int format, const int n, const int k, const int large_groups, const int use_neural_accelerators, const int rows_override, const int unquantized_activations, int* const __case_result__)
 {
 	const int rows = rows_override > 0 ? rows_override : large_groups ? 389 : 97;
 	const int segments = 6;
@@ -676,8 +676,9 @@ static void _segmented_swiglu_mps_float_rowwise_rows_case(const int format, cons
 				ccv_clamp((int)lrintf(ha->data.f32[i * k + j] * inv_scale), -127, 127);
 	}
 	ccv_nnc_tensor_t* const expected = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32F, rows, n), 0);
+	// The dequantize-and-GEMM fallback keeps the activations in floating point.
 	_segmented_swiglu_reference(
-		ha_dequant->data.f32, hindices->data.i32, hcounts->data.i32,
+		(unquantized_activations ? ha : ha_dequant)->data.f32, hindices->data.i32, hcounts->data.i32,
 		hgate_dequant->data.f32, hup_dequant->data.f32, hroute->data.f32,
 		rows, segments, n, k, clamp, expected->data.f32);
 	ccv_nnc_tensor_param_t gpu_q_params = q_params;
@@ -770,7 +771,7 @@ static void _segmented_swiglu_mps_float_rowwise_rows_case(const int format, cons
 
 static void _segmented_swiglu_mps_float_rowwise_case(const int format, const int n, const int k, const int large_groups, const int use_neural_accelerators, int* const __case_result__)
 {
-	_segmented_swiglu_mps_float_rowwise_rows_case(format, n, k, large_groups, use_neural_accelerators, 0, __case_result__);
+	_segmented_swiglu_mps_float_rowwise_rows_case(format, n, k, large_groups, use_neural_accelerators, 0, 0, __case_result__);
 }
 
 TEST_CASE("MPS segmented SwiGLU emulates int8 with normalized half values and float scales")
@@ -1083,6 +1084,18 @@ TEST_CASE("MPS segmented SwiGLU packed prefill with neural accelerators")
 }
 
 
+TEST_CASE("MPS segmented SwiGLU packed weights whose N does not fill 256-weight blocks take the decode fallback")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS));
+	// N 384: whole 256-weight blocks along K, but not a multiple of the scaled SwiGLU's 256-row blocks. With or
+	// without neural accelerators it decodes the selected experts and runs the floating-point segmented GEMM.
+	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_Q4_K, CCV_NNC_QX_8I_ROWWISE_Q5_K, CCV_NNC_QX_8I_ROWWISE_Q6_K };
+	int i, use_neural_accelerators;
+	for (i = 0; i < sizeof(formats) / sizeof(formats[0]); i++)
+		for (use_neural_accelerators = 0; use_neural_accelerators < 2; use_neural_accelerators++)
+			_segmented_swiglu_mps_float_rowwise_rows_case(formats[i], 384, 256, 0, use_neural_accelerators, 64, 1, __case_result__);
+}
+
 // TMCQ decode (one input row per routed row, or one broadcast row): the vector path decodes the
 // 16 x 16 tiles in place, one SIMD group per 16-row tile row.
 static void _segmented_swiglu_mps_tmcq_decode_shape_case(const int format, const int datatype, const int rows, const int broadcast_input, const float clamp, const int experts, const int k, int* const __case_result__)
@@ -1260,8 +1273,8 @@ TEST_CASE("MPS segmented SwiGLU TMCQ prefill matches the spec reference at 64 an
 	for (i = 0; i < sizeof(formats) / sizeof(formats[0]); i++)
 		for (use_neural_accelerators = 0; use_neural_accelerators < 2; use_neural_accelerators++)
 		{
-			_segmented_swiglu_mps_float_rowwise_rows_case(formats[i], 256, 512, 1, use_neural_accelerators, 64, __case_result__);
-			_segmented_swiglu_mps_float_rowwise_rows_case(formats[i], 256, 512, 1, use_neural_accelerators, 512, __case_result__);
+			_segmented_swiglu_mps_float_rowwise_rows_case(formats[i], 256, 512, 1, use_neural_accelerators, 64, 0, __case_result__);
+			_segmented_swiglu_mps_float_rowwise_rows_case(formats[i], 256, 512, 1, use_neural_accelerators, 512, 0, __case_result__);
 		}
 }
 

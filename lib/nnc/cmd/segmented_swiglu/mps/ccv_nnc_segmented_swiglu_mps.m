@@ -614,7 +614,9 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 	// The segmented GEMM fallback below decodes weights to floating point, which FTQ does not have.
 	if (ftq_weights && !use_neural_accelerators && !use_segmented_scaled_swiglu_without_neural_accelerators)
 		return CCV_NNC_EXEC_INVALID;
-	if (rowwise_weights && (use_neural_accelerators || use_segmented_scaled_swiglu_without_neural_accelerators))
+	// The segmented scaled SwiGLU takes whole blocks or tiles (rowwise_shape_supported), with neural accelerators too;
+	// other packed shapes decode the selected experts for the segmented GEMM below.
+	if (rowwise_weights && rowwise_shape_supported && (use_neural_accelerators || use_segmented_scaled_swiglu_without_neural_accelerators))
 	{
 		const ccv_nnc_mfa_segmented_scaled_swiglu_params_t params = {
 			.data_type = mtl_datatype,
