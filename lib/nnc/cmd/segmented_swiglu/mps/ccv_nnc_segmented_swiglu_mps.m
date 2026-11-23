@@ -366,6 +366,10 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 		return CCV_NNC_EXEC_INVALID;
 	// TMCQ and FTQ are a 16 x 16 tile grid (K % 16, N % 16); the other packed codecs take whole 256-weight blocks.
 	const int rowwise_shape_supported = gate_format == 0 ? (K % 4) == 0 : ccv_nnc_8i_rowwise_x_is_tiled(gate_format) ? (K % 16) == 0 && (N % 16) == 0 : (K % 256) == 0 && (N % 256) == 0;
+	// The segmented scaled SwiGLU decodes the selected experts row by row unless it fuses the decode
+	// (ccv_nnc_mfa_segmented_scaled_gemm_fuses_packed_format, which takes whole 256-weight blocks itself), so the
+	// block codecs need whole blocks along K only, as SEGMENTED_GEMM_FORWARD.
+	const int scaled_shape_supported = gate_format == 0 || ccv_nnc_8i_rowwise_x_is_tiled(gate_format) ? rowwise_shape_supported : (K % 256) == 0;
 	// Static-rate FTQ gate and up: each one CCVFTQSR blob of expert_count N x K experts (as SEGMENTED_GEMM_FORWARD), at
 	// the same rate and codebook slot, with an FP16 or FP32 base matching the activation, read as 32-bit words. A few
 	// rows take the packed SwiGLU kernel, gate and up in one pass; larger batches take the W8A8
@@ -606,7 +610,7 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 		((gate_format & ~CCV_NNC_QX_8I_ROWWISE_FORMAT_MASK) || (gate_w->dataof % 4) != 0 || (up_w->dataof % 4) != 0))
 		return CCV_NNC_EXEC_INVALID;
 	const int use_segmented_scaled_swiglu_without_neural_accelerators =
-		!use_neural_accelerators && rowwise_shape_supported && a->info.datatype == CCV_32F &&
+		!use_neural_accelerators && scaled_shape_supported && a->info.datatype == CCV_32F &&
 		(N % 8) == 0 && (K % 8) == 0 &&
 		ccv_nnc_tensor_count(a->info) <= UINT32_MAX &&
 		ccv_nnc_tensor_count(gate_w->info) <= UINT32_MAX &&
@@ -614,9 +618,9 @@ static int _ccv_nnc_segmented_swiglu_routed_forw(const ccv_nnc_cmd_t cmd, ccv_nn
 	// The segmented GEMM fallback below decodes weights to floating point, which FTQ does not have.
 	if (ftq_weights && !use_neural_accelerators && !use_segmented_scaled_swiglu_without_neural_accelerators)
 		return CCV_NNC_EXEC_INVALID;
-	// The segmented scaled SwiGLU takes whole blocks or tiles (rowwise_shape_supported), with neural accelerators too;
-	// other packed shapes decode the selected experts for the segmented GEMM below.
-	if (rowwise_weights && rowwise_shape_supported && (use_neural_accelerators || use_segmented_scaled_swiglu_without_neural_accelerators))
+	// With or without neural accelerators the segmented scaled SwiGLU takes only the shapes it decodes
+	// (scaled_shape_supported); the others decode the whole bank for the floating-point segmented GEMM below.
+	if (rowwise_weights && scaled_shape_supported && (use_neural_accelerators || use_segmented_scaled_swiglu_without_neural_accelerators))
 	{
 		const ccv_nnc_mfa_segmented_scaled_swiglu_params_t params = {
 			.data_type = mtl_datatype,

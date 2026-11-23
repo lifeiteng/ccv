@@ -284,12 +284,12 @@ void ccv_nnc_mfa_encode_segmented_scaled_swiglu(
   CCV_NNC_MFA_PRECONDITION(
     params.M > 0 && params.N > 0 && params.K > 0 &&
     params.expert_count > 0 && params.bincount > 0);
-  // TMCQ and FTQ are a 16 x 16 tile grid: the selected-expert decode takes N % 16 and K % 16, and the fused tile path
-  // is taken only for the shapes SegmentedScaledGEMMKernel::fusesPackedFormat accepts (N % 64, K % 64). The other
-  // codecs take whole 256-weight blocks.
+  // TMCQ and FTQ are a 16 x 16 tile grid: the selected-expert decode takes N % 16 and K % 16. The other codecs take
+  // whole 256-weight blocks along K; the selected-expert decode takes any N. The fused decode is taken only for the
+  // shapes SegmentedScaledGEMMKernel::fusesPackedFormat accepts (N % 64 and K % 64 tiled, N % 256 and K % 256 otherwise).
   CCV_NNC_MFA_PRECONDITION(
     params.format == 0 || ((segmentedTMCQRate(params.format) || segmentedFTQRate(params.format)) ?
-      ((params.N % 16) == 0 && (params.K % 16) == 0) : ((params.N % 256) == 0 && (params.K % 256) == 0)));
+      ((params.N % 16) == 0 && (params.K % 16) == 0) : (params.K % 256) == 0));
 
   if (!params.use_neural_accelerators) {
     CCV_NNC_MFA_PRECONDITION(
