@@ -1974,6 +1974,19 @@ TEST_CASE("an ftq checkpoint loads only when its whole container holds")
 		} else
 			REQUIRE(result != CCV_IO_FINAL && !restored, "ftq with %s fails to load", cases[c].name);
 	}
+	// An FP32 base is the same blob with the same FP16 scales; it writes and reads back too.
+	ccv_nnc_tensor_param_t f32_params = t->info;
+	f32_params.datatype = ((CCV_32F >> 12) & 0xff) | CCV_QX | CCV_NNC_QX_8I_ROWWISE_X;
+	REQUIRE_EQ(ccv_nnc_tensor_data_size_without_padding(f32_params), size, "the FP32 base takes the same blob");
+	ccv_nnc_tensor_t* const t32 = ccv_nnc_tensor_new(0, f32_params, 0);
+	memcpy(t32->data.u8, t->data.u8, size);
+	REQUIRE_EQ(ccv_nnc_tensor_write(t32, db, "f32", 0), CCV_IO_FINAL, "the FP32 base writes");
+	ccv_nnc_tensor_t* restored = 0;
+	REQUIRE_EQ(ccv_nnc_tensor_read(db, "f32", 0, 0, 0, &restored), CCV_IO_FINAL, "the FP32 base loads");
+	REQUIRE_EQ(restored->info.datatype, f32_params.datatype, "the FP32 base keeps its datatype");
+	REQUIRE(memcmp(restored->data.u8, t->data.u8, size) == 0, "the FP32 base reads back");
+	ccv_nnc_tensor_free(restored);
+	ccv_nnc_tensor_free(t32);
 	ccfree(work);
 	ccv_nnc_tensor_free(t);
 	sqlite3_close(db);

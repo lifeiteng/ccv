@@ -581,7 +581,9 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 		if (row_length == 0 || count % row_length != 0 ||
 			(ftq_vr_format >= 0 && (datatype != (((CCV_16F >> 12) & 0xff) | CCV_QX | CCV_NNC_QX_8I_ROWWISE_X) ||
 				ccv_nnc_8i_rowwise_x_ftq_vr_check(data, data_bytes, ftq_vr_format, count / row_length, row_length, 0) != 0)) ||
-			(ftq_sr_format >= 0 && (datatype != (((CCV_16F >> 12) & 0xff) | CCV_QX | CCV_NNC_QX_8I_ROWWISE_X) ||
+			// Static-rate FTQ has an FP16 or an FP32 base (the same blob, see CCV_NNC_QX_8I_ROWWISE_FTQ_N16).
+			(ftq_sr_format >= 0 && ((datatype != (((CCV_16F >> 12) & 0xff) | CCV_QX | CCV_NNC_QX_8I_ROWWISE_X) &&
+				datatype != (((CCV_32F >> 12) & 0xff) | CCV_QX | CCV_NNC_QX_8I_ROWWISE_X)) ||
 				ccv_nnc_8i_rowwise_x_ftq_load_check(data, data_bytes, ftq_sr_format, count / row_length, row_length) != 0)))
 		{
 			if (tensor_created && *tensor_out)
