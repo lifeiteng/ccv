@@ -24,9 +24,10 @@ void ccv_nnc_drain_autotune_cache(void);
 int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length, uint64_t* const level_mask_out);
 /**
  * The load-time checks of a static-rate FTQ blob of length bytes for a row_count x row_length tensor of format:
- * length is exactly the blob size of the format's schedule (align128(32 + code bytes) + 2 rows) and every FP16 row
- * scale is finite and not negative (-0 passes). The header's high_bits / drop_count are checked by the loader, the rest
- * of the container (header shape, table, code tail and padding) by ccv_nnc_dequantize_8i_rowwise_x. Returns 0 or -1.
+ * length is exactly the blob size of the format's schedule (align128(32 + code bytes) + 2 rows), the CCVFTQSR header
+ * matches the shape and schedule (rows, cols, high_bits, drop_count), its table and table CRC name the format's codebook
+ * slot, the unused bits of the last code byte and the padding to the scales are zero, and every FP16 row scale is finite
+ * and not negative (-0 passes). ccv_nnc_dequantize_8i_rowwise_x runs the same container checks. Returns 0 or -1.
  */
 int ccv_nnc_8i_rowwise_x_ftq_load_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length);
 

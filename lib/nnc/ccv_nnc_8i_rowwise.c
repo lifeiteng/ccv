@@ -3029,14 +3029,51 @@ static int _ccv_nnc_8i_rowwise_ftq_scales_valid(const uint8_t* const scales, con
 	return 1;
 }
 
+// Every check of the CCVFTQSR container, run at load time (ccv_nnc_8i_rowwise_x_ftq_load_check) and by the CPU decode,
+// also in release builds: a wrong table or schedule would read past the table or the code. The blob must hold at
+// least the scale offset plus 2 bytes a row; the table it names is returned with its index shift.
+static const int8_t* _ccv_nnc_8i_rowwise_ftq_container(const uint8_t* const u8, const size_t length, const int format, const size_t row_count, const size_t row_length, ccv_nnc_8i_rowwise_x_ftq_schedule_t* const schedule_out, int* const shift)
+{
+	if (!ccv_nnc_8i_rowwise_x_is_ftq(format) || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length == 0 || row_length % 16 != 0 || row_count == 0 || row_count % 16 != 0 || row_count > UINT32_MAX || row_length > UINT32_MAX)
+		return 0;
+	const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(format, row_count, row_length);
+	if (schedule.high_bits > 1408 || length < schedule.scale_offset + 2 * row_count)
+		return 0;
+	// "CCVFTQSR", rows, cols, high_bits, drop_count, table, table_crc.
+	uint32_t header[6];
+	memcpy(header, u8 + 8, sizeof(header));
+	if (memcmp(u8, "CCVFTQSR", 8) != 0 || header[0] != row_count || header[1] != row_length || header[2] != schedule.high_bits || header[3] != schedule.drop_count)
+		return 0;
+	// The header's table must be the tensor's codebook slot, see _ccv_nnc_8i_rowwise_ftq_table. A mismatch would
+	// index out of the table.
+	const int8_t* const table = _ccv_nnc_8i_rowwise_ftq_table(ccv_nnc_codebook_slot_of(format), header[4], header[5], shift);
+	if (!table)
+		return 0;
+	// The rest of the container: unused bits of the last code byte and the padding to the scales are zero,
+	// and the FP16 scales are finite and not negative (-0 passes).
+	const size_t code_end = 32 + (schedule.code_bits + 7) / 8;
+	if (schedule.code_bits % 8 != 0 && (u8[code_end - 1] >> (schedule.code_bits % 8)) != 0)
+		return 0;
+	size_t p;
+	for (p = code_end; p < schedule.scale_offset; p++)
+		if (u8[p] != 0)
+			return 0;
+	if (!_ccv_nnc_8i_rowwise_ftq_scales_valid(u8 + schedule.scale_offset, row_count))
+		return 0;
+	if (schedule_out)
+		*schedule_out = schedule;
+	return table;
+}
+
 int ccv_nnc_8i_rowwise_x_ftq_load_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length)
 {
-	if (!ccv_nnc_8i_rowwise_x_is_ftq(format) || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length == 0 || row_length % 16 != 0 || row_count == 0 || row_count % 16 != 0)
+	if (!ccv_nnc_8i_rowwise_x_is_ftq(format) || row_length == 0 || row_count == 0 || row_count % 16 != 0 || row_length % 16 != 0)
 		return -1;
-	const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(format, row_count, row_length);
-	if (length != schedule.scale_offset + 2 * row_count)
+	// A stored blob is exactly the size its schedule gives.
+	if (length != ccv_nnc_8i_rowwise_x_ftq_schedule(format, row_count, row_length).scale_offset + 2 * row_count)
 		return -1;
-	return _ccv_nnc_8i_rowwise_ftq_scales_valid((const uint8_t*)data + schedule.scale_offset, row_count) ? 0 : -1;
+	int shift;
+	return _ccv_nnc_8i_rowwise_ftq_container((const uint8_t*)data, length, format, row_count, row_length, 0, &shift) ? 0 : -1;
 }
 
 int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length, uint64_t* const level_mask_out)
@@ -3131,34 +3168,13 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 	const uint8_t* const scales = u8 + scale_offset;
 	if (ccv_nnc_8i_rowwise_x_is_ftq(format))
 	{
-		// Every check of the FTQ container returns -1, also in release builds: a wrong table or schedule would
-		// read past the table or the code.
-		if (datatype != CCV_16F || (format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length % 16 != 0 || row_count % 16 != 0)
+		// Every check of the FTQ container returns -1 (_ccv_nnc_8i_rowwise_ftq_container).
+		if (datatype != CCV_16F)
 			return -1;
-		const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(format, row_count, row_length);
-		if (schedule.scale_offset != scale_offset || input_length < scale_offset + row_count * 2 || schedule.high_bits > 1408)
-			return -1;
-		// "CCVFTQSR", rows, cols, high_bits, drop_count, table, table_crc.
-		uint32_t header[6];
-		memcpy(header, u8 + 8, sizeof(header));
-		if (memcmp(u8, "CCVFTQSR", 8) != 0 || header[0] != row_count || header[1] != row_length || header[2] != schedule.high_bits || header[3] != schedule.drop_count)
-			return -1;
-		// The header's table must be the tensor's codebook slot, see _ccv_nnc_8i_rowwise_ftq_table. A mismatch would
-		// index out of the table.
+		ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule;
 		int shift;
-		const int8_t* const table = _ccv_nnc_8i_rowwise_ftq_table(ccv_nnc_codebook_slot_of(format), header[4], header[5], &shift);
-		if (!table)
-			return -1;
-		// The rest of the container: unused bits of the last code byte and the padding to the scales are zero,
-		// and the FP16 scales are finite and not negative (-0 passes).
-		const size_t code_end = 32 + (schedule.code_bits + 7) / 8;
-		if (schedule.code_bits % 8 != 0 && (u8[code_end - 1] >> (schedule.code_bits % 8)) != 0)
-			return -1;
-		size_t p;
-		for (p = code_end; p < scale_offset; p++)
-			if (u8[p] != 0)
-				return -1;
-		if (!_ccv_nnc_8i_rowwise_ftq_scales_valid(scales, row_count))
+		const int8_t* const table = _ccv_nnc_8i_rowwise_ftq_container(u8, input_length, format, row_count, row_length, &schedule, &shift);
+		if (!table || schedule.scale_offset != scale_offset)
 			return -1;
 		const size_t tile_rows = row_count / 16;
 		const size_t strips = row_length / 16;

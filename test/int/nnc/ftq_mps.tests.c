@@ -316,7 +316,10 @@ TEST_CASE("cpu ftq decode rejects every broken container, also without asserts")
 		int format = base;
 		cases[c].mutate(work, &schedule, &format, slot);
 		REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(work, CCV_16F, CCV_TENSOR_CPU_MEMORY, size, cols, format, out, (size_t)rows * cols), -1, "FTQ with a broken %s is rejected", cases[c].name);
+		// The load-time check runs the same container checks.
+		REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_load_check(work, size, format, rows, cols), -1, "FTQ with a broken %s fails the load check", cases[c].name);
 	}
+	REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_load_check(blob, size, base, rows, cols), 0, "the valid container passes the load check");
 	// The code is always whole bytes (16 n bits a tile) and the padding after it must be zero; the FP16-only
 	// rule is checked on the same small container.
 	{
@@ -331,7 +334,9 @@ TEST_CASE("cpu ftq decode rejects every broken container, also without asserts")
 		REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(b2, CCV_16F, CCV_TENSOR_CPU_MEMORY, z2, c2, f2, out, (size_t)r2 * c2), 0, "the small container decodes");
 		b2[32 + s2.code_bits / 8] = 1;
 		REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(b2, CCV_16F, CCV_TENSOR_CPU_MEMORY, z2, c2, f2, out, (size_t)r2 * c2), -1, "FTQ with non-zero padding is rejected");
+		REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_load_check(b2, z2, f2, r2, c2), -1, "FTQ with non-zero padding fails the load check");
 		b2[32 + s2.code_bits / 8] = 0;
+		REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_load_check(b2, z2, f2, r2, c2), 0, "the small container passes the load check");
 		// Not FP16 output and a short input are rejected too.
 		REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(b2, CCV_32F, CCV_TENSOR_CPU_MEMORY, z2, c2, f2, out, (size_t)r2 * c2), -1, "FTQ decodes to FP16 only");
 		ccfree(b2);
@@ -1923,6 +1928,54 @@ TEST_CASE("ftq and ftq_vr checkpoints load only when the stored blob is exactly 
 		ccfree(longer);
 		ccv_nnc_tensor_free(t);
 	}
+	sqlite3_close(db);
+}
+
+// The whole static-rate container is checked when a checkpoint loads, as for variable rate: header shape and schedule,
+// the table and its CRC, the zero padding after the code and the row scales. Each broken blob replaces the stored data
+// of a valid tensor and fails to load; the valid one loads.
+TEST_CASE("an ftq checkpoint loads only when its whole container holds")
+{
+	sqlite3* db = 0;
+	REQUIRE_EQ(sqlite3_open(":memory:", &db), SQLITE_OK, "in-memory database opens");
+	size_t size;
+	ccv_nnc_tensor_t* const t = ftq_rule_tensor_new(0, 0xc0ffu, &size);
+	const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(t->info.reserved, 48, 256);
+	// Byte offset and value written there; offset -1 is the valid blob.
+	const struct { const char* name; int offset; uint8_t value; } cases[] = {
+		{ "the valid blob", -1, 0 }, { "rows", 8, 47 }, { "cols", 12, 255 }, { "table", 24, 1 }, { "table crc", 28, 1 },
+		{ "padding", 32 + (int)(schedule.code_bits / 8), 1 }, { "the last padding byte", (int)schedule.scale_offset - 1, 0x80 },
+	};
+	REQUIRE(32 + schedule.code_bits / 8 < schedule.scale_offset, "padding follows the code");
+	uint8_t* const work = (uint8_t*)ccmalloc(size);
+	int c;
+	for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++)
+	{
+		memcpy(work, t->data.u8, size);
+		if (cases[c].offset >= 0)
+			work[cases[c].offset] = cases[c].value;
+		REQUIRE_EQ(ftq_rule_check(0, work, size), cases[c].offset < 0 ? 0 : -1, "ftq with %s: the load check", cases[c].name);
+		char name[32];
+		snprintf(name, sizeof(name), "c%d", c);
+		REQUIRE_EQ(ccv_nnc_tensor_write(t, db, name, 0), CCV_IO_FINAL, "ftq writes");
+		sqlite3_stmt* update = 0;
+		REQUIRE_EQ(sqlite3_prepare_v2(db, "UPDATE tensors SET data=?1 WHERE name=?2", -1, &update, 0), SQLITE_OK, "update prepares");
+		sqlite3_bind_blob(update, 1, work, (int)size, SQLITE_TRANSIENT);
+		sqlite3_bind_text(update, 2, name, -1, SQLITE_TRANSIENT);
+		REQUIRE_EQ(sqlite3_step(update), SQLITE_DONE, "ftq with %s is stored", cases[c].name);
+		sqlite3_finalize(update);
+		ccv_nnc_tensor_t* restored = 0;
+		const int result = ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored);
+		if (cases[c].offset < 0)
+		{
+			REQUIRE_EQ(result, CCV_IO_FINAL, "ftq with %s loads", cases[c].name);
+			REQUIRE(memcmp(restored->data.u8, work, size) == 0, "ftq with %s reads back", cases[c].name);
+			ccv_nnc_tensor_free(restored);
+		} else
+			REQUIRE(result != CCV_IO_FINAL && !restored, "ftq with %s fails to load", cases[c].name);
+	}
+	ccfree(work);
+	ccv_nnc_tensor_free(t);
 	sqlite3_close(db);
 }
 
