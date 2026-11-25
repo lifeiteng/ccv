@@ -616,6 +616,25 @@ int ccv_nnc_tensor_read(void* const handle, const char* const name, const ccv_nn
 			return CCV_IO_ERROR;
 		}
 	}
+	// An inline codebook stored as is (no decoder takes these bytes) is checked here, once, on the host: magic, P,
+	// crc32, zero padding and values. Backends that cannot read the table on the host per command (CUDA) rely on it;
+	// a decoder that takes the bytes checks its output itself (ccv_nnc_codebook_resolve_inline). An FTQ inline codebook
+	// was resolved with its blob header above.
+	if (stored_inline_bits && !ftq_inline_size && (!identifier || !options || !options->decode) &&
+		(data_bytes < ccv_nnc_8i_rowwise_x_inline_codebook_size(stored_inline_bits) || ccv_nnc_codebook_resolve_inline(data, stored_inline_bits) < 0))
+	{
+		if (split_workspace)
+			ccfree(split_workspace);
+		if (tensor_created && *tensor_out)
+		{
+			ccv_nnc_tensor_free(*tensor_out);
+			*tensor_out = 0;
+		}
+		sqlite3_reset(tensor_select_stmt);
+		sqlite3_clear_bindings(tensor_select_stmt);
+		sqlite3_finalize(tensor_select_stmt);
+		return CCV_IO_ERROR;
+	}
 	int dim[CCV_NNC_MAX_DIM_ALLOC];
 	memcpy(dim, sqlite3_column_blob(tensor_select_stmt, 4), ccv_min(sizeof(dim), sqlite3_column_bytes(tensor_select_stmt, 4)));
 	const int nd = ccv_nnc_tensor_nd(dim);
