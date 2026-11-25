@@ -22,6 +22,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define CCV_NNC_CODEBOOK_SLOT_SHIFT (16)
 #define CCV_NNC_CODEBOOK_SLOT_MASK (0xff << CCV_NNC_CODEBOOK_SLOT_SHIFT)
 #define CCV_NNC_CODEBOOK_MAX_SLOTS (256)
@@ -103,5 +107,9 @@ int ccv_nnc_codebook_resolve_inline(const void* const data, const int reserved);
  * must have 512 non-negative pairs). FTQ names its table structure in its blob header, see
  * ccv_nnc_8i_rowwise_x_resolve_inline. */
 int ccv_nnc_codebook_resolve_inline_with_flags(const void* const data, const int reserved, const int flags);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
