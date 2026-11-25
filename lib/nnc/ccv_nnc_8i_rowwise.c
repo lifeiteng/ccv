@@ -55,8 +55,11 @@ CCV_WARN_UNUSED(size_t) ccv_nnc_8i_rowwise_x_data_size(const int format, const i
 	assert(row_length > 0);
 	assert(input_length % row_length == 0);
 	const size_t row_count = input_length / row_length;
+	if (!ccv_nnc_8i_rowwise_x_codebook_is_valid(format))
+		return 0;
 	const size_t scale_offset = _ccv_nnc_8i_rowwise_packed_scale_offset(format, input_length, row_length);
-	return scale_offset + row_count * CCV_GET_DATA_TYPE_SIZE(datatype);
+	// An inline codebook (TMCQ) comes first.
+	return ccv_nnc_8i_rowwise_x_inline_codebook_size(format) + scale_offset + row_count * CCV_GET_DATA_TYPE_SIZE(datatype);
 }
 
 static void _ccv_nnc_8i_rowwise_packed_write_bits(uint8_t* const data, const size_t bit_offset, const uint32_t value, const int bits)
@@ -2952,7 +2955,7 @@ CCV_WARN_UNUSED(size_t) ccv_nnc_quantize_8i_rowwise_x(const void* input, const i
 			return 0;
 	}
 	// The quantizer encodes with the built-in codebook only.
-	if (ccv_nnc_8i_rowwise_x_codebook_slot(format) != 0)
+	if (ccv_nnc_8i_rowwise_x_codebook_slot(format) != 0 || ccv_nnc_8i_rowwise_x_inline_codebook_entries(format))
 		return 0;
 	if (ccv_nnc_8i_rowwise_x_is_tiled(format))
 	{
@@ -3065,6 +3068,32 @@ static const int8_t* _ccv_nnc_8i_rowwise_ftq_container(const uint8_t* const u8, 
 	return table;
 }
 
+int ccv_nnc_8i_rowwise_x_resolve_inline(const void* const data, const size_t size, const int format)
+{
+	const size_t inline_size = ccv_nnc_8i_rowwise_x_inline_codebook_size(format);
+	if (!inline_size)
+		return format;
+	if (!ccv_nnc_8i_rowwise_x_codebook_is_valid(format) || !data || size < inline_size)
+		return -1;
+	int flags = 0;
+	if (ccv_nnc_8i_rowwise_x_is_ftq_any(format))
+	{
+		// The FTQ blob after the codebook names its table structure in its header (table bits 16 - 17): 0 plain, 1
+		// quadrant fold. Its id, log2 and crc are checked against the resolved slot where the blob is decoded or
+		// loaded (_ccv_nnc_8i_rowwise_ftq_table); the id stays the one the blob was fitted with and is not looked up.
+		const uint8_t* const head = (const uint8_t*)data + inline_size;
+		if (size < inline_size + 32 || memcmp(head, ccv_nnc_8i_rowwise_x_is_ftq_vr(format) ? "CCVFTQVR" : "CCVFTQSR", 8) != 0)
+			return -1;
+		uint32_t field;
+		memcpy(&field, head + 24, 4);
+		const uint32_t structure = (field >> 16) & 3;
+		if (structure > 1)
+			return -1;
+		flags = structure ? CCV_NNC_CODEBOOK_FOLD : 0;
+	}
+	return ccv_nnc_codebook_resolve_inline_with_flags(data, format, flags);
+}
+
 int ccv_nnc_8i_rowwise_x_ftq_load_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length)
 {
 	if (!ccv_nnc_8i_rowwise_x_is_ftq(format) || row_length == 0 || row_count == 0 || row_count % 16 != 0 || row_length % 16 != 0)
@@ -3130,25 +3159,22 @@ int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t lengt
 	return 0;
 }
 
-int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const int memory_type, const size_t input_length, const size_t row_length, const int format, void* output, const size_t output_length)
+int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const int memory_type, const size_t input_length, const size_t row_length, const int format_in, void* output, const size_t output_length)
 {
 	assert(datatype == CCV_16F || datatype == CCV_16BF || datatype == CCV_32F || datatype == CCV_64F);
 	assert(memory_type == CCV_TENSOR_CPU_MEMORY || memory_type == CCV_TENSOR_GPU_MEMORY);
 	assert(row_length > 0);
 	assert(output_length % row_length == 0);
-	assert(!(format & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length % 256 == 0);
-	// A codebook slot only names a table for the trellis codecs, and only once it is registered.
-	const int codebook_slot = ccv_nnc_codebook_slot_of(format);
-	if (codebook_slot && (!ccv_nnc_8i_rowwise_x_is_tiled(format) || !ccv_nnc_codebook_get(codebook_slot, 0, 0)))
-		return -1;
-	// A folded table (CCV_NNC_CODEBOOK_FOLD) exists for FTQ only.
-	if (codebook_slot && (ccv_nnc_codebook_flags(codebook_slot) & CCV_NNC_CODEBOOK_FOLD) && !ccv_nnc_8i_rowwise_x_is_ftq_any(format))
-		return -1;
-	// FTQ is FP16 only and has a schedule-derived size; checked before the generic size asserts below.
-	if (ccv_nnc_8i_rowwise_x_is_ftq_any(format) && (datatype != CCV_16F || ccv_nnc_8i_rowwise_x_data_size(format, datatype, output_length, row_length) == 0 || input_length < ccv_nnc_8i_rowwise_x_data_size(format, datatype, output_length, row_length)))
+	assert(!(format_in & CCV_NNC_QX_8I_ROWWISE_HADAMARD_256) || row_length % 256 == 0);
+	if (!ccv_nnc_8i_rowwise_x_codebook_is_valid(format_in))
 		return -1;
 	if (memory_type != CCV_TENSOR_CPU_MEMORY)
 	{
+		// A GPU backend reads an inline codebook from the buffer itself; any other slot is checked here.
+		const int codebook_slot = ccv_nnc_codebook_slot_of(format_in);
+		if (codebook_slot && !ccv_nnc_8i_rowwise_x_inline_codebook_entries(format_in) && !ccv_nnc_codebook_get(codebook_slot, 0, 0))
+			return -1;
+		const int format = format_in;
 #ifdef HAVE_CUDA
 		ccv_nnc_compat_dequantize_8i_rowwise_x_fp(input, datatype, input_length, row_length, format, output, output_length, 0);
 #elif defined(HAVE_MPS)
@@ -3159,11 +3185,30 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 #endif
 		return 0;
 	}
+	// An inline codebook (TMCQ, FTQ any) is the start of the data: register it and decode the rest with its slot.
+	const size_t inline_size = ccv_nnc_8i_rowwise_x_inline_codebook_size(format_in);
+	if (input_length < inline_size)
+		return -1;
+	const int format = ccv_nnc_8i_rowwise_x_resolve_inline(input, input_length, format_in);
+	if (format < 0)
+		return -1;
+	input = (const uint8_t*)input + inline_size;
+	const size_t payload_length = input_length - inline_size;
+	// A codebook slot only names a table for the trellis codecs, and only once it is registered.
+	const int codebook_slot = ccv_nnc_codebook_slot_of(format);
+	if (codebook_slot && (!ccv_nnc_8i_rowwise_x_is_tiled(format) || !ccv_nnc_codebook_get(codebook_slot, 0, 0)))
+		return -1;
+	// A folded table (CCV_NNC_CODEBOOK_FOLD) exists for FTQ only.
+	if (codebook_slot && (ccv_nnc_codebook_flags(codebook_slot) & CCV_NNC_CODEBOOK_FOLD) && !ccv_nnc_8i_rowwise_x_is_ftq_any(format))
+		return -1;
+	// FTQ is FP16 only and has a schedule-derived size; checked before the generic size asserts below.
+	if (ccv_nnc_8i_rowwise_x_is_ftq_any(format) && (datatype != CCV_16F || ccv_nnc_8i_rowwise_x_data_size(format, datatype, output_length, row_length) == 0 || payload_length < ccv_nnc_8i_rowwise_x_data_size(format, datatype, output_length, row_length)))
+		return -1;
 	const size_t row_count = output_length / row_length;
 	const size_t group_size = ccv_nnc_8i_rowwise_x_group_size(format);
 	const size_t groups_per_row = (row_length + group_size - 1) / group_size;
 	const size_t scale_offset = _ccv_nnc_8i_rowwise_packed_scale_offset(format, output_length, row_length);
-	assert(input_length >= scale_offset + row_count * CCV_GET_DATA_TYPE_SIZE(datatype));
+	assert(payload_length >= scale_offset + row_count * CCV_GET_DATA_TYPE_SIZE(datatype));
 	const uint8_t* const u8 = (const uint8_t*)input;
 	const uint8_t* const scales = u8 + scale_offset;
 	if (ccv_nnc_8i_rowwise_x_is_ftq(format))
@@ -3173,7 +3218,7 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 			return -1;
 		ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule;
 		int shift;
-		const int8_t* const table = _ccv_nnc_8i_rowwise_ftq_container(u8, input_length, format, row_count, row_length, &schedule, &shift);
+		const int8_t* const table = _ccv_nnc_8i_rowwise_ftq_container(u8, payload_length, format, row_count, row_length, &schedule, &shift);
 		if (!table || schedule.scale_offset != scale_offset)
 			return -1;
 		const size_t tile_rows = row_count / 16;
@@ -3199,7 +3244,8 @@ int ccv_nnc_dequantize_8i_rowwise_x(const void* input, const int datatype, const
 	if (ccv_nnc_8i_rowwise_x_is_ftq_vr(format))
 	{
 		// Every check of the CCVFTQVR container returns -1, also in release builds (ccv_nnc_8i_rowwise_x_ftq_vr_check).
-		// input_length is the caller's buffer (it may be a padded tensor, checked >= above); the blob is its first
+		// payload_length is the caller's buffer after any inline codebook (it may be a padded tensor, checked >= above);
+		// the blob is its first
 		// ccv_nnc_8i_rowwise_x_data_size bytes.
 		if (datatype != CCV_16F || ccv_nnc_8i_rowwise_x_ftq_vr_check(u8, ccv_nnc_8i_rowwise_x_data_size(format, datatype, output_length, row_length), format, row_count, row_length, 0) != 0)
 			return -1;

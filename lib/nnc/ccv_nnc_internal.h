@@ -31,6 +31,13 @@ int ccv_nnc_8i_rowwise_x_ftq_vr_check(const void* const data, const size_t lengt
  * FP16 or FP32 base. Returns 0 or -1.
  */
 int ccv_nnc_8i_rowwise_x_ftq_load_check(const void* const data, const size_t length, const int format, const size_t row_count, const size_t row_length);
+/**
+ * The reserved field for the data after the inline codebook of an 8I_ROWWISE_X weight whose data (CPU memory, size
+ * bytes) starts with it: ccv_nnc_codebook_resolve_inline, and for FTQ / FTQ-VR the table registered with
+ * CCV_NNC_CODEBOOK_FOLD when the blob header after the codebook names a quadrant-folded table. format unchanged if it
+ * has no inline codebook; -1 if the codebook or the FTQ header magic or structure is invalid.
+ */
+int ccv_nnc_8i_rowwise_x_resolve_inline(const void* const data, const size_t size, const int format);
 
 // Define some internal constraints
 
