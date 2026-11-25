@@ -1863,8 +1863,39 @@ static int streaming_case(const int datatype, ccv_nnc_tensor_t* const* const sou
 	return status;
 }
 
-// rates: of gate, up and down.
-static void streaming_ftq_case(const int datatype, const ftq_table_t* const table, const int* const rates, int* const __case_result__)
+// The inline form (ccv_nnc_codebook.h) of a slot-form FTQ weight on the CPU: the serialized table of its slot (1 or
+// more), zeros up to 128 + 2 P bytes, then the same bytes.
+static ccv_nnc_tensor_t* ftq_inline_host_new(const ccv_nnc_tensor_t* const host)
+{
+	const int slot = ccv_nnc_codebook_slot_of(host->info.reserved);
+	int entries = 0;
+	ccv_nnc_codebook_get(slot, &entries, 0);
+	ccv_nnc_tensor_param_t params = host->info;
+	params.reserved = ccv_nnc_8i_rowwise_x_with_inline_codebook(host->info.reserved, entries);
+	ccv_nnc_tensor_t* const t = ccv_nnc_tensor_new(0, params, 0);
+	const size_t prefix = ccv_nnc_8i_rowwise_x_inline_codebook_size(params.reserved);
+	const size_t size = ccv_nnc_tensor_data_size_without_padding(host->info);
+	assert(ccv_nnc_tensor_data_size_without_padding(params) == prefix + size);
+	memset(t->data.u8, 0, prefix);
+	const size_t serialized = ccv_nnc_codebook_serialize(slot, t->data.u8, prefix);
+	assert(serialized == 16 + 2 * (size_t)entries);
+	(void)serialized;
+	memcpy(t->data.u8 + prefix, host->data.u8, size);
+	return t;
+}
+
+static ccv_nnc_tensor_t* gpu_copy_of(const ccv_nnc_tensor_t* const host)
+{
+	ccv_nnc_tensor_param_t params = host->info;
+	params.type = CCV_TENSOR_GPU_MEMORY | 000;
+	ccv_nnc_tensor_t* const g = ccv_nnc_tensor_new(0, params, 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST((ccv_nnc_tensor_t*)host), TENSOR_LIST(g), 0);
+	return g;
+}
+
+// rates: of gate, up and down. inline_codebook: the streamed (file-backed) sources carry their table inline instead of
+// naming its slot; the references still name it.
+static void streaming_ftq_case(const int datatype, const ftq_table_t* const table, const int* const rates, const int inline_codebook, int* const __case_result__)
 {
 	const int experts = 32, n_rows = 256, k = 512;
 	char paths[3][64] = {
@@ -1884,10 +1915,14 @@ static void streaming_ftq_case(const int datatype, const ftq_table_t* const tabl
 		bank.dim[0] = 2;
 		const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(bank.reserved, 2 * bank.dim[1], bank.dim[2]);
 		REQUIRE_EQ(ccv_nnc_tensor_data_size_without_padding(bank), schedule.scale_offset + 2 * 2 * (size_t)bank.dim[1], "a 2-slot FTQ bank is a [2, N, K] blob");
-		REQUIRE(write_file(hosts[i], paths[i]), "each FTQ projection is written to a temporary file");
-		ccv_nnc_tensor_param_t gpu_params = hosts[i]->info;
+		ccv_nnc_tensor_t* const inline_host = inline_codebook ? ftq_inline_host_new(hosts[i]) : 0;
+		const ccv_nnc_tensor_t* const streamed_host = inline_codebook ? inline_host : hosts[i];
+		REQUIRE(write_file(streamed_host, paths[i]), "each FTQ projection is written to a temporary file");
+		ccv_nnc_tensor_param_t gpu_params = streamed_host->info;
 		gpu_params.type = CCV_TENSOR_GPU_MEMORY | 000;
 		sources[i] = ccv_nnc_tensor_new_from_file(gpu_params, paths[i], 0, CCV_NNC_TENSOR_MEMORY_MAP_ON_DEMAND);
+		if (inline_host)
+			ccv_nnc_tensor_free(inline_host);
 		REQUIRE(sources[i], "the FTQ projection maps on demand");
 	}
 	double max_difference = 0;
@@ -1926,13 +1961,344 @@ TEST_CASE("mps moe weights streaming stages ftq banks, fp16 and fp32, built-in a
 	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_MOE_WEIGHTS_STREAMING_FORWARD, CCV_NNC_BACKEND_MPS));
 	const ftq_table_t folded = ftq_folded_table();
 	static const int rates[3] = { 34, 34, 48 };
-	streaming_ftq_case(CCV_16F, &ftq_builtin, rates, __case_result__);
-	streaming_ftq_case(CCV_32F, &ftq_builtin, rates, __case_result__);
-	streaming_ftq_case(CCV_32F, &folded, rates, __case_result__);
+	streaming_ftq_case(CCV_16F, &ftq_builtin, rates, 0, __case_result__);
+	streaming_ftq_case(CCV_32F, &ftq_builtin, rates, 0, __case_result__);
+	streaming_ftq_case(CCV_32F, &folded, rates, 0, __case_result__);
 	// Above 4 bpw: n72 gate / up and an n88 down.
 	static const int high_rates[3] = { 72, 72, 88 };
-	streaming_ftq_case(CCV_16F, &ftq_builtin, high_rates, __case_result__);
-	streaming_ftq_case(CCV_32F, &folded, high_rates, __case_result__);
+	streaming_ftq_case(CCV_16F, &ftq_builtin, high_rates, 0, __case_result__);
+	streaming_ftq_case(CCV_32F, &folded, high_rates, 0, __case_result__);
+}
+
+// The built-in table's content registered as a table of its own (file table 1, as the delivered files name it).
+static ftq_table_t ftq_builtin_content_table(void)
+{
+	static ftq_table_t t;
+	if (t.slot)
+		return t;
+	int entries = 0;
+	const int8_t* const pairs = ccv_nnc_codebook_get(0, &entries, 0);
+	t.slot = ccv_nnc_codebook_register(pairs, entries);
+	ccv_nnc_codebook_get(t.slot, 0, &t.crc);
+	t.table = 1u | (9u << 8);
+	return t;
+}
+
+// A random 512-pair table (header id 1, log2 9).
+static ftq_table_t ftq_external9_table(void)
+{
+	static ftq_table_t t;
+	if (t.slot)
+		return t;
+	int8_t pairs[1024];
+	uint32_t seed = 0x7e57ab09u;
+	int i;
+	for (i = 0; i < 1024; i++)
+		pairs[i] = (int8_t)((int)(rng_next(&seed) % 255) - 127);
+	t.slot = ccv_nnc_codebook_register(pairs, 512);
+	ccv_nnc_codebook_get(t.slot, 0, &t.crc);
+	t.table = 1u | (9u << 8);
+	return t;
+}
+
+TEST_CASE("mps moe weights streaming stages ftq banks from sources with an inline codebook like the same weights naming the table")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_MOE_WEIGHTS_STREAMING_FORWARD, CCV_NNC_BACKEND_MPS));
+	// The table and the FTQ headers are read from the file in front of the experts; the streamed outputs equal the
+	// resident references that name the table's slot, bit for bit (max difference 0), through decode and prefill.
+	const ftq_table_t builtin_content = ftq_builtin_content_table(), external9 = ftq_external9_table(), external = ftq_external_table(), folded = ftq_folded_table();
+	REQUIRE(builtin_content.slot >= 1 && external9.slot >= 1 && external.slot >= 1 && folded.slot >= 1, "the tables register");
+	static const int rates[3] = { 34, 34, 48 };
+	static const int high_rates[3] = { 72, 72, 88 };
+	streaming_ftq_case(CCV_16F, &builtin_content, rates, 1, __case_result__);
+	streaming_ftq_case(CCV_32F, &external9, rates, 1, __case_result__);
+	streaming_ftq_case(CCV_16F, &external, high_rates, 1, __case_result__);
+	streaming_ftq_case(CCV_32F, &folded, rates, 1, __case_result__);
+	streaming_ftq_case(CCV_16F, &folded, high_rates, 1, __case_result__);
+}
+
+// Segmented GEMM and SwiGLU of `r` on the slot form and on the inline form of the same weights: the outputs that differ
+// in any bit, or -1 if the two do not both run (*ran: whether they did; both failing alike is 0 with *ran 0).
+static int inline_segmented_mismatches(const int datatype, const routing_t* const r, const int k, const int n_rows, ccv_nnc_tensor_t* const gate, ccv_nnc_tensor_t* const up, ccv_nnc_tensor_t* const gate_inline, ccv_nnc_tensor_t* const up_inline, const int swiglu, const int no_na, const uint32_t seed, int* const ran)
+{
+	float* const a = activations_new(datatype, r->rows, k, seed);
+	float* const route = route_weights_new(datatype, r->rows);
+	float* const out = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	float* const want = (float*)ccmalloc(sizeof(float) * r->rows * n_rows);
+	const int s1 = swiglu ? run_segmented_swiglu(datatype, r, a, r->rows, route, k, n_rows, gate, up, no_na, want) : run_segmented_gemm(datatype, r, a, k, n_rows, gate, 0, no_na, want);
+	const int s2 = swiglu ? run_segmented_swiglu(datatype, r, a, r->rows, route, k, n_rows, gate_inline, up_inline, no_na, out) : run_segmented_gemm(datatype, r, a, k, n_rows, gate_inline, 0, no_na, out);
+	*ran = s1 == CCV_NNC_EXEC_SUCCESS;
+	const int mismatches = s1 != s2 ? -1 : *ran ? bit_mismatches(out, want, (size_t)r->rows * n_rows) : 0;
+	ccfree(want);
+	ccfree(out);
+	ccfree(route);
+	ccfree(a);
+	return mismatches;
+}
+
+TEST_CASE("mps ftq segmented gemm and swiglu with an inline codebook equal the same weights naming the table bit for bit, and reject a header that does not name it")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS) && ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	const int na = ccv_nnc_mfa_has_neural_accelerators(ccv_nnc_default_mfa_context());
+	const ftq_table_t tables[5] = { ftq_builtin_content_table(), ftq_external9_table(), ftq_external_table(), ftq_external11_table(), ftq_folded_table() };
+	// One row a bin (the fused FTQ GEMV) and a prefill (W8A8: tiles decoded in registers with neural accelerators, the
+	// selected-expert decode and Int8MatMul without).
+	routing_t gemv = routing_of(4, small_gemv_indices, small_gemv_counts);
+	routing_t prefill = routing_of(5, small_w8a8_indices, (const int[]){ 30, 41, 0, 25, 33 });
+	static const int ks[] = { 320, 1152 };
+	static const int rates[] = { 34, 72 };
+	const int n_rows = 128;
+	int t, ki, ri, d, compared = 0;
+	for (t = 0; t < 5; t++)
+		for (ki = 0; ki < 2; ki++)
+			for (ri = 0; ri < 2; ri++)
+				for (d = 0; d < 2; d++)
+				{
+					if (ki == 1 && t != 1 && t != 4)
+						continue;
+					const int datatype = d ? CCV_32F : CCV_16F;
+					const int k = ks[ki], n = rates[ri];
+					const uint32_t seed = 0x1a1500u + t * 97 + ki * 31 + ri * 7 + d;
+					ccv_nnc_tensor_t* gate_host;
+					ccv_nnc_tensor_t* up_host;
+					ccv_nnc_tensor_t* const gate = ftq_weight_new(datatype, 6, n_rows, k, n, &tables[t], seed, &gate_host);
+					ccv_nnc_tensor_t* const up = ftq_weight_new(datatype, 6, n_rows, k, n, &tables[t], seed + 1000, &up_host);
+					ccv_nnc_tensor_t* const gate_inline_host = ftq_inline_host_new(gate_host);
+					ccv_nnc_tensor_t* const up_inline_host = ftq_inline_host_new(up_host);
+					ccv_nnc_tensor_t* const gate_inline = gpu_copy_of(gate_inline_host);
+					ccv_nnc_tensor_t* const up_inline = gpu_copy_of(up_inline_host);
+					int p, swiglu, no_na;
+					for (p = 0; p < 2; p++)
+						for (swiglu = 0; swiglu < 2; swiglu++)
+							for (no_na = 0; no_na < 2; no_na++)
+							{
+								if (no_na && (!p || !na))
+									continue;
+								int ran = 0;
+								const int m = inline_segmented_mismatches(datatype, p ? &prefill : &gemv, k, n_rows, gate, up, gate_inline, up_inline, swiglu, no_na, seed + 2 + p * 4 + swiglu * 2 + no_na, &ran);
+								REQUIRE_EQ(m, 0, "FTQ inline table %d %s K=%d n%d %s %s%s equals the slot form", t, dtype_name(datatype), k, n, p ? "prefill" : "gemv", swiglu ? "swiglu" : "gemm", no_na ? " without neural accelerators" : "");
+								// The GEMV and the prefill with neural accelerators (or FP32) always run.
+								if (!no_na && (!p || na || datatype == CCV_32F))
+									REQUIRE(ran, "FTQ table %d %s K=%d n%d %s %s runs", t, dtype_name(datatype), k, n, p ? "prefill" : "gemv", swiglu ? "swiglu" : "gemm");
+								compared += ran;
+							}
+					if (t == 1 && ki == 0 && ri == 0)
+					{
+						// The header crc of another table: the inline weight is rejected by both commands, routed gate or up.
+						uint32_t crc;
+						const size_t prefix = ccv_nnc_8i_rowwise_x_inline_codebook_size(gate_inline_host->info.reserved);
+						memcpy(&crc, gate_inline_host->data.u8 + prefix + 28, 4);
+						crc ^= 1;
+						memcpy(gate_inline_host->data.u8 + prefix + 28, &crc, 4);
+						ccv_nnc_tensor_t* const bad = gpu_copy_of(gate_inline_host);
+						float* const a = activations_new(datatype, gemv.rows, k, seed);
+						float* const route = route_weights_new(datatype, gemv.rows);
+						REQUIRE_EQ(run_segmented_gemm(datatype, &gemv, a, k, n_rows, bad, 0, 0, 0), CCV_NNC_EXEC_INVALID, "a bad inline header fails the segmented GEMM %s", dtype_name(datatype));
+						REQUIRE_EQ(run_segmented_swiglu(datatype, &gemv, a, gemv.rows, route, k, n_rows, bad, up_inline, 0, 0), CCV_NNC_EXEC_INVALID, "a bad inline gate header fails the segmented SwiGLU %s", dtype_name(datatype));
+						REQUIRE_EQ(run_segmented_swiglu(datatype, &gemv, a, gemv.rows, route, k, n_rows, gate_inline, bad, 0, 0), CCV_NNC_EXEC_INVALID, "a bad inline up header fails the segmented SwiGLU %s", dtype_name(datatype));
+						ccfree(route);
+						ccfree(a);
+						ccv_nnc_tensor_free(bad);
+					}
+					ccv_nnc_tensor_free(up_inline);
+					ccv_nnc_tensor_free(gate_inline);
+					ccv_nnc_tensor_free(up_inline_host);
+					ccv_nnc_tensor_free(gate_inline_host);
+					ccv_nnc_tensor_free(up);
+					ccv_nnc_tensor_free(up_host);
+					ccv_nnc_tensor_free(gate);
+					ccv_nnc_tensor_free(gate_host);
+				}
+	REQUIRE(compared > 0, "the forms were compared");
+	if (getenv("FTQ_SEGMENTED_VERBOSE"))
+		printf("\n  %d segmented runs of the inline form bit-identical to the slot form\n", compared);
+	routing_free(&prefill);
+	routing_free(&gemv);
+}
+
+TEST_CASE("mps segmented gemm takes an ftq shared expert with an inline codebook like the same shared weight naming the table")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_SEGMENTED_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	// The shared expert's weights do not join the routed dispatch: they run as GEMM_FORWARD on the weight as given, so
+	// an inline one is resolved there. FP16 (dense FTQ takes an FP16 base), routed FTQ and a shared [256, 512] FTQ.
+	const int k = 512, n_rows = 256, shared_rows = 256;
+	const ftq_table_t external9 = ftq_external9_table(), folded = ftq_folded_table();
+	const ftq_table_t* const shared_tables[2] = { &external9, &folded };
+	routing_t gemv = routing_of(4, small_gemv_indices, small_gemv_counts);
+	ccv_nnc_tensor_t* down_host;
+	ccv_nnc_tensor_t* const down = ftq_weight_new(CCV_16F, 6, n_rows, k, 48, &ftq_builtin, 0x1a5d0u, &down_host);
+	float* const shared_values = activations_new(CCV_16F, 1, k, 0x1a5d1u);
+	ccv_nnc_tensor_t* const shared_a = gpu_from_floats(CCV_16F, shared_values, 1, k);
+	float* const a = activations_new(CCV_16F, gemv.rows, k, 0x1a5d2u);
+	ccv_nnc_tensor_t* const ga = gpu_from_floats(CCV_16F, a, gemv.rows, k);
+	ccv_nnc_tensor_t* const indices = gpu_ints(gemv.indices, gemv.bins);
+	ccv_nnc_tensor_t* const counts = gpu_ints(gemv.counts, gemv.bins);
+	int t;
+	for (t = 0; t < 2; t++)
+	{
+		const int format = ccv_nnc_codebook_with_slot(ftq_format(34), shared_tables[t]->slot);
+		ccv_nnc_tensor_param_t sp = CPU_TENSOR_NHWC(16F, shared_rows, k);
+		ccv_nnc_tensor_t* const shared_host = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(sp, format), 0);
+		ftq_fill(shared_host->data.u8, ccv_nnc_tensor_data_size_without_padding(shared_host->info), format, shared_rows, k, shared_tables[t], 0x1a5e0u + t);
+		ccv_nnc_tensor_t* const shared_inline_host = ftq_inline_host_new(shared_host);
+		ccv_nnc_tensor_t* const shared_w = gpu_copy_of(shared_host);
+		ccv_nnc_tensor_t* const shared_inline = gpu_copy_of(shared_inline_host);
+		ccv_nnc_tensor_param_t op = GPU_TENSOR_NHWC(000, 16F, gemv.rows, n_rows);
+		ccv_nnc_tensor_param_t so = GPU_TENSOR_NHWC(000, 16F, 1, shared_rows);
+		ccv_nnc_tensor_t* const b[2] = { ccv_nnc_tensor_new(0, op, 0), ccv_nnc_tensor_new(0, op, 0) };
+		ccv_nnc_tensor_t* const shared_b[2] = { ccv_nnc_tensor_new(0, so, 0), ccv_nnc_tensor_new(0, so, 0) };
+		ccv_nnc_cmd_t gemm = CMD_SEGMENTED_GEMM_FORWARD(NO_TRANSPOSE, TRANSPOSE(1, 2));
+		gemm.backend = CCV_NNC_BACKEND_MPS;
+		REQUIRE_EQ(ccv_nnc_cmd_exec(gemm, ccv_nnc_no_hint, 0, TENSOR_LIST(ga, indices, counts, down, 0, shared_a, shared_w), TENSOR_LIST(b[0], shared_b[0]), 0), CCV_NNC_EXEC_SUCCESS, "the slot-form shared expert runs, table %d", t);
+		REQUIRE_EQ(ccv_nnc_cmd_exec(gemm, ccv_nnc_no_hint, 0, TENSOR_LIST(ga, indices, counts, down, 0, shared_a, shared_inline), TENSOR_LIST(b[1], shared_b[1]), 0), CCV_NNC_EXEC_SUCCESS, "the inline shared expert runs, table %d", t);
+		float* const x = (float*)ccmalloc(sizeof(float) * gemv.rows * n_rows);
+		float* const y = (float*)ccmalloc(sizeof(float) * gemv.rows * n_rows);
+		floats_from_gpu(b[0], x);
+		floats_from_gpu(b[1], y);
+		REQUIRE_EQ(bit_mismatches(x, y, (size_t)gemv.rows * n_rows), 0, "the routed outputs are the same, table %d", t);
+		floats_from_gpu(shared_b[0], x);
+		floats_from_gpu(shared_b[1], y);
+		REQUIRE_EQ(bit_mismatches(x, y, shared_rows), 0, "the shared outputs are the same, table %d", t);
+		ccfree(y);
+		ccfree(x);
+		int i;
+		for (i = 0; i < 2; i++)
+		{
+			ccv_nnc_tensor_free(shared_b[i]);
+			ccv_nnc_tensor_free(b[i]);
+		}
+		ccv_nnc_tensor_free(shared_inline);
+		ccv_nnc_tensor_free(shared_w);
+		ccv_nnc_tensor_free(shared_inline_host);
+		ccv_nnc_tensor_free(shared_host);
+	}
+	ccv_nnc_tensor_free(counts);
+	ccv_nnc_tensor_free(indices);
+	ccv_nnc_tensor_free(ga);
+	ccfree(a);
+	ccv_nnc_tensor_free(shared_a);
+	ccfree(shared_values);
+	ccv_nnc_tensor_free(down);
+	ccv_nnc_tensor_free(down_host);
+	routing_free(&gemv);
+}
+
+// Only the streaming command on these sources (decode of one routed row): its exec status.
+static int streaming_only(ccv_nnc_tensor_t* const* const sources, const int* const indices, const int* const counts, const int bins, const int resident_slots)
+{
+	routing_t r = routing_of(bins, indices, counts);
+	float* const route = route_weights_new(CCV_16F, r.rows);
+	ccv_nnc_tensor_t* const groute = gpu_from_floats(CCV_16F, route, r.rows, 1);
+	ccv_nnc_tensor_t* const gindices = gpu_ints(indices, bins);
+	ccv_nnc_tensor_t* const gcounts = gpu_ints(counts, bins);
+	ccv_nnc_cmd_t streaming = CMD_MOE_WEIGHTS_STREAMING_FORWARD(resident_slots, 1);
+	streaming.backend = CCV_NNC_BACKEND_MPS;
+	ccv_nnc_tensor_param_t streamed_params[6] = {};
+	ccv_nnc_hint_tensor_auto(streaming, TENSOR_PARAM_LIST(gindices->info, gcounts->info, groute->info, sources[0]->info, sources[1]->info, sources[2]->info), ccv_nnc_no_hint, streamed_params, 6);
+	ccv_nnc_tensor_t* streamed[6];
+	int i;
+	for (i = 0; i < 6; i++)
+	{
+		if (i >= 3)
+			streamed_params[i].reserved = 0;
+		streamed[i] = ccv_nnc_tensor_new(0, streamed_params[i], 0);
+	}
+	ccv_nnc_stream_context_t* const stream = ccv_nnc_stream_context_new(CCV_STREAM_CONTEXT_GPU);
+	const int status = ccv_nnc_cmd_exec(streaming, ccv_nnc_no_hint, 0, TENSOR_LIST(gindices, gcounts, groute, sources[0], sources[1], sources[2]),
+		TENSOR_LIST(streamed[0], streamed[1], streamed[2], streamed[3], streamed[4], streamed[5]), stream);
+	ccv_nnc_stream_context_wait(stream);
+	ccv_nnc_stream_context_free(stream);
+	for (i = 0; i < 6; i++)
+		ccv_nnc_tensor_free(streamed[i]);
+	ccv_nnc_tensor_free(gcounts);
+	ccv_nnc_tensor_free(gindices);
+	ccv_nnc_tensor_free(groute);
+	ccfree(route);
+	routing_free(&r);
+	return status;
+}
+
+TEST_CASE("mps moe weights streaming rejects an inline ftq source whose header does not name the table, and ftq_vr in either form")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_MOE_WEIGHTS_STREAMING_FORWARD, CCV_NNC_BACKEND_MPS));
+	const int experts = 32, n_rows = 256, k = 512;
+	const ftq_table_t external9 = ftq_external9_table();
+	static const int indices[] = { 3, 17, 31, 0 };
+	static const int counts[] = { 1, 0, 0, 0 };
+	int c;
+	// 0: the down projection's header crc + 1; 1: the gate's header id 0; 2: FTQ_VR gate / up / down (no fixed expert
+	// stride), slot form; 3: the same inline.
+	for (c = 0; c < 4; c++)
+	{
+		char paths[3][64] = {
+			"/tmp/ccv-moe-ftq-bad-gate-XXXXXX",
+			"/tmp/ccv-moe-ftq-bad-up-XXXXXX",
+			"/tmp/ccv-moe-ftq-bad-down-XXXXXX",
+		};
+		ccv_nnc_tensor_t* hosts[3];
+		ccv_nnc_tensor_t* references[3];
+		ccv_nnc_tensor_t* sources[3];
+		int i;
+		for (i = 0; i < 3; i++)
+		{
+			const int rows = i < 2 ? n_rows : k, cols = i < 2 ? k : n_rows;
+			if (c < 2)
+				references[i] = ftq_weight_new(CCV_16F, experts, rows, cols, 34, &external9, 0x1a6000u + c * 3 + i, &hosts[i]);
+			else {
+				// FTQ_VR at a single rate (nm34 everywhere) over the whole [E N, K] blob.
+				const int format = ccv_nnc_codebook_with_slot(CCV_NNC_QX_8I_ROWWISE_FTQ_VR_BLOCK_FIRST + (34 - 8) / 2, external9.slot);
+				hosts[i] = ccv_nnc_tensor_new(0, ftq_param(CCV_TENSOR_CPU_MEMORY, CCV_16F, experts, rows, cols, format), 0);
+				const size_t size = ccv_nnc_tensor_data_size_without_padding(hosts[i]->info);
+				uint8_t* const data = hosts[i]->data.u8;
+				memset(data, 0, size);
+				memcpy(data, "CCVFTQVR", 8);
+				const int tile_rows = experts * rows / 16, tiles = cols / 16;
+				const uint32_t header[6] = { (uint32_t)(experts * rows), (uint32_t)cols, 16u * 34, 1u << ((34 - 8) / 2), external9.table, external9.crc };
+				memcpy(data + 8, header, sizeof(header));
+				uint32_t* const off = (uint32_t*)(data + 32);
+				int r;
+				for (r = 0; r <= tile_rows; r++)
+					off[r] = (uint32_t)(r * tiles * 34 / 2);
+				uint32_t seed = 0x1a6100u + i;
+				uint32_t* const code = off + tile_rows + 1;
+				uint32_t w;
+				for (w = 0; w < off[tile_rows]; w++)
+					code[w] = rng_next(&seed);
+				float* const scales = (float*)ccmalloc(sizeof(float) * experts * rows);
+				for (r = 0; r < experts * rows; r++)
+					scales[r] = 1e-3f;
+				ccv_float_to_half_precision(scales, (uint16_t*)(data + size - 2 * (size_t)experts * rows), experts * rows);
+				ccfree(scales);
+				REQUIRE_EQ(ccv_nnc_8i_rowwise_x_ftq_vr_check(data, size, format, (size_t)experts * rows, cols, 0), 0, "the FTQ_VR blob passes its checks");
+				references[i] = gpu_copy_of(hosts[i]);
+			}
+			ccv_nnc_tensor_t* const inline_host = c != 2 ? ftq_inline_host_new(hosts[i]) : 0;
+			if (inline_host && ((c == 0 && i == 2) || (c == 1 && i == 0)))
+			{
+				const size_t prefix = ccv_nnc_8i_rowwise_x_inline_codebook_size(inline_host->info.reserved);
+				uint32_t word;
+				memcpy(&word, inline_host->data.u8 + prefix + (c == 0 ? 28 : 24), 4);
+				word = c == 0 ? word + 1 : word & ~0xffu;
+				memcpy(inline_host->data.u8 + prefix + (c == 0 ? 28 : 24), &word, 4);
+			}
+			const ccv_nnc_tensor_t* const streamed_host = inline_host ? inline_host : hosts[i];
+			REQUIRE(write_file(streamed_host, paths[i]), "each projection is written to a temporary file");
+			ccv_nnc_tensor_param_t gpu_params = streamed_host->info;
+			gpu_params.type = CCV_TENSOR_GPU_MEMORY | 000;
+			sources[i] = ccv_nnc_tensor_new_from_file(gpu_params, paths[i], 0, CCV_NNC_TENSOR_MEMORY_MAP_ON_DEMAND);
+			REQUIRE(sources[i], "the projection maps on demand");
+			if (inline_host)
+				ccv_nnc_tensor_free(inline_host);
+		}
+		REQUIRE_EQ(streaming_only(sources, indices, counts, 4, 2), CCV_NNC_EXEC_INVALID, "streaming case %d is rejected", c);
+		for (i = 0; i < 3; i++)
+		{
+			ccv_nnc_tensor_free(sources[i]);
+			ccv_nnc_tensor_free(references[i]);
+			ccv_nnc_tensor_free(hosts[i]);
+			unlink(paths[i]);
+		}
+	}
 }
 
 #include "case_main.h"

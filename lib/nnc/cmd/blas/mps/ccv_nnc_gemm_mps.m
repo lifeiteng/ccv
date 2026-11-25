@@ -157,7 +157,7 @@ static int _ccv_nnc_gemm_forw(const ccv_nnc_cmd_t cmd, const ccv_nnc_hint_t hint
 {
 	assert(input_size >= 2);
 	const ccv_nnc_tensor_view_t* a = (const ccv_nnc_tensor_view_t*)inputs[0];
-	// A TMCQ weight with an inline codebook: the data after the table, naming the table's slot.
+	// A TMCQ / FTQ weight with an inline codebook: the data after the table, naming the table's slot.
 	ccv_nnc_tensor_t w_inline;
 	const ccv_nnc_tensor_view_t* w = (const ccv_nnc_tensor_view_t*)ccv_nnc_mps_8i_rowwise_x_inline_view(inputs[1], &w_inline);
 	if (!w)

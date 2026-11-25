@@ -10,6 +10,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <nnc/ccv_nnc_trellis_builtin_table.inc>
 #include "trellis_table_alt.inc"
 #include "3rdparty/sqlite3/sqlite3.h"
@@ -2677,6 +2678,432 @@ TEST_CASE("mps ftq_vr is exact with tile rows above 64: n66 - n88 alone and mixe
 	}
 	printf("\n\t%d high-rate FTQ_VR blobs, %d CPU decodes skipped (K %% 16)", checked, cpu_skipped);
 	ccfree(base);
+}
+
+// Inline codebooks (CCV_NNC_QX_8I_ROWWISE_CODEBOOK_INLINE_MASK) on Metal: the same FTQ / FTQ_VR blob stored once naming
+// the file codebook row __ccv_codebook__/1 and once with its table inline (the serialized table, zeros up to 128 + 2 P
+// bytes, then the blob). Read back and moved to the GPU, the two run every Metal path bit for bit alike. The inline one
+// takes its table from the prefix only: its database has another table as row 1, and the blob header keeps id 1.
+// ccv_nnc_mps.h declares these for Objective-C only (the buffer is an id<MTLBuffer>).
+extern int ccv_nnc_mps_8i_rowwise_x_resolve_inline(void* buffer, const off_t offset, const int format);
+extern const ccv_nnc_tensor_t* ccv_nnc_mps_8i_rowwise_x_inline_view(const ccv_nnc_tensor_t* const tensor, ccv_nnc_tensor_t* const view);
+
+typedef struct {
+	int slot; // The table the blob decodes with (folded for the folded table).
+	int row_slot; // The table written as the file row (the plain slot of the folded table).
+	int entries;
+	uint32_t field; // The header table field: id 1, log2 P, structure.
+	uint32_t crc;
+} ftq_inline_table_t;
+
+static ftq_inline_table_t ftq_inline_table_of(const int slot, const int row_slot)
+{
+	ftq_inline_table_t t = { .slot = slot, .row_slot = row_slot };
+	ccv_nnc_codebook_get(slot, &t.entries, &t.crc);
+	const int folded = !!(ccv_nnc_codebook_flags(slot) & CCV_NNC_CODEBOOK_FOLD);
+	t.field = 1u | ((uint32_t)ccv_nnc_codebook_log2_entries(t.entries) << 8) | ((uint32_t)folded << 16);
+	return t;
+}
+
+// The tables: the built-in table's content as file table 1, random 512, 1024 and 2048-pair tables, and a folded table.
+static void ftq_inline_tables(ftq_inline_table_t* const tables)
+{
+	const int builtin = ccv_nnc_codebook_register(ccv_nnc_trellis_builtin_table, 512);
+	tables[0] = ftq_inline_table_of(builtin, builtin);
+	int i;
+	for (i = 0; i < 3; i++)
+	{
+		ftq_table_t t = ftq_table_new(9 + i, 0, 0x1a11eu + i);
+		tables[1 + i] = ftq_inline_table_of(t.slot, t.slot);
+		ccfree(t.pairs);
+	}
+	int8_t* const base = ftq_fold_base_new(0x1a1f0u);
+	const int plain = ccv_nnc_codebook_register(base, 512);
+	const int folded = ccv_nnc_codebook_register_with_flags(base, 512, CCV_NNC_CODEBOOK_FOLD);
+	tables[4] = ftq_inline_table_of(folded, plain);
+	ccfree(base);
+}
+
+// The inline form of an FTQ / FTQ_VR weight of base format `format` (no slot) whose blob is blob: params of `type`.
+static ccv_nnc_tensor_t* ftq_inline_tensor_new(const int type, const int rows, const int cols, const int format, const int slot, const uint8_t* const blob, const size_t blob_size)
+{
+	int entries = 0;
+	ccv_nnc_codebook_get(slot, &entries, 0);
+	const int inline_format = ccv_nnc_8i_rowwise_x_with_inline_codebook(format, entries);
+	ccv_nnc_tensor_t* const t = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), inline_format), 0);
+	const size_t prefix = ccv_nnc_8i_rowwise_x_inline_codebook_size(inline_format);
+	assert(ccv_nnc_tensor_data_size_without_padding(t->info) == prefix + blob_size);
+	memset(t->data.u8, 0, prefix);
+	const size_t serialized = ccv_nnc_codebook_serialize(slot, t->data.u8, prefix);
+	assert(serialized == 16 + 2 * (size_t)entries);
+	(void)serialized;
+	memcpy(t->data.u8 + prefix, blob, blob_size);
+	if (CCV_TENSOR_GET_MEMORY(type) == CCV_TENSOR_CPU_MEMORY)
+		return t;
+	ccv_nnc_tensor_t* const g = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(type, rows, cols), inline_format), 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(t), TENSOR_LIST(g), 0);
+	ccv_nnc_tensor_free(t);
+	return g;
+}
+
+static ccv_nnc_tensor_t* ftq_inline_to_gpu(const ccv_nnc_tensor_t* const host)
+{
+	ccv_nnc_tensor_param_t params = host->info;
+	params.type = CCV_TENSOR_GPU_MEMORY | 000;
+	ccv_nnc_tensor_t* const g = ccv_nnc_tensor_new(0, params, 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST((ccv_nnc_tensor_t*)host), TENSOR_LIST(g), 0);
+	return g;
+}
+
+// GEMM_FORWARD of m rows of fixed activations against gq (with or without bias) into out (m x rows FP16). Returns the
+// exec status.
+static int ftq_inline_gemm(ccv_nnc_tensor_t* const gq, ccv_nnc_tensor_t* const gbias, const int m, const int rows, const int cols, uint16_t* const out)
+{
+	ccv_nnc_tensor_t* const ha = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_CPU_MEMORY, m, cols), 0);
+	int i, k;
+	for (i = 0; i < m; i++)
+		for (k = 0; k < cols; k++)
+		{
+			const float v = ftq_activation_value(i * 3 + 1, k);
+			ccv_float_to_half_precision(&v, (uint16_t*)ha->data.u8 + (size_t)i * cols + k, 1);
+		}
+	ccv_nnc_tensor_t* const ga = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_GPU_MEMORY, m, cols), 0);
+	ccv_nnc_tensor_t* const gb = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_GPU_MEMORY, m, rows), 0);
+	ccv_nnc_tensor_t* const hb = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_CPU_MEMORY, m, rows), 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(ha), TENSOR_LIST(ga), 0);
+	const int status = gbias ?
+		ccv_nnc_cmd_exec(CMD_GEMM_FORWARD(NO_TRANSPOSE, TRANSPOSE(0, 1)), ccv_nnc_no_hint, 0, TENSOR_LIST(ga, gq, gbias), TENSOR_LIST(gb), 0) :
+		ccv_nnc_cmd_exec(CMD_GEMM_FORWARD(NO_TRANSPOSE, TRANSPOSE(0, 1)), ccv_nnc_no_hint, 0, TENSOR_LIST(ga, gq), TENSOR_LIST(gb), 0);
+	if (status == CCV_NNC_EXEC_SUCCESS && out)
+	{
+		ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gb), TENSOR_LIST(hb), 0);
+		memcpy(out, hb->data.u8, sizeof(uint16_t) * m * rows);
+	}
+	ccv_nnc_tensor_free(hb);
+	ccv_nnc_tensor_free(gb);
+	ccv_nnc_tensor_free(ga);
+	ccv_nnc_tensor_free(ha);
+	return status;
+}
+
+// The Metal int8 decode (codes and scales) of a GPU weight of data size `size` and format `format`, out_bytes bytes.
+static void ftq_inline_int8(ccv_nnc_tensor_t* const gq, const size_t size, const int format, const int rows, const int cols, uint8_t* const out, const size_t out_bytes)
+{
+	ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32S, (int)((out_bytes + 3) / 4)), 0);
+	ccv_nnc_tensor_t* const hout = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, (int)((out_bytes + 3) / 4)), 0);
+	ccv_nnc_mps_dequantize_8i_rowwise_x_to_8i_rowwise(gq->data.u8, CCV_16F, size, cols, format, gout->data.u8, (size_t)rows * cols, 0);
+	ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gout), TENSOR_LIST(hout), 0);
+	memcpy(out, hout->data.u8, out_bytes);
+	ccv_nnc_tensor_free(hout);
+	ccv_nnc_tensor_free(gout);
+}
+
+// Writes t to name in db and reads it back on the CPU; NULL if either fails.
+static ccv_nnc_tensor_t* ftq_inline_round_trip(sqlite3* const db, const char* const name, ccv_nnc_tensor_t* const t)
+{
+	if (ccv_nnc_tensor_write(t, db, name, 0) != CCV_IO_FINAL)
+		return 0;
+	ccv_nnc_tensor_t* restored = 0;
+	if (ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored) != CCV_IO_FINAL)
+		return 0;
+	return restored;
+}
+
+TEST_CASE("mps ftq and ftq_vr with an inline codebook equal the file codebook row bit for bit on int8 decode, fused gemv and gemm")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	ftq_inline_table_t tables[5];
+	ftq_inline_tables(tables);
+	int ti;
+	for (ti = 0; ti < 5; ti++)
+		REQUIRE(tables[ti].slot >= 1 && tables[ti].row_slot >= 1, "table %d registers", ti);
+	REQUIRE(ccv_nnc_codebook_flags(tables[4].slot) == CCV_NNC_CODEBOOK_FOLD, "table 4 is folded");
+	// The row 1 of the inline weights' database: a table that none of them decodes with.
+	ftq_table_t decoy = ftq_table_new(9, 0, 0xdec0u);
+	REQUIRE(decoy.slot >= 1, "the decoy registers");
+	// (rows, cols, static rate n or FTQ_VR mean nm, vr): FTQ at n20, n48 and n88 (above 4 bpw); FTQ_VR at nm20 (rates 8 -
+	// 32), nm72 and nm88 (tile row rates up to 84 / 88, so level mask bits 18 - 31 of its table word are set).
+	static const int cases[][4] = { { 64, 1024, 20, 0 }, { 272, 512, 48, 0 }, { 48, 768, 88, 0 }, { 208, 768, 20, 1 }, { 96, 512, 72, 1 }, { 48, 1024, 88, 1 } };
+	int c, compared = 0;
+	for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++)
+		for (ti = 0; ti < 5; ti++)
+		{
+			const int rows = cases[c][0], cols = cases[c][1], n = cases[c][2], vr = cases[c][3];
+			// FTQ_VR runs the built-in table's content, a random 512-pair table and the folded table.
+			if (vr && (ti == 2 || ti == 3))
+				continue;
+			const ftq_inline_table_t t = tables[ti];
+			const int base = vr ? ftq_vr_format(n) : ftq_format(n);
+			// The file form names file codebook id 1.
+			const int file_format = base | (1 << CCV_NNC_CODEBOOK_SLOT_SHIFT);
+			ccv_nnc_tensor_t* const hfile = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), file_format), 0);
+			const size_t size = ccv_nnc_tensor_data_size_without_padding(hfile->info);
+			const uint32_t seed = 0x1a1700u + c * 16 + ti;
+			int* rates = 0;
+			if (vr)
+			{
+				rates = (int*)ccmalloc(sizeof(int) * (rows / 16));
+				ftq_vr_rates(rows / 16, n, rates);
+				ftq_vr_fill(hfile->data.u8, size, base, rows, cols, rates, t.field, t.crc, seed);
+			} else
+				ftq_fill(hfile->data.u8, size, base, rows, cols, t.field, t.crc, seed);
+			ccv_nnc_tensor_t* const hinline = ftq_inline_tensor_new(CCV_TENSOR_CPU_MEMORY, rows, cols, base, t.slot, hfile->data.u8, size);
+			const int inline_format = hinline->info.reserved;
+			sqlite3* file_db = 0;
+			sqlite3* inline_db = 0;
+			REQUIRE_EQ(sqlite3_open(":memory:", &file_db), SQLITE_OK, "in-memory database opens");
+			REQUIRE_EQ(sqlite3_open(":memory:", &inline_db), SQLITE_OK, "in-memory database opens");
+			REQUIRE_EQ(ccv_nnc_tensor_write_codebook(file_db, t.row_slot, 1), CCV_IO_FINAL, "the table writes as id 1");
+			REQUIRE_EQ(ccv_nnc_tensor_write_codebook(inline_db, decoy.slot, 1), CCV_IO_FINAL, "the decoy writes as id 1 next to the inline weight");
+			char what[96];
+			snprintf(what, sizeof(what), "%s %dx%d n%d table %d", vr ? "FTQ_VR" : "FTQ", rows, cols, n, ti);
+			ccv_nnc_tensor_t* const rfile = ftq_inline_round_trip(file_db, "w", hfile);
+			ccv_nnc_tensor_t* const rinline = ftq_inline_round_trip(inline_db, "w", hinline);
+			REQUIRE(rfile && rinline, "%s: both forms write and read", what);
+			REQUIRE_EQ(ccv_nnc_codebook_slot_of(rfile->info.reserved), t.slot, "%s: the file form reads into the table's slot", what);
+			REQUIRE_EQ(rinline->info.reserved, inline_format, "%s: the inline form keeps the inline bits and slot 255", what);
+			const int file_slot_format = rfile->info.reserved;
+			const size_t inline_size = ccv_nnc_tensor_data_size_without_padding(rinline->info);
+			REQUIRE_EQ(inline_size, ccv_nnc_8i_rowwise_x_inline_codebook_size(inline_format) + size, "%s: the inline form is the prefix and the blob", what);
+			ccv_nnc_tensor_t* const gfile = ftq_inline_to_gpu(rfile);
+			ccv_nnc_tensor_t* const ginline = ftq_inline_to_gpu(rinline);
+			// The Metal view of the inline weight: the data after the prefix, the table's slot.
+			ccv_nnc_tensor_t view;
+			const ccv_nnc_tensor_t* const v = ccv_nnc_mps_8i_rowwise_x_inline_view(ginline, &view);
+			REQUIRE(v == &view, "%s: the inline weight has a view", what);
+			REQUIRE_EQ(view.info.reserved, file_slot_format, "%s: its view names the file form's slot", what);
+			REQUIRE_EQ((size_t)view.dataof, ccv_nnc_8i_rowwise_x_inline_codebook_size(inline_format), "%s: its view starts after the prefix", what);
+			REQUIRE_EQ(ccv_nnc_mps_8i_rowwise_x_resolve_inline(ginline->data.u8, 0, inline_format), file_slot_format, "%s: the buffer resolves to the same slot", what);
+			// int8 decode.
+			const size_t out_bytes = (((size_t)rows * cols + 127) & ~(size_t)127) + rows * 2;
+			uint8_t* const codes_file = (uint8_t*)ccmalloc(out_bytes);
+			uint8_t* const codes_inline = (uint8_t*)ccmalloc(out_bytes);
+			ftq_inline_int8(gfile, size, file_slot_format, rows, cols, codes_file, out_bytes);
+			ftq_inline_int8(ginline, inline_size, inline_format, rows, cols, codes_inline, out_bytes);
+			REQUIRE_EQ(memcmp(codes_file, codes_inline, out_bytes), 0, "%s: int8 codes and scales are the same", what);
+			if (!vr && ti != 4)
+			{
+				// The decoy decodes to other codes, so equal codes did not come from row 1 of the inline database.
+				const ccv_nnc_8i_rowwise_x_ftq_schedule_t schedule = ccv_nnc_8i_rowwise_x_ftq_schedule(base, rows, cols);
+				int8_t* const decoy_codes = (int8_t*)ccmalloc((size_t)rows * cols);
+				ftq_ref_decode_matrix(hfile->data.u8 + 32, rows, cols, schedule.high_bits, schedule.drop_count, decoy.pairs, 9, decoy_codes);
+				REQUIRE(memcmp(decoy_codes, codes_inline, (size_t)rows * cols) != 0, "%s: the decoy table decodes differently", what);
+				ccfree(decoy_codes);
+			}
+			// CPU decode of the inline form.
+			uint16_t* const cpu_file = (uint16_t*)ccmalloc(sizeof(uint16_t) * rows * cols);
+			uint16_t* const cpu_inline = (uint16_t*)ccmalloc(sizeof(uint16_t) * rows * cols);
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(rfile->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, size, cols, file_slot_format, cpu_file, (size_t)rows * cols), 0, "%s: the file form decodes on the CPU", what);
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(rinline->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, inline_size, cols, inline_format, cpu_inline, (size_t)rows * cols), 0, "%s: the inline form decodes on the CPU", what);
+			REQUIRE_EQ(memcmp(cpu_file, cpu_inline, sizeof(uint16_t) * rows * cols), 0, "%s: CPU decodes are the same", what);
+			ccfree(cpu_inline);
+			ccfree(cpu_file);
+			// GEMM_FORWARD: the fused GEMV for 1 to 3 rows, from 4 rows the decode and the quantized GEMM; with a bias
+			// for odd M.
+			ccv_nnc_tensor_param_t bias_params = ftq_params(CCV_TENSOR_CPU_MEMORY, rows, 0);
+			bias_params.dim[1] = 0;
+			ccv_nnc_tensor_t* const hbias = ccv_nnc_tensor_new(0, bias_params, 0);
+			bias_params.type = CCV_TENSOR_GPU_MEMORY;
+			ccv_nnc_tensor_t* const gbias = ccv_nnc_tensor_new(0, bias_params, 0);
+			int j;
+			for (j = 0; j < rows; j++)
+			{
+				const float b = ftq_bias_value(j);
+				ccv_float_to_half_precision(&b, (uint16_t*)hbias->data.u8 + j, 1);
+			}
+			ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(hbias), TENSOR_LIST(gbias), 0);
+			static const int ms[] = { 1, 2, 3, 4, 9, 64 };
+			int mi;
+			for (mi = 0; mi < (int)(sizeof(ms) / sizeof(ms[0])); mi++)
+			{
+				const int m = ms[mi];
+				uint16_t* const out_file = (uint16_t*)ccmalloc(sizeof(uint16_t) * m * rows);
+				uint16_t* const out_inline = (uint16_t*)ccmalloc(sizeof(uint16_t) * m * rows);
+				REQUIRE_EQ(ftq_inline_gemm(gfile, (m & 1) ? gbias : 0, m, rows, cols, out_file), CCV_NNC_EXEC_SUCCESS, "%s: file form GEMM M=%d runs", what, m);
+				REQUIRE_EQ(ftq_inline_gemm(ginline, (m & 1) ? gbias : 0, m, rows, cols, out_inline), CCV_NNC_EXEC_SUCCESS, "%s: inline form GEMM M=%d runs", what, m);
+				REQUIRE_EQ(memcmp(out_file, out_inline, sizeof(uint16_t) * m * rows), 0, "%s: GEMM M=%d outputs are the same", what, m);
+				ccfree(out_inline);
+				ccfree(out_file);
+			}
+			compared++;
+			ccv_nnc_tensor_free(gbias);
+			ccv_nnc_tensor_free(hbias);
+			ccfree(codes_inline);
+			ccfree(codes_file);
+			ccv_nnc_tensor_free(ginline);
+			ccv_nnc_tensor_free(gfile);
+			ccv_nnc_tensor_free(rinline);
+			ccv_nnc_tensor_free(rfile);
+			sqlite3_close(inline_db);
+			sqlite3_close(file_db);
+			ccv_nnc_tensor_free(hinline);
+			ccv_nnc_tensor_free(hfile);
+			if (rates)
+				ccfree(rates);
+		}
+	REQUIRE_EQ(compared, 24, "every case and table ran");
+	ccfree(decoy.pairs);
+}
+
+// A file holding the data of t, padded to its GPU size, as an on-demand file-backed GPU tensor (pread path).
+static ccv_nnc_tensor_t* ftq_inline_file_backed(const ccv_nnc_tensor_t* const t, char path[64])
+{
+	strcpy(path, "/tmp/ccv-ftq-inline-XXXXXX");
+	const int fd = mkstemp(path);
+	if (fd < 0)
+		return 0;
+	const size_t data_size = ccv_nnc_tensor_data_size_without_padding(t->info);
+	size_t written = 0;
+	while (written < data_size)
+	{
+		const ssize_t result = write(fd, t->data.u8 + written, data_size - written);
+		if (result <= 0)
+			break;
+		written += (size_t)result;
+	}
+	ccv_nnc_tensor_param_t params = t->info;
+	params.type = CCV_TENSOR_GPU_MEMORY | 000;
+	const int ok = written == data_size && ftruncate(fd, (off_t)ccv_nnc_tensor_data_size(params)) == 0;
+	close(fd);
+	return ok ? ccv_nnc_tensor_new_from_file(params, path, 0, CCV_NNC_TENSOR_MEMORY_MAP_ON_DEMAND) : 0;
+}
+
+TEST_CASE("mps ftq and ftq_vr reject an inline codebook that the blob header does not name, never looking the header id up")
+{
+	GUARD_ELSE_RETURN(ccv_nnc_cmd_ok(CCV_NNC_GEMM_FORWARD, CCV_NNC_BACKEND_MPS));
+	enum { rows = 64, cols = 512 };
+	ftq_inline_table_t tables[5];
+	ftq_inline_tables(tables);
+	// A registered table whose process slot is the header id of the "decoy id" mutation, with its crc and P: a reader
+	// that looked the header id up would find it and accept the blob.
+	ftq_table_t decoy = ftq_table_new(9, 0, 0xdec1u);
+	REQUIRE(decoy.slot >= 1 && decoy.slot < 255, "the decoy registers");
+	// A plain 512-pair table with negative values (not a valid folded table) and a 1024-pair table.
+	const ftq_inline_table_t plain = tables[1], wide = tables[2], folded = tables[4];
+	enum {
+		GOOD, ID_0, DECOY_ID, LOG2, CRC, OTHER_CRC, STRUCTURE_2, STRUCTURE_3, FOLD_NEGATIVE, FOLD_1024, HIGH_BITS, LEGACY_MAGIC, BLOB_MAGIC, MUTATIONS,
+	};
+	static const char* const names[MUTATIONS] = {
+		"good", "header id 0", "header id and crc of a registered decoy", "header log2 P + 1", "header crc + 1", "header crc of another table", "structure 2", "structure 3",
+		"structure 1 on a table with negative values", "structure 1 on a 1024-pair table", "static-rate table word bit 18", "prefix magic CCVCB001", "blob magic of the other FTQ",
+	};
+	int vr, mu, checked = 0;
+	for (vr = 0; vr < 2; vr++)
+		for (mu = 0; mu < MUTATIONS; mu++)
+		{
+			if (vr && mu == HIGH_BITS)
+				continue; // FTQ_VR keeps level mask bits there.
+			const ftq_inline_table_t t = mu == FOLD_NEGATIVE ? plain : mu == FOLD_1024 ? wide : mu == STRUCTURE_2 || mu == STRUCTURE_3 ? folded : (mu & 1) ? folded : plain;
+			const int base = vr ? ftq_vr_format(20) : ftq_format(20);
+			ccv_nnc_tensor_t* const blob = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), base), 0);
+			const size_t size = ccv_nnc_tensor_data_size_without_padding(blob->info);
+			uint32_t field = t.field, crc = t.crc;
+			switch (mu)
+			{
+				case ID_0: field &= ~0xffu; break;
+				case DECOY_ID: field = (uint32_t)decoy.slot | (9u << 8); crc = decoy.crc; break;
+				case LOG2: field += 1u << 8; break;
+				case CRC: crc += 1; break;
+				case OTHER_CRC: crc = t.slot == plain.slot ? folded.crc : plain.crc; break;
+				case STRUCTURE_2: field = (field & ~(3u << 16)) | (2u << 16); break;
+				case STRUCTURE_3: field |= 3u << 16; break;
+				case FOLD_NEGATIVE: case FOLD_1024: field |= 1u << 16; break;
+				case HIGH_BITS: field |= 1u << 18; break;
+			}
+			int rates[rows / 16];
+			if (vr)
+			{
+				ftq_vr_rates(rows / 16, 20, rates);
+				ftq_vr_fill(blob->data.u8, size, base, rows, cols, rates, field, crc, 0x1a1e00u + mu);
+			} else
+				ftq_fill(blob->data.u8, size, base, rows, cols, field, crc, 0x1a1e00u + mu);
+			if (mu == BLOB_MAGIC)
+				memcpy(blob->data.u8, vr ? "CCVFTQSR" : "CCVFTQVR", 8);
+			ccv_nnc_tensor_t* const hq = ftq_inline_tensor_new(CCV_TENSOR_CPU_MEMORY, rows, cols, base, t.slot, blob->data.u8, size);
+			if (mu == LEGACY_MAGIC)
+				memcpy(hq->data.u8, "CCVCB001", 8);
+			const int format = hq->info.reserved;
+			const size_t data_size = ccv_nnc_tensor_data_size_without_padding(hq->info);
+			char what[128];
+			snprintf(what, sizeof(what), "%s inline %s", vr ? "FTQ_VR" : "FTQ", names[mu]);
+			const int good = mu == GOOD;
+			ccv_nnc_tensor_t* const gq = ftq_inline_to_gpu(hq);
+			// The resolver that the int8 decode takes (it asserts on -1), the view every command takes, the CPU decode.
+			const int resolved = ccv_nnc_mps_8i_rowwise_x_resolve_inline(gq->data.u8, 0, format);
+			REQUIRE(good ? resolved >= 0 && ccv_nnc_codebook_slot_of(resolved) == t.slot : resolved == -1, "%s: the buffer %s", what, good ? "resolves to the table's slot" : "does not resolve");
+			ccv_nnc_tensor_t view;
+			REQUIRE((ccv_nnc_mps_8i_rowwise_x_inline_view(gq, &view) != 0) == good, "%s: the view %s", what, good ? "exists" : "is NULL");
+			uint16_t* const cpu = (uint16_t*)ccmalloc(sizeof(uint16_t) * rows * cols);
+			REQUIRE((ccv_nnc_dequantize_8i_rowwise_x(hq->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, data_size, cols, format, cpu, (size_t)rows * cols) == 0) == good, "%s: the CPU decode %s", what, good ? "runs" : "fails");
+			ccfree(cpu);
+			// GEMM_FORWARD through the fused GEMV and through the decode + quantized GEMM.
+			uint16_t* const out = (uint16_t*)ccmalloc(sizeof(uint16_t) * 64 * rows);
+			uint16_t* const out_file_backed = (uint16_t*)ccmalloc(sizeof(uint16_t) * 64 * rows);
+			REQUIRE_EQ(ftq_inline_gemm(gq, 0, 1, rows, cols, out), good ? CCV_NNC_EXEC_SUCCESS : CCV_NNC_EXEC_INVALID, "%s: GEMV %s", what, good ? "runs" : "is rejected");
+			REQUIRE_EQ(ftq_inline_gemm(gq, 0, 64, rows, cols, 0), good ? CCV_NNC_EXEC_SUCCESS : CCV_NNC_EXEC_INVALID, "%s: GEMM %s", what, good ? "runs" : "is rejected");
+			// The same bytes on demand from a file, read with pread (twice: the second takes the cached slot).
+			char path[64];
+			ccv_nnc_tensor_t* const fq = ftq_inline_file_backed(hq, path);
+			REQUIRE(fq, "%s: maps on demand", what);
+			int pass;
+			for (pass = 0; pass < 2; pass++)
+			{
+				REQUIRE_EQ(ftq_inline_gemm(fq, 0, 1, rows, cols, out_file_backed), good ? CCV_NNC_EXEC_SUCCESS : CCV_NNC_EXEC_INVALID, "%s: file-backed GEMV pass %d %s", what, pass, good ? "runs" : "is rejected");
+				if (good)
+					REQUIRE_EQ(memcmp(out, out_file_backed, sizeof(uint16_t) * rows), 0, "%s: file-backed GEMV pass %d equals the GEMV in memory", what, pass);
+			}
+			ccv_nnc_tensor_free(fq);
+			unlink(path);
+			ccfree(out_file_backed);
+			ccfree(out);
+			// A checkpoint whose codebook row of the header id is the decoy: the read fails unless the blob is good.
+			sqlite3* db = 0;
+			REQUIRE_EQ(sqlite3_open(":memory:", &db), SQLITE_OK, "in-memory database opens");
+			REQUIRE_EQ(ccv_nnc_tensor_write_codebook(db, decoy.slot, mu == DECOY_ID ? decoy.slot : 1), CCV_IO_FINAL, "the decoy row writes");
+			REQUIRE_EQ(ccv_nnc_tensor_write(hq, db, "w", 0), CCV_IO_FINAL, "%s writes", what);
+			ccv_nnc_tensor_t* restored = 0;
+			REQUIRE_EQ(ccv_nnc_tensor_read(db, "w", 0, 0, 0, &restored), good ? CCV_IO_FINAL : CCV_IO_ERROR, "%s: the read %s", what, good ? "succeeds" : "fails");
+			if (restored)
+				ccv_nnc_tensor_free(restored);
+			sqlite3_close(db);
+			checked++;
+			ccv_nnc_tensor_free(gq);
+			ccv_nnc_tensor_free(hq);
+			ccv_nnc_tensor_free(blob);
+		}
+	REQUIRE_EQ(checked, 2 * MUTATIONS - 1, "every mutation ran");
+	// IndexSelect and the dense SwiGLU take no FTQ weight, also not an inline one.
+	{
+		ccv_nnc_tensor_t* const blob = ccv_nnc_tensor_new(0, ccv_nnc_tensor_8i_rowwise_x(ftq_params(CCV_TENSOR_CPU_MEMORY, rows, cols), ftq_format(20)), 0);
+		const size_t size = ccv_nnc_tensor_data_size_without_padding(blob->info);
+		ftq_fill(blob->data.u8, size, ftq_format(20), rows, cols, plain.field, plain.crc, 0x1a1effu);
+		ccv_nnc_tensor_t* const gq = ftq_inline_tensor_new(CCV_TENSOR_GPU_MEMORY, rows, cols, ftq_format(20), plain.slot, blob->data.u8, size);
+		if (ccv_nnc_cmd_ok(CCV_NNC_INDEX_SELECT_FORWARD, CCV_NNC_BACKEND_MPS))
+		{
+			ccv_nnc_tensor_t* const hindices = ccv_nnc_tensor_new(0, CPU_TENSOR_NHWC(32S, 1), 0);
+			hindices->data.i32[0] = 3;
+			ccv_nnc_tensor_t* const gindices = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 32S, 1), 0);
+			ccv_nnc_tensor_t* const gout = ccv_nnc_tensor_new(0, GPU_TENSOR_NHWC(000, 16F, 1, cols), 0);
+			ccv_nnc_cmd_exec(CMD_DATA_TRANSFER_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(hindices), TENSOR_LIST(gindices), 0);
+			REQUIRE_EQ(ccv_nnc_cmd_exec(CMD_INDEX_SELECT_FORWARD(), ccv_nnc_no_hint, 0, TENSOR_LIST(gq, gindices), TENSOR_LIST(gout), 0), CCV_NNC_EXEC_INVALID, "an inline FTQ weight does not support IndexSelect");
+			ccv_nnc_tensor_free(gout);
+			ccv_nnc_tensor_free(gindices);
+			ccv_nnc_tensor_free(hindices);
+		}
+		if (ccv_nnc_cmd_ok(CCV_NNC_SWIGLU_FORWARD, CCV_NNC_BACKEND_MPS))
+		{
+			ccv_nnc_tensor_t* const ga = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_GPU_MEMORY, 1, cols), 0);
+			ccv_nnc_tensor_t* const gb = ccv_nnc_tensor_new(0, ftq_params(CCV_TENSOR_GPU_MEMORY, 1, rows), 0);
+			ccv_nnc_cmd_t swiglu = CMD_SWIGLU_FORWARD(10);
+			swiglu.backend = CCV_NNC_BACKEND_MPS;
+			REQUIRE_EQ(ccv_nnc_cmd_exec(swiglu, ccv_nnc_no_hint, 0, TENSOR_LIST(ga, gq, gq), TENSOR_LIST(gb), 0), CCV_NNC_EXEC_INVALID, "the dense SwiGLU takes no inline FTQ weight");
+			ccv_nnc_tensor_free(gb);
+			ccv_nnc_tensor_free(ga);
+		}
+		ccv_nnc_tensor_free(gq);
+		ccv_nnc_tensor_free(blob);
+	}
+	ccfree(decoy.pairs);
 }
 
 #endif

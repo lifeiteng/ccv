@@ -873,8 +873,10 @@ static int _ccv_nnc_moe_weights_streaming_forw(const ccv_nnc_cmd_t cmd, const cc
 		return CCV_NNC_EXEC_INVALID;
 	if (outputs[0]->info.dim[0] == 0)
 		return CCV_NNC_EXEC_SUCCESS;
-	// Expert weights with an inline codebook (TMCQ) stream as the data after the table, naming the table's slot:
-	// the file region, the layouts and the resident bank are those of a tensor without one.
+	// Expert weights with an inline codebook (TMCQ, static-rate FTQ) stream as the data after the table, naming the
+	// table's slot: the file region, the layouts and the resident bank are those of a tensor without one. The view's
+	// region starts after the table, so an FTQ source's CCVFTQSR header is read from there, and the view checked that
+	// header against the table (ccv_nnc_mps_8i_rowwise_x_inline_view).
 	ccv_nnc_tensor_t weight_views[3];
 	ccv_nnc_tensor_t* inputs[6];
 	int k;

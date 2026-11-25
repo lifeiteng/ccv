@@ -775,7 +775,7 @@ static int _ccv_nnc_segmented_swiglu_forw(const ccv_nnc_cmd_t cmd, const ccv_nnc
 {
 	if (!(input_size == 6 && output_size == 1) && !(input_size == 9 && output_size == 2))
 		return CCV_NNC_EXEC_INVALID;
-	// Weights in place with an inline codebook (TMCQ), routed and shared: the data after the table, naming the table's
+	// Weights in place with an inline codebook (TMCQ, FTQ), routed and shared: the data after the table, naming the table's
 	// slot. Streamed weights (moe_weights_streaming) resolve theirs when they stream.
 	ccv_nnc_tensor_t weight_views[4];
 	ccv_nnc_tensor_t* routed_inputs[9];
