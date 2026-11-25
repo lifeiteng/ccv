@@ -1667,6 +1667,135 @@ TEST_CASE("TMCQ, FTQ and FTQ_VR at K = 1152 and K = 272 survive tensor persisten
 	sqlite3_close(db);
 }
 
+TEST_CASE("FTQ and FTQ_VR with an inline codebook read without a codebook tensor, register a folded table from the blob header, and fail on a mismatch")
+{
+	enum { rows = 32, cols = 1152 };
+	const int formats[] = { CCV_NNC_QX_8I_ROWWISE_FTQ_N20, CCV_NNC_QX_8I_ROWWISE_FTQ_VR_N20 };
+	dsfmt_t dsfmt;
+	dsfmt_init_gen_rand(&dsfmt, 2048);
+	// The alternate table, and its pairs made non-negative and registered folded: the two structures the header names.
+	const int slot_alt = ccv_nnc_codebook_register_serialized(test_trellis_table_alt, sizeof(test_trellis_table_alt));
+	REQUIRE(slot_alt >= 1, "the alternate table registers");
+	int entries = 0;
+	uint32_t crc_alt = 0;
+	const int8_t* const alt_pairs = ccv_nnc_codebook_get(slot_alt, &entries, &crc_alt);
+	REQUIRE(alt_pairs && entries == 512, "the alternate table has 512 pairs");
+	int8_t folded[1024];
+	int i;
+	for (i = 0; i < 1024; i++)
+		folded[i] = alt_pairs[i] < 0 ? -alt_pairs[i] : alt_pairs[i];
+	const int slot_fold = ccv_nnc_codebook_register_with_flags(folded, 512, CCV_NNC_CODEBOOK_FOLD);
+	REQUIRE(slot_fold >= 1 && ccv_nnc_codebook_flags(slot_fold) == CCV_NNC_CODEBOOK_FOLD, "the folded table registers folded");
+	uint32_t crc_fold = 0;
+	ccv_nnc_codebook_get(slot_fold, 0, &crc_fold);
+	const int table_slots[2] = { slot_alt, slot_fold };
+	const uint32_t table_crcs[2] = { crc_alt, crc_fold };
+	sqlite3* db = 0;
+	REQUIRE_EQ(sqlite3_open(":memory:", &db), SQLITE_OK, "in-memory database opens");
+	float* const values = ccmalloc(sizeof(float) * rows * cols);
+	uint16_t* const half = ccmalloc(sizeof(uint16_t) * rows * cols);
+	uint16_t* const by_slot = ccmalloc(sizeof(uint16_t) * rows * cols);
+	uint16_t* const by_inline = ccmalloc(sizeof(uint16_t) * rows * cols);
+	_test_tmcq_values(&dsfmt, values, rows, cols);
+	ccv_float_to_half_precision(values, half, rows * cols);
+	int f, t;
+	for (f = 0; f < 2; f++)
+	{
+		REQUIRE(ccv_nnc_8i_rowwise_x_codebook_is_valid(ccv_nnc_8i_rowwise_x_with_inline_codebook(formats[f], 512)), "format %x takes an inline codebook", formats[f]);
+		for (t = 0; t < 2; t++)
+		{
+			ccv_nnc_tensor_t* const packed = _test_tiled_quantize(CPU_TENSOR_NHWC(16F, rows, cols), formats[f], half, 0);
+			REQUIRE(packed, "format %x quantizes", formats[f]);
+			const size_t size = ccv_nnc_tensor_data_size_without_padding(packed->info);
+			// The header keeps the id the blob was fitted with (3 here; it is not looked up), 2^9 pairs and the
+			// structure (bit 16: folded), and the table's crc.
+			const uint32_t field = 3u | (9u << 8) | ((uint32_t)t << 16);
+			memcpy(packed->data.u8 + 24, &field, 4);
+			memcpy(packed->data.u8 + 28, &table_crcs[t], 4);
+			const int slot_format = ccv_nnc_codebook_with_slot(formats[f], table_slots[t]);
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(packed->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, size, cols, slot_format, by_slot, rows * cols), 0, "format %x table %d decodes by slot", formats[f], t);
+			const int format = ccv_nnc_8i_rowwise_x_with_inline_codebook(formats[f], 512);
+			const size_t prefix = ccv_nnc_8i_rowwise_x_inline_codebook_size(format);
+			REQUIRE_EQ(prefix, 1152, "the prefix of 512 pairs is 1152 bytes");
+			ccv_nnc_tensor_param_t params = packed->info;
+			params.reserved = format;
+			ccv_nnc_tensor_t* const weight = ccv_nnc_tensor_new(0, params, 0);
+			REQUIRE_EQ(ccv_nnc_tensor_data_size_without_padding(weight->info), prefix + size, "the tensor holds the prefix and the blob");
+			memset(weight->data.u8, 0, prefix);
+			// A folded slot serializes its 512 pairs; the structure stays in the blob header.
+			REQUIRE_EQ(ccv_nnc_codebook_serialize(table_slots[t], weight->data.u8, prefix), 16 + 1024, "the container serializes");
+			memcpy(weight->data.u8 + prefix, packed->data.u8, size);
+			char name[32];
+			snprintf(name, sizeof(name), "ftq_inline_%d_%d", f, t);
+			REQUIRE_EQ(ccv_nnc_tensor_write(weight, db, name, 0), CCV_IO_FINAL, "%s writes", name);
+			ccv_nnc_tensor_t* restored = 0;
+			REQUIRE_EQ(ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored), CCV_IO_FINAL, "%s reads without a codebook tensor", name);
+			REQUIRE_EQ(restored->info.reserved, format, "%s keeps the inline bits and slot 255", name);
+			REQUIRE_EQ(memcmp(restored->data.u8, weight->data.u8, prefix + size), 0, "%s data is unchanged", name);
+			REQUIRE_EQ(ccv_nnc_dequantize_8i_rowwise_x(restored->data.u8, CCV_16F, CCV_TENSOR_CPU_MEMORY, prefix + size, cols, restored->info.reserved, by_inline, rows * cols), 0, "%s decodes inline", name);
+			REQUIRE_ARRAY_EQ(uint16_t, by_inline, by_slot, rows * cols, "%s inline decodes like its table by slot", name);
+			// The structure decides the slot: the inline table resolves to the slot registered with the same flags.
+			REQUIRE_EQ(ccv_nnc_8i_rowwise_x_resolve_inline(restored->data.u8, prefix + size, format) & CCV_NNC_CODEBOOK_SLOT_MASK, table_slots[t] << CCV_NNC_CODEBOOK_SLOT_SHIFT, "%s resolves to the table's slot", name);
+			ccv_nnc_tensor_free(restored);
+			// A header crc that is not the inline table's fails the read and the decode.
+			uint8_t* const bad = ccmalloc(prefix + size);
+			memcpy(bad, weight->data.u8, prefix + size);
+			memcpy(bad + prefix + 28, &table_crcs[1 - t], 4);
+			REQUIRE_EQ(_test_set_stored_data(db, name, bad, prefix + size), 0, "data updates");
+			restored = 0;
+			REQUIRE_EQ(ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored), CCV_IO_ERROR, "%s with another table's crc fails", name);
+			REQUIRE(restored == 0, "no tensor on failure");
+			REQUIRE(ccv_nnc_dequantize_8i_rowwise_x(bad, CCV_16F, CCV_TENSOR_CPU_MEMORY, prefix + size, cols, format, by_inline, rows * cols) != 0, "%s with another table's crc does not decode", name);
+			// The header names a 1024-pair table.
+			memcpy(bad, weight->data.u8, prefix + size);
+			const uint32_t log2_field = field + (1u << 8);
+			memcpy(bad + prefix + 24, &log2_field, 4);
+			REQUIRE_EQ(_test_set_stored_data(db, name, bad, prefix + size), 0, "data updates");
+			REQUIRE_EQ(ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored), CCV_IO_ERROR, "%s with another P in its header fails", name);
+			// Structure 2 does not exist.
+			memcpy(bad, weight->data.u8, prefix + size);
+			const uint32_t structure_field = (field & ~(3u << 16)) | (2u << 16);
+			memcpy(bad + prefix + 24, &structure_field, 4);
+			REQUIRE_EQ(_test_set_stored_data(db, name, bad, prefix + size), 0, "data updates");
+			REQUIRE_EQ(ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored), CCV_IO_ERROR, "%s with structure 2 fails", name);
+			// A corrupt inline container (one table byte changed, the crc kept).
+			memcpy(bad, weight->data.u8, prefix + size);
+			bad[16] ^= 1;
+			REQUIRE_EQ(_test_set_stored_data(db, name, bad, prefix + size), 0, "data updates");
+			REQUIRE_EQ(ccv_nnc_tensor_read(db, name, 0, 0, 0, &restored), CCV_IO_ERROR, "%s with a corrupt inline table fails", name);
+			REQUIRE(restored == 0, "no tensor on failure");
+			ccfree(bad);
+			ccv_nnc_tensor_free(weight);
+			ccv_nnc_tensor_free(packed);
+		}
+	}
+	REQUIRE_EQ(ccv_nnc_tensor_read_codebook(db, 255), -1, "no codebook tensor was written");
+	sqlite3_close(db);
+	ccfree(by_inline);
+	ccfree(by_slot);
+	ccfree(half);
+	ccfree(values);
+}
+
+TEST_CASE("codebook rows written with the old CCVCB001 magic still register, an inline codebook takes CCVCBOOK only")
+{
+	uint8_t legacy[sizeof(test_trellis_table_alt)];
+	memcpy(legacy, test_trellis_table_alt, sizeof(legacy));
+	REQUIRE_EQ(memcmp(legacy, "CCVCBOOK", 8), 0, "the asset has the new magic");
+	const int slot = ccv_nnc_codebook_register_serialized(test_trellis_table_alt, sizeof(test_trellis_table_alt));
+	memcpy(legacy, "CCVCB001", 8);
+	REQUIRE_EQ(ccv_nnc_codebook_register_serialized(legacy, sizeof(legacy)), slot, "the old magic registers the same table");
+	memcpy(legacy, "CCVCB002", 8);
+	REQUIRE_EQ(ccv_nnc_codebook_register_serialized(legacy, sizeof(legacy)), -1, "another magic fails");
+	const int format = ccv_nnc_8i_rowwise_x_with_inline_codebook(CCV_NNC_QX_8I_ROWWISE_FTQ_N20, 512);
+	uint8_t prefix[1152];
+	memset(prefix, 0, sizeof(prefix));
+	memcpy(prefix, test_trellis_table_alt, sizeof(test_trellis_table_alt));
+	REQUIRE_EQ(ccv_nnc_codebook_resolve_inline(prefix, format) & CCV_NNC_CODEBOOK_SLOT_MASK, slot << CCV_NNC_CODEBOOK_SLOT_SHIFT, "the new magic resolves inline");
+	memcpy(prefix, "CCVCB001", 8);
+	REQUIRE_EQ(ccv_nnc_codebook_resolve_inline(prefix, format), -1, "the old magic does not resolve inline");
+}
+
 TEST_CASE("FTQ_VR under budget pads the code with zeros, and ftq_vr_check rejects bad shapes, padding and offsets")
 {
 	static const int shapes[][2] = { { 48, 272 }, { 64, 1152 } };
